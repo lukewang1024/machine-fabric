@@ -519,8 +519,8 @@ for host in "$@"; do
     controller_params=$(printf '{"controllerId":"%s","endpoint":{"transport":"local","socket":"%s"}}' "$host" "$(escape_json "$peer_controller")")
     "$fabric" --socket "$controller_socket" call controller.register "$controller_params" >/dev/null
     if [ "$host_platform" = windows ]; then
-      reverse_executor="C:\ProgramData\machine-fabric\fabric\$local_id-executor.sock"
-      reverse_controller="C:\ProgramData\machine-fabric\fabric\$local_id-controller.sock"
+      reverse_executor='C:\ProgramData\machine-fabric\fabric\'"$local_id"'-executor.sock'
+      reverse_controller='C:\ProgramData\machine-fabric\fabric\'"$local_id"'-controller.sock'
     else
       reverse_executor=$remote_home/.local/state/machine-fabric/fabric/$local_id-executor.sock
       reverse_controller=$remote_home/.local/state/machine-fabric/fabric/$local_id-controller.sock
@@ -555,8 +555,8 @@ for node_a in "$@"; do
     if [ "$dialer_platform" = windows ]; then
       dialer_home=$(ssh -o BatchMode=yes -o ClearAllForwardings=yes "$dialer" \
         'powershell.exe -NoProfile -NonInteractive -Command "[Environment]::GetFolderPath('"'"'UserProfile'"'"')"' | tr -d '\r')
-      peer_executor="C:\ProgramData\machine-fabric\peers\$peer\executor.sock"
-      peer_controller="C:\ProgramData\machine-fabric\peers\$peer\controller.sock"
+      peer_executor='C:\ProgramData\machine-fabric\peers\'"$peer"'\executor.sock'
+      peer_controller='C:\ProgramData\machine-fabric\peers\'"$peer"'\controller.sock'
     else
       dialer_home=$(ssh -o BatchMode=yes -o ClearAllForwardings=yes "$dialer" 'printf %s "$HOME"')
       peer_executor=$dialer_home/.local/state/machine-fabric/peers/$peer/executor.sock
@@ -565,8 +565,8 @@ for node_a in "$@"; do
     if [ "$peer_platform" = windows ]; then
       peer_home=$(ssh -o BatchMode=yes -o ClearAllForwardings=yes "$peer" \
         'powershell.exe -NoProfile -NonInteractive -Command "[Environment]::GetFolderPath('"'"'UserProfile'"'"')"' | tr -d '\r')
-      reverse_executor="C:\ProgramData\machine-fabric\fabric\$dialer-executor.sock"
-      reverse_controller="C:\ProgramData\machine-fabric\fabric\$dialer-controller.sock"
+      reverse_executor='C:\ProgramData\machine-fabric\fabric\'"$dialer"'-executor.sock'
+      reverse_controller='C:\ProgramData\machine-fabric\fabric\'"$dialer"'-controller.sock'
     else
       peer_home=$(ssh -o BatchMode=yes -o ClearAllForwardings=yes "$peer" 'printf %s "$HOME"')
       reverse_executor=$peer_home/.local/state/machine-fabric/fabric/$dialer-executor.sock
