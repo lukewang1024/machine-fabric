@@ -283,7 +283,7 @@ windows_call() {
   call_json=$4
   encoded=$(printf '%s' "$call_json" | base64 | tr -d '\n')
   ssh -o BatchMode=yes -o ClearAllForwardings=yes "$call_host" \
-    "powershell.exe -NoProfile -NonInteractive -Command \"\$j=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('$encoded')); & 'C:\Program Files\machine-fabric\machine-fabric.exe' --socket '$call_socket' call '$call_action' \$j\""
+    "powershell.exe -NoProfile -NonInteractive -Command \"\$j=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('$encoded')); \$p=Join-Path \$env:TEMP ('machine-fabric-call-'+[guid]::NewGuid().ToString('N')+'.json'); \$code=1; try { [IO.File]::WriteAllText(\$p,\$j,(New-Object System.Text.UTF8Encoding \$false)); & 'C:\Program Files\machine-fabric\machine-fabric.exe' --socket '$call_socket' call '$call_action' --params-file \$p; \$code=\$LASTEXITCODE } finally { Remove-Item -LiteralPath \$p -Force -ErrorAction SilentlyContinue }; exit \$code\""
 }
 
 remote_call() {

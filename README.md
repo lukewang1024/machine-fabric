@@ -90,7 +90,7 @@ the archive against the release's `SHA256SUMS` before extraction.
 
 ```sh
 MACHINE_FABRIC_RELEASE_BASE_URL=https://<internal-cdn-root> \
-  scripts/install-from-release.sh 0.1.6
+  scripts/install-from-release.sh 0.1.7
 ```
 
 The package is also published to its private GitHub repository for source and
