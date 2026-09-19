@@ -15,7 +15,7 @@ use std::ffi::{OsStr, OsString};
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 #[cfg(windows)]
-use std::process::{Command, Stdio};
+use std::process::{Command as ProcessCommand, Stdio};
 use std::sync::Arc;
 #[cfg(windows)]
 use std::time::Duration;
@@ -437,7 +437,7 @@ fn run_windows_service() -> Result<()> {
     })?;
 
     let executable = env::current_exe()?;
-    let mut worker = match Command::new(executable)
+    let mut worker = match ProcessCommand::new(executable)
         .args(worker_args)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
