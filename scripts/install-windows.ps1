@@ -50,7 +50,8 @@ $executorParts = @(
   "--state", (Quote-Arg $executorState)
 )
 foreach ($root in $AllowRoot) {
-  if (-not [System.IO.Path]::IsPathFullyQualified($root)) {
+  # IsPathFullyQualified is unavailable in Windows PowerShell 5.1's .NET Framework.
+  if ($root -notmatch '^(?:[A-Za-z]:[\\/]|\\\\[^\\]+\\[^\\]+(?:[\\/]|$))') {
     throw "allow-root must be absolute: $root"
   }
   $executorParts += @("--allow-root", (Quote-Arg $root))
