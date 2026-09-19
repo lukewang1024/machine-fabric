@@ -15,8 +15,8 @@ use windows_sys::Win32::{
             CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT, CreateProcessAsUserW,
             PROCESS_INFORMATION, STARTUPINFOW,
         },
-        UI::Shell::GetUserProfileDirectoryW,
     },
+    UI::Shell::GetUserProfileDirectoryW,
 };
 
 pub(crate) fn interactive_computer_use_state_root() -> Result<PathBuf, RpcError> {
