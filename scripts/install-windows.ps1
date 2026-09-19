@@ -65,12 +65,15 @@ foreach ($service in @(
   $existing = Get-Service -Name $service.Name -ErrorAction SilentlyContinue
   if ($existing) {
     Stop-Service -Name $service.Name -Force -ErrorAction SilentlyContinue
-    & sc.exe config $service.Name binPath= $service.Command start= auto | Out-Null
+    $serviceKey = "HKLM:\SYSTEM\CurrentControlSet\Services\$($service.Name)"
+    if (!(Test-Path -LiteralPath $serviceKey)) { throw "service registry key is missing: $($service.Name)" }
+    Set-ItemProperty -LiteralPath $serviceKey -Name ImagePath -Value $service.Command
+    Set-Service -Name $service.Name -StartupType Automatic
   } else {
-    & sc.exe create $service.Name binPath= $service.Command start= auto DisplayName= $service.Display | Out-Null
+    New-Service -Name $service.Name -BinaryPathName $service.Command -StartupType Automatic -DisplayName $service.Display | Out-Null
   }
-  if ($LASTEXITCODE -ne 0) { throw "failed to configure $($service.Name)" }
   & sc.exe failure $service.Name reset= 86400 actions= restart/1000/restart/5000/restart/30000 | Out-Null
+  if ($LASTEXITCODE -ne 0) { throw "failed to configure recovery actions for $($service.Name)" }
   Start-Service -Name $service.Name
 }
 
