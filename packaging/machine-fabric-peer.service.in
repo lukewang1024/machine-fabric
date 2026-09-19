@@ -5,7 +5,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=@BINARY@ peer connect --id @PEER_ID@ --local-id @LOCAL_ID@ --host @HOST@ --expose-controller-socket @EXPOSE_CONTROLLER_SOCKET@ --expose-executor-socket @EXPOSE_EXECUTOR_SOCKET@ --remote-executable @REMOTE_EXECUTABLE@ --remote-state-root @REMOTE_STATE_ROOT@ --remote-platform @REMOTE_PLATFORM@ --state @STATE_PATH@
+ExecStart="@BINARY@" peer connect --id @PEER_ID@ --local-id @LOCAL_ID@ --host @HOST@ --expose-controller-socket "@EXPOSE_CONTROLLER_SOCKET@" --expose-executor-socket "@EXPOSE_EXECUTOR_SOCKET@" --remote-executable "@REMOTE_EXECUTABLE@" --remote-state-root "@REMOTE_STATE_ROOT@" --remote-platform @REMOTE_PLATFORM@ --state "@STATE_PATH@"
 Restart=always
 RestartSec=1
 

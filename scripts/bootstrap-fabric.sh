@@ -287,6 +287,10 @@ escape_sed() {
   printf '%s' "$1" | sed 's/[\\&|]/\\&/g'
 }
 
+escape_systemd() {
+  printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
+}
+
 escape_json() {
   printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
 }
@@ -460,16 +464,16 @@ install_remote_peer_service() {
   fi
   unit=machine-fabric-peer-$peer.service
   sed \
-    -e "s|@BINARY@|$dialer_home/.local/bin/machine-fabric|g" \
+    -e "s|@BINARY@|$(escape_sed "$(escape_systemd "$dialer_home/.local/bin/machine-fabric")")|g" \
     -e "s|@PEER_ID@|$peer|g" \
     -e "s|@LOCAL_ID@|$dialer|g" \
     -e "s|@HOST@|$peer|g" \
-    -e "s|@EXPOSE_CONTROLLER_SOCKET@|$expose_controller|g" \
-    -e "s|@EXPOSE_EXECUTOR_SOCKET@|$expose_executor|g" \
-    -e "s|@REMOTE_STATE_ROOT@|$peer_state_root|g" \
-    -e "s|@REMOTE_EXECUTABLE@|$peer_executable|g" \
+    -e "s|@EXPOSE_CONTROLLER_SOCKET@|$(escape_sed "$(escape_systemd "$expose_controller")")|g" \
+    -e "s|@EXPOSE_EXECUTOR_SOCKET@|$(escape_sed "$(escape_systemd "$expose_executor")")|g" \
+    -e "s|@REMOTE_STATE_ROOT@|$(escape_sed "$(escape_systemd "$peer_state_root")")|g" \
+    -e "s|@REMOTE_EXECUTABLE@|$(escape_sed "$(escape_systemd "$peer_executable")")|g" \
     -e "s|@REMOTE_PLATFORM@|$peer_platform|g" \
-    -e "s|@STATE_PATH@|$remote_status_path|g" \
+    -e "s|@STATE_PATH@|$(escape_sed "$(escape_systemd "$remote_status_path")")|g" \
     "$remote_peer_template" | ssh -o BatchMode=yes -o ClearAllForwardings=yes "$dialer" \
       "mkdir -p '$remote_peer_dir' \"\$HOME/.config/systemd/user\"; cat >\"\$HOME/.config/systemd/user/$unit\"; if [ -f '$remote_status_path' ]; then mv '$remote_status_path' '$remote_status_path.previous'; fi; systemctl --user daemon-reload; systemctl --user enable --now '$unit'; systemctl --user restart '$unit'"
   attempt=0
