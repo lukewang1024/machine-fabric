@@ -1,3 +1,10 @@
+FROM rust:1.88-bookworm AS build
+
+WORKDIR /src
+COPY Cargo.toml Cargo.lock ./
+COPY crates ./crates
+RUN cargo build --release --locked --bin machine-fabric
+
 FROM debian:bookworm-slim
 
 RUN apt-get update \
@@ -5,9 +12,10 @@ RUN apt-get update \
         ca-certificates openssh-client openssh-server util-linux \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --create-home --shell /bin/sh fabric \
+    && passwd -d fabric \
     && install -d -m 0700 -o fabric -g fabric /home/fabric/.ssh
 
-COPY machine-fabric /usr/local/bin/machine-fabric
+COPY --from=build /src/target/release/machine-fabric /usr/local/bin/machine-fabric
 COPY sshd_config /etc/ssh/sshd_config.d/90-machine-fabric.conf
 COPY ssh_config /etc/machine-fabric/ssh_config
 COPY node-entrypoint.sh /usr/local/bin/node-entrypoint

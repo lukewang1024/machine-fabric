@@ -11,7 +11,7 @@ staging=$output_dir/$package
 case $version in *[!0-9A-Za-z._-]*|'') echo "invalid version: $version" >&2; exit 2;; esac
 case $target in *[!0-9A-Za-z._-]*|'') echo "invalid target: $target" >&2; exit 2;; esac
 
-mkdir -p "$staging/bin" "$staging/scripts" "$staging/packaging"
+mkdir -p "$staging/bin" "$staging/scripts" "$staging/packaging" "$staging/skills"
 case $target in
   *-windows-msvc)
     cp "$build_dir/machine-fabric.exe" "$staging/bin/machine-fabric.exe"
@@ -28,7 +28,8 @@ case $target in
     ;;
 esac
 cp README.md LICENSE "$staging/"
-cp scripts/install-linux-user.sh scripts/install-macos-app.sh scripts/install-windows.ps1 scripts/install-windows-peer.ps1 scripts/bootstrap-fabric.sh scripts/preflight-fabric.sh scripts/plan-release-fabric.sh scripts/install-agent-skills.sh scripts/prune-state.sh "$staging/scripts/"
+cp -R skills/machine-fabric "$staging/skills/machine-fabric"
+cp scripts/install-from-release.sh scripts/install-from-release.ps1 scripts/install-linux-user.sh scripts/install-macos-agent.sh scripts/install-macos-app.sh scripts/install-windows.ps1 scripts/install-windows-peer.ps1 scripts/bootstrap-fabric.sh scripts/preflight-fabric.sh scripts/plan-release-fabric.sh scripts/install-agent-skills.sh scripts/prune-state.sh "$staging/scripts/"
 cp packaging/* "$staging/packaging/"
 case $target in
   *-windows-msvc)

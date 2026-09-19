@@ -4,7 +4,7 @@ set -eu
 script_dir=$(CDPATH= cd "$(dirname "$0")" && pwd)
 repo_root=$(CDPATH= cd "$script_dir/../.." && pwd)
 
-for program in cargo docker jq ssh-keygen; do
+for program in docker jq ssh-keygen; do
     if ! command -v "$program" >/dev/null 2>&1; then
         printf 'docker-three-node: required command not found: %s\n' "$program" >&2
         exit 2
@@ -34,10 +34,10 @@ case "$docker_init" in
     *) printf '%s\n' 'docker-three-node: MACHINE_FABRIC_DOCKER_INIT must be yes or no' >&2; exit 2 ;;
 esac
 provided_image=${MACHINE_FABRIC_DOCKER_NODE_IMAGE:-}
+cache_home=${XDG_CACHE_HOME:-"$HOME/.cache"}
+mkdir -p "$cache_home"
 
-cargo build --release --manifest-path "$repo_root/Cargo.toml" --bin machine-fabric
-
-temporary=$(mktemp -d "${TMPDIR:-/tmp}/machine-fabric-acceptance.XXXXXX")
+temporary=$(mktemp -d "$cache_home/machine-fabric-acceptance.XXXXXX")
 run_id=$(date -u +%Y%m%dT%H%M%SZ)-$$
 network=machine-fabric-accept-$run_id
 image=${provided_image:-machine-fabric-acceptance:$run_id}
@@ -76,7 +76,7 @@ cleanup() {
         docker_cmd image rm "$image" >/dev/null 2>&1 || true
     fi
     case "$temporary" in
-        "${TMPDIR:-/tmp}"/machine-fabric-acceptance.*) rm -rf "$temporary" ;;
+        "$cache_home"/machine-fabric-acceptance.*) rm -rf "$temporary" ;;
         *) printf 'docker-three-node: refusing to remove unexpected temp path: %s\n' "$temporary" >&2 ;;
     esac
     exit "$cleanup_status"
@@ -100,11 +100,14 @@ fi
 
 context=$temporary/context
 mkdir "$context"
+keys=$temporary/keys
+mkdir "$keys"
 ssh-keygen -q -t ed25519 -N '' -C machine-fabric-local-acceptance \
-    -f "$temporary/id_ed25519"
+    -f "$keys/id_ed25519"
 
 if [ -z "$provided_image" ]; then
-    cp "$repo_root/target/release/machine-fabric" "$context/machine-fabric"
+    cp "$repo_root/Cargo.toml" "$repo_root/Cargo.lock" "$context/"
+    cp -R "$repo_root/crates" "$context/crates"
     cp "$repo_root/tests/docker/Dockerfile" "$context/Dockerfile"
     cp "$repo_root/tests/docker/node-entrypoint.sh" "$context/node-entrypoint.sh"
     cp "$repo_root/tests/docker/sshd_config" "$context/sshd_config"
@@ -128,8 +131,7 @@ start_node() {
         --network "$network" --network-alias "$start_id" \
         --env "MACHINE_FABRIC_NODE_ID=$start_id" \
         --env "MACHINE_FABRIC_DOCKER_USER=$docker_user" \
-        --volume "$temporary/id_ed25519:/run/acceptance/id_ed25519:ro" \
-        --volume "$temporary/id_ed25519.pub:/run/acceptance/id_ed25519.pub:ro" \
+        --volume "$keys:/run/acceptance:ro" \
         "$image" >/dev/null
 }
 
@@ -181,8 +183,12 @@ start_peer() {
     peer_target=$2
     peer_container=$(container_for "$peer_source")
     peer_state="/var/lib/machine-fabric/peers/$peer_target/status.json"
-    docker_cmd exec --detach --user "$docker_user" --env XDG_STATE_HOME=/var/lib \
-        "$peer_container" /usr/local/bin/machine-fabric peer connect \
+    docker_cmd exec --detach --user "$docker_user" \
+        --env HOME="$(if [ "$docker_user" = root ]; then printf /root; else printf /home/fabric; fi)" \
+        --env XDG_STATE_HOME=/var/lib \
+        "$peer_container" /bin/sh -c 'log=$1; shift; exec "$@" >>"$log" 2>&1' sh \
+        "/var/lib/machine-fabric/peers/connect-$peer_target.log" \
+        /usr/local/bin/machine-fabric peer connect \
         --id "$peer_target" --local-id "$peer_source" --host "$peer_target" \
         --local-controller-socket /var/lib/machine-fabric/controller.sock \
         --local-executor-socket /var/lib/machine-fabric/executor.sock \
@@ -190,7 +196,7 @@ start_peer() {
         --expose-executor-socket "/var/lib/machine-fabric/fabric/$peer_target-executor.sock" \
         --remote-executable /usr/local/bin/machine-fabric \
         --remote-state-root /var/lib/machine-fabric \
-        --state "$peer_state" >/dev/null
+        --state "$peer_state"
 }
 
 wait_peer_ready() {
@@ -209,6 +215,13 @@ wait_peer_ready() {
         peer_attempt=$((peer_attempt + 1))
         sleep 1
     done
+    printf 'docker-three-node: last peer status for %s -> %s:\n' \
+        "$peer_source" "$peer_target" >&2
+    docker_cmd exec --user "$docker_user" \
+        --env HOME="$(if [ "$docker_user" = root ]; then printf /root; else printf /home/fabric; fi)" \
+        --env XDG_STATE_HOME=/var/lib "$peer_container" \
+        /usr/local/bin/machine-fabric peer status --state "$peer_state" >&2 || true
+    docker_cmd exec "$peer_container" cat "/var/lib/machine-fabric/peers/connect-$peer_target.log" >&2 || true
     docker_cmd logs "$peer_container" >&2 || true
     printf 'docker-three-node: peer did not become ready: %s -> %s\n' \
         "$peer_source" "$peer_target" >&2
