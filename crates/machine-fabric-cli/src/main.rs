@@ -665,7 +665,10 @@ fn validate_allow_root(value: &str) -> Result<()> {
 fn print_response(response: machine_fabric_protocol::Response) -> Result<()> {
     println!("{}", serde_json::to_string_pretty(&response)?);
     if !response.ok {
-        bail!("request failed")
+        let error = response
+            .error
+            .ok_or_else(|| anyhow::anyhow!("request failed without an RPC error"))?;
+        bail!("{}: {}", error.code, error.message)
     }
     Ok(())
 }
