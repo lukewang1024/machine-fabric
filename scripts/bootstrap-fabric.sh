@@ -103,7 +103,7 @@ peer_root=$state_home/machine-fabric/peers
 launch_agents=$HOME/Library/LaunchAgents
 peer_template=$script_dir/../packaging/dev.machine-fabric.peer.plist.in
 remote_peer_template=$script_dir/../packaging/machine-fabric-peer.service.in
-app_binary=${XDG_DATA_HOME:-"$HOME/.local/share"}/machine-fabric/Agent\ Machine Fabric.app/Contents/MacOS/machine-fabric-macos-agent
+app_binary=${XDG_DATA_HOME:-"$HOME/.local/share"}/machine-fabric/Machine\ Fabric.app/Contents/MacOS/machine-fabric-macos-agent
 if [ -n "${MACHINE_FABRIC_BINARY:-}" ]; then
   fabric=$MACHINE_FABRIC_BINARY
 elif [ -x "$app_binary" ]; then
