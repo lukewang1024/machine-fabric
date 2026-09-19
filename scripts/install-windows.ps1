@@ -27,6 +27,11 @@ New-Item -ItemType Directory -Force -Path $fabricRoot | Out-Null
 # endpoints in this directory. Controller state remains writable by services.
 & icacls.exe $fabricRoot /grant '*S-1-5-11:(OI)(CI)M' /T /C | Out-Null
 if ($LASTEXITCODE -ne 0) { throw "failed to grant fabric IPC directory access" }
+$initialServiceProcessIds = @(
+  Get-CimInstance -ClassName Win32_Service -Filter "Name = 'MachineFabricController' OR Name = 'MachineFabricExecutor'" |
+    Where-Object { $_.ProcessId -gt 0 } |
+    Select-Object -ExpandProperty ProcessId
+)
 foreach ($serviceName in @("MachineFabricController", "MachineFabricExecutor")) {
   if (Get-Service -Name $serviceName -ErrorAction SilentlyContinue) {
     Stop-Service -Name $serviceName -Force -ErrorAction SilentlyContinue
@@ -52,8 +57,18 @@ do {
   )
   if ($runningProcesses.Count -eq 0) { break }
   if ((Get-Date) -ge $processDeadline) {
-    $processIds = ($runningProcesses | ForEach-Object { $_.ProcessId }) -join ", "
-    throw "Machine Fabric processes still hold the installed binary: $processIds"
+    $serviceProcessIdsText = $initialServiceProcessIds -join ", "
+    $processDetails = ($runningProcesses | ForEach-Object {
+      $owner = if ($initialServiceProcessIds -contains $_.ProcessId) {
+        "service"
+      } elseif ($initialServiceProcessIds -contains $_.ParentProcessId) {
+        "service-child"
+      } else {
+        "unmatched"
+      }
+      "pid=$($_.ProcessId), parent=$($_.ParentProcessId), created=$($_.CreationDate), owner=$owner"
+    }) -join "; "
+    throw "Machine Fabric processes still hold the installed binary (service pids: $serviceProcessIdsText; remaining: $processDetails)"
   }
   Start-Sleep -Milliseconds 200
 } while ($true)

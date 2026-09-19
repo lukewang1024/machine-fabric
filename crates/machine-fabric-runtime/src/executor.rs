@@ -26,6 +26,9 @@ pub struct ExecutorRuntime {
     fences: Option<Mutex<ExecutorFences>>,
     execution: ExecutionCapacity,
     relay_root: PathBuf,
+    computer_use: crate::computer_use::ComputerUseService,
+    desktop: Mutex<crate::desktop::DesktopQueue>,
+    desktop_execution: Mutex<()>,
 }
 
 #[derive(Debug)]
@@ -260,6 +263,9 @@ impl ExecutorRuntime {
             fences: None,
             execution: ExecutionCapacity::from_environment(),
             relay_root,
+            computer_use: crate::computer_use::ComputerUseService::default(),
+            desktop: Mutex::new(crate::desktop::DesktopQueue::default()),
+            desktop_execution: Mutex::new(()),
         })
     }
 
@@ -292,6 +298,9 @@ impl ExecutorRuntime {
         runtime.relay_root = state_path.with_file_name("artifact-relay");
         fences.path = state_path;
         runtime.processes = ProcessTable::open(process_state_path)?;
+        runtime.desktop = Mutex::new(crate::desktop::DesktopQueue::open(
+            runtime.relay_root.with_file_name("desktop-queue.json"),
+        )?);
         runtime.fences = Some(Mutex::new(fences));
         Ok(runtime)
     }
@@ -323,8 +332,9 @@ impl ExecutorRuntime {
         };
         let result = match permit {
             Ok(_permit) => self
-                .issue_authority(&request.action, &mut params)
-                .and_then(|()| self.dispatch(&request.action, params)),
+                .reconcile_desktop()
+                .and_then(|()| self.issue_authority(&request.action, &mut params))
+                .and_then(|()| self.desktop_dispatch(&request.action, params)),
             Err(error) => Err(error),
         };
         let response = match result {
@@ -398,6 +408,81 @@ impl ExecutorRuntime {
         })
     }
 
+    fn desktop_dispatch(&self, action: &str, mut params: Value) -> Result<Value, RpcError> {
+        if action.starts_with("desktop.") {
+            let result = self
+                .desktop
+                .lock()
+                .map_err(|error| RpcError::new("DESKTOP_STATE_FAILED", error.to_string()))?
+                .command(action, &params)?;
+            self.reconcile_desktop()?;
+            if matches!(action, "desktop.finish" | "desktop.cancel") {
+                return self
+                    .desktop
+                    .lock()
+                    .map_err(|error| RpcError::new("DESKTOP_STATE_FAILED", error.to_string()))?
+                    .command("desktop.get", &params);
+            }
+            return Ok(result);
+        }
+        if !crate::desktop::protected(action) {
+            return self.dispatch(action, params);
+        }
+        self.reconcile_desktop()?;
+        let gate = self
+            .desktop_execution
+            .lock()
+            .map_err(|error| RpcError::new("DESKTOP_STATE_FAILED", error.to_string()))?;
+        self.desktop
+            .lock()
+            .map_err(|error| RpcError::new("DESKTOP_STATE_FAILED", error.to_string()))?
+            .begin(action, &mut params)?;
+        let result = self.dispatch(action, params);
+        let uncertain = result.as_ref().is_err_and(|error| {
+            let message = error.message.to_ascii_lowercase();
+            error.code == "COMPUTER_USE_UNAVAILABLE"
+                || error.code.contains("TIMEOUT")
+                || (error.code == "COMPUTER_USE_TOOL_FAILED"
+                    && (message.contains("timeout")
+                        || message.contains("timed out")
+                        || message.contains("abort")))
+        });
+        self.desktop
+            .lock()
+            .map_err(|error| RpcError::new("DESKTOP_STATE_FAILED", error.to_string()))?
+            .end(uncertain)?;
+        drop(gate);
+        self.reconcile_desktop()?;
+        result
+    }
+
+    fn reconcile_desktop(&self) -> Result<(), RpcError> {
+        let gate = match self.desktop_execution.try_lock() {
+            Ok(gate) => gate,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(()),
+            Err(std::sync::TryLockError::Poisoned(error)) => {
+                return Err(RpcError::new("DESKTOP_STATE_FAILED", error.to_string()));
+            }
+        };
+        let cleanup = self
+            .desktop
+            .lock()
+            .map_err(|error| RpcError::new("DESKTOP_STATE_FAILED", error.to_string()))?
+            .needs_cleanup();
+        if !cleanup {
+            return Ok(());
+        }
+        let closed = self
+            .computer_use
+            .close_existing(&self.relay_root.with_file_name("computer-use"));
+        self.desktop
+            .lock()
+            .map_err(|error| RpcError::new("DESKTOP_STATE_FAILED", error.to_string()))?
+            .cleanup_done(closed.is_ok())?;
+        drop(gate);
+        closed
+    }
+
     fn dispatch(&self, action: &str, params: Value) -> Result<Value, RpcError> {
         match action {
             "ping" | "status" => Ok(json!({
@@ -406,7 +491,14 @@ impl ExecutorRuntime {
                 "allowedRoots": self.allowed_roots,
                 "capabilities": capability_catalog(),
                 "execution": self.execution_summary(),
+                "computerUse": self.computer_use.status(&self.relay_root.with_file_name("computer-use")),
+                "computerUseStateRoot": self.relay_root.with_file_name("computer-use"),
             })),
+            "computer-use.tools" | "computer-use.call" => self.computer_use.call(
+                &self.relay_root.with_file_name("computer-use"),
+                &params,
+                action == "computer-use.tools",
+            ),
             "availability" => {
                 let (active, maximum, queued, queue_limit, held_resources) =
                     self.execution.snapshot();

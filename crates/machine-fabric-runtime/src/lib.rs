@@ -1,4 +1,6 @@
+mod computer_use;
 mod controller;
+mod desktop;
 mod executor;
 mod generation;
 #[cfg(target_os = "macos")]
@@ -8,6 +10,8 @@ mod process;
 mod rpc;
 mod telemetry;
 mod transport;
+#[cfg(windows)]
+mod windows_computer_use;
 
 pub use controller::Controller;
 pub use executor::{ExecutorRuntime, capability_catalog};

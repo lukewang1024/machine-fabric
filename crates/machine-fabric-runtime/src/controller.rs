@@ -202,6 +202,10 @@ impl Controller {
     }
 
     fn dispatch(&self, action: &str, params: Value) -> Result<Value, RpcError> {
+        if action.starts_with("desktop.") {
+            let executor_id = required_str(&params, "executorId")?.to_owned();
+            return self.call_registered_executor(&executor_id, action, params);
+        }
         if let Some(routed) = self.route_session_action(action, &params)? {
             return Ok(routed);
         }

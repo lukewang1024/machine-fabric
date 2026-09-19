@@ -20,6 +20,8 @@ use std::sync::Arc;
 #[cfg(windows)]
 use std::time::Duration;
 
+mod computer_use_cli;
+
 #[derive(Debug, Parser)]
 #[command(
     name = "machine-fabric",
@@ -83,6 +85,10 @@ enum Command {
     Manifest {
         #[command(subcommand)]
         command: ManifestCommand,
+    },
+    ComputerUse {
+        #[command(subcommand)]
+        command: computer_use_cli::ComputerUseCommand,
     },
 }
 
@@ -401,6 +407,10 @@ fn run_cli() -> Result<()> {
         Command::Manifest {
             command: ManifestCommand::Plan { file },
         } => plan_fabric_manifest(&file),
+        Command::ComputerUse { command } => computer_use_cli::run(
+            &cli.socket.unwrap_or_else(default_controller_socket),
+            command,
+        ),
     }
 }
 
