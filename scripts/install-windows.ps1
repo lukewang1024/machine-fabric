@@ -41,6 +41,22 @@ foreach ($serviceName in @("MachineFabricController", "MachineFabricExecutor")) 
     )
   }
 }
+$processDeadline = (Get-Date).AddSeconds(30)
+do {
+  $runningProcesses = @(
+    Get-CimInstance -ClassName Win32_Process -Filter "Name = 'machine-fabric.exe'" |
+      Where-Object {
+        $_.ExecutablePath -and
+          $_.ExecutablePath.Equals($installedBinary, [System.StringComparison]::OrdinalIgnoreCase)
+      }
+  )
+  if ($runningProcesses.Count -eq 0) { break }
+  if ((Get-Date) -ge $processDeadline) {
+    $processIds = ($runningProcesses | ForEach-Object { $_.ProcessId }) -join ", "
+    throw "Machine Fabric processes still hold the installed binary: $processIds"
+  }
+  Start-Sleep -Milliseconds 200
+} while ($true)
 Copy-Item -Force -LiteralPath $Binary -Destination $installedBinary
 
 function Quote-Arg([string]$Value) {
