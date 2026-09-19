@@ -1,0 +1,30 @@
+[package]
+name = "machine-fabric-runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+base64.workspace = true
+flate2.workspace = true
+hex.workspace = true
+interprocess.workspace = true
+libc.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tar.workspace = true
+thiserror.workspace = true
+tungstenite.workspace = true
+uuid.workspace = true
+machine-fabric-core = { path = "../machine-fabric-core" }
+machine-fabric-protocol = { path = "../machine-fabric-protocol" }
+machine-fabric-schema = { path = "../machine-fabric-schema" }
+
+[target.'cfg(windows)'.dependencies]
+junction = "1.2"
+widestring = "1.2"
+
+[dev-dependencies]
+tempfile.workspace = true

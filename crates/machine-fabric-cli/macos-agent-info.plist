@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleIdentifier</key>
+  <string>dev.machine-fabric.macos-agent</string>
+  <key>CFBundleName</key>
+  <string>Machine Fabric</string>
+  <key>CFBundleDisplayName</key>
+  <string>Machine Fabric</string>
+  <key>CFBundleExecutable</key>
+  <string>machine-fabric-macos-agent</string>
+  <key>CFBundlePackageType</key>
+  <string>APPL</string>
+  <key>CFBundleShortVersionString</key>
+  <string>0.1.0</string>
+  <key>CFBundleVersion</key>
+  <string>1</string>
+  <key>NSAppleEventsUsageDescription</key>
+  <string>Machine Fabric launches and inspects applications requested by the active development task.</string>
+  <key>NSDesktopFolderUsageDescription</key>
+  <string>Machine Fabric accesses task artifacts selected by the user.</string>
+  <key>NSDocumentsFolderUsageDescription</key>
+  <string>Machine Fabric opens documents used by the active acceptance task.</string>
+</dict>
+</plist>
+

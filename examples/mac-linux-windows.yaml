@@ -1,0 +1,33 @@
+apiVersion: machine-fabric.dev/v1
+kind: Fabric
+
+initiatorNode: mac-agent
+
+nodes:
+  - id: mac-agent
+    platform: macos
+    architecture: aarch64
+    allowRoots:
+      - "${user.home}/Workspace"
+      - "${user.home}/Code"
+
+  - id: linux-build
+    platform: linux
+    architecture: x86_64
+    connection:
+      sshAlias: linux-build
+    allowRoots:
+      - "${user.home}/Workspace"
+      - "${user.home}/Code"
+
+  - id: windows-verify
+    platform: windows
+    architecture: x86_64
+    connection:
+      sshAlias: windows-verify
+    allowRoots:
+      - "${user.home}/Workspace"
+      - "${user.home}/Code"
+
+topology:
+  mode: full-mesh

@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>dev.machine-fabric.peer.@PEER_ID@</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>@EXECUTABLE@</string>
+    <string>peer</string>
+    <string>connect</string>
+    <string>--id</string>
+    <string>@PEER_ID@</string>
+    <string>--local-id</string>
+    <string>@LOCAL_ID@</string>
+    <string>--host</string>
+    <string>@HOST@</string>
+    <string>--expose-controller-socket</string>
+    <string>@EXPOSE_CONTROLLER_SOCKET@</string>
+    <string>--expose-executor-socket</string>
+    <string>@EXPOSE_EXECUTOR_SOCKET@</string>
+    <string>--remote-state-root</string>
+    <string>@REMOTE_STATE_ROOT@</string>
+    <string>--remote-executable</string>
+    <string>@REMOTE_EXECUTABLE@</string>
+    <string>--remote-platform</string>
+    <string>@REMOTE_PLATFORM@</string>
+    <string>--state</string>
+    <string>@STATE_PATH@</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ProcessType</key>
+  <string>Background</string>
+  <key>StandardOutPath</key>
+  <string>@LOG_PATH@</string>
+  <key>StandardErrorPath</key>
+  <string>@LOG_PATH@</string>
+</dict>
+</plist>

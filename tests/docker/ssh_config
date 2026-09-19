@@ -1,0 +1,10 @@
+Host node-mac node-linux node-windows
+    User fabric
+    IdentityFile /home/fabric/.ssh/id_ed25519
+    IdentitiesOnly yes
+    BatchMode yes
+    StrictHostKeyChecking no
+    UserKnownHostsFile /dev/null
+    ConnectTimeout 10
+    ServerAliveInterval 2
+    ServerAliveCountMax 2

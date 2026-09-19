@@ -1,0 +1,24 @@
+apiVersion: machine-fabric.dev/v1
+kind: Fabric
+
+initiatorNode: laptop
+
+nodes:
+  - id: laptop
+    platform: macos
+    architecture: aarch64
+    allowRoots:
+      - "${user.home}/Workspace"
+      - "${user.home}/Code"
+
+  - id: devbox-a
+    platform: linux
+    architecture: x86_64
+    connection:
+      sshAlias: devbox-a
+    allowRoots:
+      - "${user.home}/Workspace"
+      - "${user.home}/Code"
+
+topology:
+  mode: full-mesh

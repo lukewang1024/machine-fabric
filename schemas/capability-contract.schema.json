@@ -1,0 +1,72 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://machine-fabric.dev/schemas/capability-contract.schema.json",
+  "title": "Capability Contract",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "name",
+    "version",
+    "inputSchema",
+    "outputSchema",
+    "requiredExecutorFeatures",
+    "locks",
+    "idempotency",
+    "timeoutMs",
+    "retry",
+    "rollback",
+    "healthCheck",
+    "emittedEvidence",
+    "effect"
+  ],
+  "properties": {
+    "name": {"type": "string", "pattern": "^[a-z][a-z0-9]*(\\.[a-z][a-z0-9-]*)+$"},
+    "version": {"type": "string", "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$"},
+    "inputSchema": {"type": "object"},
+    "outputSchema": {"type": "object"},
+    "requiredExecutorFeatures": {"type": "array", "items": {"type": "string"}, "uniqueItems": true},
+    "locks": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["key", "mode"],
+        "properties": {
+          "key": {"type": "string"},
+          "mode": {"enum": ["exclusive", "shared"]}
+        }
+      }
+    },
+    "idempotency": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["keyFields", "retentionMs"],
+      "properties": {
+        "keyFields": {"type": "array", "items": {"type": "string"}, "uniqueItems": true},
+        "retentionMs": {"type": "integer", "minimum": 0}
+      }
+    },
+    "timeoutMs": {"type": "integer", "minimum": 1},
+    "retry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["maxAttempts", "retryableErrors", "backoffMs"],
+      "properties": {
+        "maxAttempts": {"type": "integer", "minimum": 1},
+        "retryableErrors": {"type": "array", "items": {"type": "string"}},
+        "backoffMs": {"type": "integer", "minimum": 0}
+      }
+    },
+    "rollback": {
+      "type": "object",
+      "required": ["strategy"],
+      "properties": {
+        "strategy": {"enum": ["none", "retain-previous-generation", "compensate"]},
+        "capability": {"type": "string"}
+      }
+    },
+    "healthCheck": {"type": "object", "required": ["type"]},
+    "emittedEvidence": {"type": "array", "items": {"type": "string"}, "uniqueItems": true},
+    "effect": {"enum": ["read-only", "mutating"]}
+  }
+}

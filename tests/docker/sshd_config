@@ -1,0 +1,9 @@
+PubkeyAuthentication yes
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+PermitRootLogin no
+AllowUsers fabric
+AuthorizedKeysFile .ssh/authorized_keys
+SetEnv XDG_STATE_HOME=/var/lib
+UsePAM no
+PidFile /run/sshd.pid

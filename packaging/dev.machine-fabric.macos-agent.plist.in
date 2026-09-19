@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>dev.machine-fabric.macos-agent</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>@APP_EXECUTABLE@</string>
+    <string>--socket</string>
+    <string>@SOCKET@</string>
+    <string>executor</string>
+    <string>serve</string>
+    <string>--id</string>
+    <string>@EXECUTOR_ID@</string>
+    <string>--allow-root</string>
+    <string>@CODE_ROOT@</string>
+    <string>--allow-root</string>
+    <string>@WORKSPACE_ROOT@</string>
+    <string>--allow-root</string>
+    <string>@STATE_ROOT@</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ProcessType</key>
+  <string>Interactive</string>
+  <key>StandardOutPath</key>
+  <string>@LOG_PATH@</string>
+  <key>StandardErrorPath</key>
+  <string>@LOG_PATH@</string>
+</dict>
+</plist>

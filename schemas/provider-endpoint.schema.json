@@ -1,0 +1,38 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://machine-fabric.dev/schemas/provider-endpoint.schema.json",
+  "title": "Capability Provider Endpoint",
+  "oneOf": [
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["transport", "socket"],
+      "properties": {
+        "transport": {"const": "local"},
+        "socket": {"type": "string"}
+      }
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["transport", "host", "socket"],
+      "properties": {
+        "transport": {"const": "ssh"},
+        "host": {"type": "string"},
+        "socket": {"type": "string"},
+        "controlPath": {"type": "string"}
+      }
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["transport", "executable"],
+      "properties": {
+        "transport": {"const": "command"},
+        "executable": {"type": "string"},
+        "args": {"type": "array", "items": {"type": "string"}},
+        "cwd": {"type": "string"}
+      }
+    }
+  ]
+}

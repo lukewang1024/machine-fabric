@@ -1,0 +1,38 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  rust:
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      matrix:
+        runner: [ubuntu-latest, macos-14, windows-latest]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2.9.2
+      - run: cargo fmt --check
+      - run: cargo test --workspace
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - if: runner.os != 'Windows'
+        run: sh -n scripts/*.sh
+      - if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $errors = @()
+          Get-ChildItem scripts/*.ps1 | ForEach-Object {
+            $tokens = $null
+            $fileErrors = $null
+            [System.Management.Automation.Language.Parser]::ParseFile($_.FullName, [ref]$tokens, [ref]$fileErrors) | Out-Null
+            $errors += $fileErrors
+          }
+          if ($errors.Count) { $errors | Format-List; exit 1 }

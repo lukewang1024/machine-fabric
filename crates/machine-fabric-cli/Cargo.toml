@@ -1,0 +1,24 @@
+[package]
+name = "machine-fabric-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+build = "build.rs"
+
+[[bin]]
+name = "machine-fabric"
+path = "src/main.rs"
+
+[[bin]]
+name = "machine-fabric-macos-agent"
+path = "src/bin/machine-fabric-macos-agent.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml.workspace = true
+machine-fabric-core = { path = "../machine-fabric-core" }
+machine-fabric-protocol = { path = "../machine-fabric-protocol" }
+machine-fabric-runtime = { path = "../machine-fabric-runtime" }

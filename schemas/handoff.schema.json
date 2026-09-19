@@ -1,0 +1,84 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://machine-fabric.dev/schemas/handoff.schema.json",
+  "title": "Structured Handoff",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "id",
+    "workspaceSessionId",
+    "objective",
+    "from",
+    "to",
+    "artifacts",
+    "evidence",
+    "completedActions",
+    "pendingActions",
+    "acceptanceCriteria",
+    "constraints",
+    "blockers",
+    "createdAt"
+  ],
+  "properties": {
+    "id": {"type": "string"},
+    "workspaceSessionId": {"type": "string"},
+    "objective": {"type": "string"},
+    "from": {"$ref": "#/$defs/role"},
+    "to": {"$ref": "#/$defs/role"},
+    "artifacts": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["artifactType", "digest", "generation", "provenance"],
+        "properties": {
+          "artifactType": {"type": "string"},
+          "digest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+          "generation": {"type": "string"},
+          "provenance": {"type": "object"},
+          "location": {
+            "oneOf": [
+              {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["kind", "executorId", "path"],
+                "properties": {
+                  "kind": {"const": "file"},
+                  "executorId": {"type": "string"},
+                  "path": {"type": "string"}
+                }
+              },
+              {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["kind", "url"],
+                "properties": {
+                  "kind": {"const": "url"},
+                  "url": {"type": "string"}
+                }
+              }
+            ]
+          }
+        }
+      }
+    },
+    "evidence": {"type": "array", "items": {}},
+    "completedActions": {"type": "array", "items": {"type": "object"}},
+    "pendingActions": {"type": "array", "items": {"type": "object", "required": ["capability"]}},
+    "acceptanceCriteria": {"type": "array", "items": {"type": "string"}},
+    "constraints": {"type": "array", "items": {"type": "string"}},
+    "blockers": {"type": "array", "items": {"type": "string"}},
+    "createdAt": {"type": "integer"},
+    "acknowledgedAt": {"type": ["integer", "null"]},
+    "completedAt": {"type": ["integer", "null"]}
+  },
+  "$defs": {
+    "role": {
+      "type": "object",
+      "required": ["role"],
+      "properties": {
+        "agentId": {"type": "string"},
+        "role": {"type": "string"}
+      }
+    }
+  }
+}

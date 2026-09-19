@@ -1,0 +1,4 @@
+interface:
+  display_name: "Machine Fabric"
+  short_description: "Deploy and repair machine fabric nodes"
+  default_prompt: "Use $machine-fabric to deploy or diagnose my selected fabric nodes."
