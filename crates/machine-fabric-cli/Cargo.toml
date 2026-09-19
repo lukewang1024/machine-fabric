@@ -22,3 +22,6 @@ serde_yaml.workspace = true
 machine-fabric-core = { path = "../machine-fabric-core" }
 machine-fabric-protocol = { path = "../machine-fabric-protocol" }
 machine-fabric-runtime = { path = "../machine-fabric-runtime" }
+
+[target.'cfg(windows)'.dependencies]
+windows-service = "0.8.1"

@@ -10,9 +10,15 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashSet;
 use std::env;
+#[cfg(windows)]
+use std::ffi::{OsStr, OsString};
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
+#[cfg(windows)]
+use std::process::{Command, Stdio};
 use std::sync::Arc;
+#[cfg(windows)]
+use std::time::Duration;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -220,6 +226,25 @@ enum RemotePlatform {
 }
 
 fn main() -> Result<()> {
+    #[cfg(windows)]
+    {
+        let args = env::args_os().collect::<Vec<_>>();
+        if args
+            .get(1)
+            .is_some_and(|argument| argument == OsStr::new("--service"))
+        {
+            let service_name = args
+                .get(2)
+                .ok_or_else(|| anyhow::anyhow!("--service requires a service name"))?;
+            windows_service::service_dispatcher::start(service_name, ffi_service_main)
+                .map_err(|error| anyhow::anyhow!("connect Windows service dispatcher: {error}"))?;
+            return Ok(());
+        }
+    }
+    run_cli()
+}
+
+fn run_cli() -> Result<()> {
     let cli = Cli::parse();
     match &cli.command {
         Command::Controller { .. } => {
@@ -363,6 +388,127 @@ fn main() -> Result<()> {
         Command::Manifest {
             command: ManifestCommand::Plan { file },
         } => plan_fabric_manifest(&file),
+    }
+}
+
+#[cfg(windows)]
+windows_service::define_windows_service!(ffi_service_main, windows_service_main);
+
+#[cfg(windows)]
+fn windows_service_main(_arguments: Vec<OsString>) {
+    if let Err(error) = run_windows_service() {
+        eprintln!("machine-fabric Windows service failed: {error:#}");
+    }
+}
+
+#[cfg(windows)]
+fn run_windows_service() -> Result<()> {
+    use std::sync::mpsc::{self, RecvTimeoutError};
+    use windows_service::service::{
+        ServiceControl, ServiceControlAccept, ServiceExitCode, ServiceState, ServiceStatus,
+        ServiceType,
+    };
+    use windows_service::service_control_handler::{self, ServiceControlHandlerResult};
+
+    let args = env::args_os().collect::<Vec<_>>();
+    let service_name = args
+        .get(2)
+        .ok_or_else(|| anyhow::anyhow!("Windows service name is missing"))?;
+    let worker_args = args.iter().skip(3).cloned().collect::<Vec<_>>();
+    let (shutdown_tx, shutdown_rx) = mpsc::channel();
+    let status_handle =
+        service_control_handler::register(service_name, move |event| match event {
+            ServiceControl::Stop | ServiceControl::Shutdown => {
+                let _ = shutdown_tx.send(());
+                ServiceControlHandlerResult::NoError
+            }
+            ServiceControl::Interrogate => ServiceControlHandlerResult::NoError,
+            _ => ServiceControlHandlerResult::NotImplemented,
+        })?;
+
+    status_handle.set_service_status(ServiceStatus {
+        service_type: ServiceType::OWN_PROCESS,
+        current_state: ServiceState::StartPending,
+        controls_accepted: ServiceControlAccept::empty(),
+        exit_code: ServiceExitCode::Win32(0),
+        checkpoint: 1,
+        wait_hint: Duration::from_secs(30),
+        process_id: None,
+    })?;
+
+    let executable = env::current_exe()?;
+    let mut worker = match Command::new(executable)
+        .args(worker_args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        Ok(worker) => worker,
+        Err(error) => {
+            status_handle.set_service_status(ServiceStatus {
+                service_type: ServiceType::OWN_PROCESS,
+                current_state: ServiceState::Stopped,
+                controls_accepted: ServiceControlAccept::empty(),
+                exit_code: ServiceExitCode::Win32(1),
+                checkpoint: 0,
+                wait_hint: Duration::default(),
+                process_id: None,
+            })?;
+            return Err(error.into());
+        }
+    };
+
+    status_handle.set_service_status(ServiceStatus {
+        service_type: ServiceType::OWN_PROCESS,
+        current_state: ServiceState::Running,
+        controls_accepted: ServiceControlAccept::STOP | ServiceControlAccept::SHUTDOWN,
+        exit_code: ServiceExitCode::Win32(0),
+        checkpoint: 0,
+        wait_hint: Duration::default(),
+        process_id: None,
+    })?;
+
+    loop {
+        if let Some(status) = worker.try_wait()? {
+            status_handle.set_service_status(ServiceStatus {
+                service_type: ServiceType::OWN_PROCESS,
+                current_state: ServiceState::Stopped,
+                controls_accepted: ServiceControlAccept::empty(),
+                exit_code: ServiceExitCode::Win32(status.code().unwrap_or(1) as u32),
+                checkpoint: 0,
+                wait_hint: Duration::default(),
+                process_id: None,
+            })?;
+            return Ok(());
+        }
+
+        match shutdown_rx.recv_timeout(Duration::from_millis(250)) {
+            Ok(()) | Err(RecvTimeoutError::Disconnected) => {
+                status_handle.set_service_status(ServiceStatus {
+                    service_type: ServiceType::OWN_PROCESS,
+                    current_state: ServiceState::StopPending,
+                    controls_accepted: ServiceControlAccept::empty(),
+                    exit_code: ServiceExitCode::Win32(0),
+                    checkpoint: 1,
+                    wait_hint: Duration::from_secs(10),
+                    process_id: None,
+                })?;
+                let _ = worker.kill();
+                let _ = worker.wait();
+                status_handle.set_service_status(ServiceStatus {
+                    service_type: ServiceType::OWN_PROCESS,
+                    current_state: ServiceState::Stopped,
+                    controls_accepted: ServiceControlAccept::empty(),
+                    exit_code: ServiceExitCode::Win32(0),
+                    checkpoint: 0,
+                    wait_hint: Duration::default(),
+                    process_id: None,
+                })?;
+                return Ok(());
+            }
+            Err(RecvTimeoutError::Timeout) => {}
+        }
     }
 }
 

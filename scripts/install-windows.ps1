@@ -40,11 +40,13 @@ function Quote-Arg([string]$Value) {
 
 $controllerArgs = @(
   (Quote-Arg $installedBinary)
+  "--service", (Quote-Arg "MachineFabricController")
   "--socket", (Quote-Arg $controllerSocket)
   "controller", "serve", "--state", (Quote-Arg $controllerState), "--id", (Quote-Arg $NodeId)
 ) -join " "
 $executorParts = @(
   (Quote-Arg $installedBinary)
+  "--service", (Quote-Arg "MachineFabricExecutor")
   "--socket", (Quote-Arg $executorSocket)
   "executor", "serve", "--id", (Quote-Arg ($NodeId + "-native"))
   "--state", (Quote-Arg $executorState)
