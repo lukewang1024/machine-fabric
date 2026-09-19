@@ -32,6 +32,15 @@ foreach ($serviceName in @("MachineFabricController", "MachineFabricExecutor")) 
     Stop-Service -Name $serviceName -Force -ErrorAction SilentlyContinue
   }
 }
+foreach ($serviceName in @("MachineFabricController", "MachineFabricExecutor")) {
+  $service = Get-Service -Name $serviceName -ErrorAction SilentlyContinue
+  if ($service -and $service.Status -ne [System.ServiceProcess.ServiceControllerStatus]::Stopped) {
+    $service.WaitForStatus(
+      [System.ServiceProcess.ServiceControllerStatus]::Stopped,
+      [TimeSpan]::FromSeconds(30)
+    )
+  }
+}
 Copy-Item -Force -LiteralPath $Binary -Destination $installedBinary
 
 function Quote-Arg([string]$Value) {
