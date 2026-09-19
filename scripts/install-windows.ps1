@@ -96,6 +96,12 @@ $registration = @{
   executorId = $NodeId + "-native"
   endpoint = @{ transport = "local"; socket = $executorSocket }
 } | ConvertTo-Json -Compress
-& $installedBinary --socket $controllerSocket call executor.register $registration | Out-Null
-if ($LASTEXITCODE -ne 0) { throw "failed to register local executor" }
+$registrationPath = Join-Path $env:TEMP ("machine-fabric-registration-" + [guid]::NewGuid().ToString("N") + ".json")
+try {
+  [IO.File]::WriteAllText($registrationPath, $registration, (New-Object System.Text.UTF8Encoding $false))
+  & $installedBinary --socket $controllerSocket call executor.register --params-file $registrationPath | Out-Null
+  if ($LASTEXITCODE -ne 0) { throw "failed to register local executor" }
+} finally {
+  Remove-Item -LiteralPath $registrationPath -Force -ErrorAction SilentlyContinue
+}
 Write-Output $installedBinary

@@ -62,8 +62,11 @@ enum Command {
     },
     Call {
         action: String,
-        #[arg(default_value = "{}")]
-        params: String,
+        #[arg(conflicts_with = "params_file")]
+        params: Option<String>,
+        /// Read JSON parameters from a UTF-8 file, avoiding native-shell quoting limits.
+        #[arg(long, conflicts_with = "params")]
+        params_file: Option<PathBuf>,
     },
     Controller {
         #[command(subcommand)]
@@ -293,10 +296,20 @@ fn run_cli() -> Result<()> {
             since_ms,
             tail,
         ),
-        Command::Call { action, params } => print_response(call_unix(
-            cli.socket.unwrap_or_else(default_controller_socket),
-            &Request::new(action, serde_json::from_str(&params)?),
-        )?),
+        Command::Call {
+            action,
+            params,
+            params_file,
+        } => {
+            let params = match params_file {
+                Some(path) => serde_json::from_slice(&std::fs::read(path)?)?,
+                None => serde_json::from_str(params.as_deref().unwrap_or("{}"))?,
+            };
+            print_response(call_unix(
+                cli.socket.unwrap_or_else(default_controller_socket),
+                &Request::new(action, params),
+            )?)
+        }
         Command::Controller {
             command: ControllerCommand::Serve { state, id },
         } => {
