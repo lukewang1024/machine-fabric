@@ -119,7 +119,111 @@ test -f "$peer_template" || { printf 'bootstrap-fabric: missing %s\n' "$peer_tem
 test -f "$remote_peer_template" || { printf 'bootstrap-fabric: missing %s\n' "$remote_peer_template" >&2; exit 2; }
 
 release_cache=$(mktemp -d "${TMPDIR:-/tmp}/machine-fabric-fabric.XXXXXX")
-trap 'rm -rf "$release_cache"' EXIT HUP INT TERM
+pause_state_dir=$state_home/machine-fabric
+mkdir -p "$pause_state_dir"
+paused_peer_connections=$pause_state_dir/bootstrap-paused-peers-$local_id-$$.txt
+: >"$paused_peer_connections"
+setup_succeeded=false
+
+remove_paused_peer_connection() {
+  record="$1 $2 $3"
+  temporary=$paused_peer_connections.tmp.$$
+  grep -Fvx "$record" "$paused_peer_connections" >"$temporary" || true
+  mv "$temporary" "$paused_peer_connections"
+}
+
+resume_paused_peer_connection() {
+  resume_kind=$1
+  resume_owner=$2
+  resume_target=$3
+  record="$resume_kind $resume_owner $resume_target"
+  grep -Fqx "$record" "$paused_peer_connections" || return 0
+  case $resume_kind in
+    local)
+      label=dev.machine-fabric.peer.$resume_target
+      domain=gui/$(id -u)
+      plist=$launch_agents/$label.plist
+      if [ -f "$plist" ]; then
+        if ! launchctl print "$domain/$label" >/dev/null 2>&1; then
+          launchctl bootstrap "$domain" "$plist" >/dev/null 2>&1 || return 1
+        fi
+        launchctl kickstart -k "$domain/$label" >/dev/null 2>&1 || return 1
+      else
+        return 1
+      fi
+      ;;
+    posix)
+      unit=machine-fabric-peer-$resume_target.service
+      ssh -o BatchMode=yes -o ClearAllForwardings=yes "$resume_owner" \
+        "systemctl --user start '$unit'" >/dev/null || return 1
+      ;;
+    windows)
+      service=MachineFabricPeer_$resume_target
+      ssh -o BatchMode=yes -o ClearAllForwardings=yes "$resume_owner" \
+        "powershell.exe -NoProfile -NonInteractive -Command \"Start-Service -Name '$service'\"" \
+        >/dev/null || return 1
+      ;;
+    *) return 1 ;;
+  esac
+  remove_paused_peer_connection "$resume_kind" "$resume_owner" "$resume_target"
+}
+
+restore_paused_peer_connections() {
+  [ -s "$paused_peer_connections" ] || return 0
+  snapshot=$paused_peer_connections.restore.$$
+  cp "$paused_peer_connections" "$snapshot" || return 1
+  while IFS=' ' read -r restore_kind restore_owner restore_target; do
+    if ! resume_paused_peer_connection "$restore_kind" "$restore_owner" "$restore_target"; then
+      printf 'bootstrap-fabric: could not resume paused %s peer connection %s -> %s\n' \
+        "$restore_kind" "$restore_owner" "$restore_target" >&2
+    fi
+  done <"$snapshot"
+  rm -f "$snapshot"
+}
+
+cleanup() {
+  if [ "$setup_succeeded" != true ]; then
+    restore_paused_peer_connections || true
+  fi
+  rm -rf "$release_cache"
+  if [ ! -s "$paused_peer_connections" ]; then rm -f "$paused_peer_connections"; fi
+}
+
+trap cleanup EXIT
+trap 'exit 1' HUP INT TERM
+
+pause_peer_connectors_to_windows() {
+  target=$1
+  label=dev.machine-fabric.peer.$target
+  domain=gui/$(id -u)
+  plist=$launch_agents/$label.plist
+  if [ -f "$plist" ] && launchctl print "$domain/$label" >/dev/null 2>&1; then
+    printf 'local %s %s\n' "$local_id" "$target" >>"$paused_peer_connections"
+    launchctl bootout "$domain/$label" || return 1
+  fi
+
+  for connector in $nodes; do
+    if [ "$connector" = "$target" ]; then continue; fi
+    if [ "$(platform_of "$connector")" = windows ]; then
+      service=MachineFabricPeer_$target
+      pause_output=$(ssh -o BatchMode=yes -o ClearAllForwardings=yes "$connector" \
+        "powershell.exe -NoProfile -NonInteractive -Command \"\$s=Get-Service -Name '$service' -ErrorAction SilentlyContinue; if (\$s -and \$s.Status -ne 'Stopped') { Stop-Service -Name '$service' -Force; Write-Output active } else { Write-Output inactive }\"")
+      pause_state=$(printf '%s' "$pause_output" | tr -d '\r\n')
+      if [ "$pause_state" = active ]; then
+        printf 'windows %s %s\n' "$connector" "$target" >>"$paused_peer_connections"
+        printf 'bootstrap-fabric: paused Windows peer connector %s -> %s\n' "$connector" "$target"
+      fi
+    else
+      unit=machine-fabric-peer-$target.service
+      pause_state=$(ssh -o BatchMode=yes -o ClearAllForwardings=yes "$connector" \
+        "if systemctl --user is-active --quiet '$unit'; then systemctl --user stop '$unit' || exit 1; printf active; else printf inactive; fi")
+      if [ "$pause_state" = active ]; then
+        printf 'posix %s %s\n' "$connector" "$target" >>"$paused_peer_connections"
+        printf 'bootstrap-fabric: paused POSIX peer connector %s -> %s\n' "$connector" "$target"
+      fi
+    fi
+  done
+}
 
 install_linux_release() {
   install_host=$1
@@ -484,10 +588,12 @@ for host in "$@"; do
   if [ "$verify_only" = false ] && [ "$skip_release_install" = false ]; then
     printf 'bootstrap-fabric: %s: installing %s\n' "$host" "$version"
     if [ "$host_platform" = windows ]; then
+      pause_peer_connectors_to_windows "$host"
       scp -q "$script_dir/install-from-release.ps1" "$host:install-machine-fabric.ps1"
       ssh -o BatchMode=yes -o ClearAllForwardings=yes "$host" \
         "powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command \"\$env:MACHINE_FABRIC_RELEASE_BASE_URL='$release_base_url'; & './install-machine-fabric.ps1' -Version '$version' -NodeId '$host'; Remove-Item './install-machine-fabric.ps1'\"" \
         >/dev/null
+      resume_paused_peer_connection local "$local_id" "$host"
     else
       install_linux_release "$host" "$host" "$executor_id"
     fi
@@ -576,8 +682,14 @@ for node_a in "$@"; do
       if [ "$dialer_platform" = windows ]; then
         install_windows_peer_service "$dialer" "$peer" "$peer_platform"
         wait_remote_peer_ready "$dialer" "$dialer_platform" "$dialer_home" "$peer"
+        if [ "$peer_platform" = windows ]; then
+          remove_paused_peer_connection windows "$dialer" "$peer"
+        fi
       else
         install_remote_peer_service "$dialer" "$peer" "$dialer_home" "$peer_home" "$peer_platform"
+        if [ "$peer_platform" = windows ]; then
+          remove_paused_peer_connection posix "$dialer" "$peer"
+        fi
       fi
       if [ "$peer_platform" = windows ]; then peer_executor_id=$peer-native; else peer_executor_id=$peer-rust; fi
       if [ "$dialer_platform" = windows ]; then dialer_executor_id=$dialer-native; else dialer_executor_id=$dialer-rust; fi
@@ -710,4 +822,10 @@ if [ "$verify_only" = false ]; then
   done
   verify_controller_routes "$@"
 fi
+if [ -s "$paused_peer_connections" ]; then
+  printf '%s\n' 'bootstrap-fabric: peer connections remained paused after reconciliation:' >&2
+  cat "$paused_peer_connections" >&2
+  exit 1
+fi
+setup_succeeded=true
 printf '%s\n' 'bootstrap-fabric: selected executors are ready'
