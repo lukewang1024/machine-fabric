@@ -23,6 +23,9 @@ log_path=$state_home/machine-fabric/macos-agent.log
 controller_log=$state_home/machine-fabric/controller.log
 node_id=${MACHINE_FABRIC_NODE_ID:-$(hostname -s)}
 backup_root=$state_root/backups/$(date -u +%Y%m%dT%H%M%SZ)
+allow_roots=${MACHINE_FABRIC_LOCAL_ALLOW_ROOTS:-"$HOME/Code
+$HOME/Workspace
+$state_home"}
 
 if [ ! -x "$source_binary" ]; then
   echo "install-macos-app: executable not found: $source_binary" >&2
@@ -35,6 +38,9 @@ fi
 app_version=$($source_binary --version | awk 'NR == 1 { print $2 }')
 
 mkdir -p "$contents/MacOS" "$(dirname "$controller_executable")" "$bin_home" "$launch_agents" "$state_home/machine-fabric"
+allow_roots_file=$state_root/.allow-roots.$$.xml
+trap 'rm -f "$allow_roots_file" "$launch_plist.$$.tmp" "$launch_plist.$$.tmp.2"' EXIT HUP INT TERM
+printf '%s\n' "$allow_roots" | sh scripts/render-allow-roots.sh >"$allow_roots_file"
 if [ -f "$controller_state" ] || [ -f "$state_home/machine-fabric/executor-fences.json" ]; then
   mkdir -p "$backup_root"
   for state_file in "$controller_state" "$state_home/machine-fabric/executor-fences.json"; do
@@ -125,6 +131,15 @@ sed \
   -e "s|@STATE_ROOT@|$(escape_sed "$state_home")|g" \
   -e "s|@LOG_PATH@|$(escape_sed "$log_path")|g" \
   "$template" >"$launch_plist.$$.tmp"
+awk -v roots_file="$allow_roots_file" '
+  $0 == "    @ALLOW_ROOTS@" {
+    while ((getline line < roots_file) > 0) print line
+    close(roots_file)
+    next
+  }
+  { print }
+' "$launch_plist.$$.tmp" >"$launch_plist.$$.tmp.2"
+mv "$launch_plist.$$.tmp.2" "$launch_plist.$$.tmp"
 plutil -lint "$launch_plist.$$.tmp" >/dev/null
 mv "$launch_plist.$$.tmp" "$launch_plist"
 

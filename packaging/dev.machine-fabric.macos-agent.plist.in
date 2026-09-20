@@ -13,12 +13,7 @@
     <string>serve</string>
     <string>--id</string>
     <string>@EXECUTOR_ID@</string>
-    <string>--allow-root</string>
-    <string>@CODE_ROOT@</string>
-    <string>--allow-root</string>
-    <string>@WORKSPACE_ROOT@</string>
-    <string>--allow-root</string>
-    <string>@STATE_ROOT@</string>
+    @ALLOW_ROOTS@
   </array>
   <key>RunAtLoad</key>
   <true/>
