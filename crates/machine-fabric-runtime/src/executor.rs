@@ -1286,7 +1286,7 @@ impl ExecutorRuntime {
                 let user_data_dir = params
                     .get("userDataDir")
                     .and_then(Value::as_str)
-                    .map(|_| self.path(&params, "userDataDir", true))
+                    .map(|_| self.path(&params, "userDataDir", false))
                     .transpose()?;
                 crate::macos::launch(
                     &application_path,
@@ -1454,6 +1454,16 @@ impl ExecutorRuntime {
                 crate::windows::native_inspect(
                     &application_path,
                     params.get("expectedWindowTitle").and_then(Value::as_str),
+                )
+            }
+            #[cfg(windows)]
+            "ui.capture" => {
+                let application_path = self.path(&params, "applicationPath", true)?;
+                let output = self.path(&params, "output", false)?;
+                crate::windows::capture_window(
+                    &application_path,
+                    params.get("expectedWindowTitle").and_then(Value::as_str),
+                    &output,
                 )
             }
             _ => Err(RpcError::new(
@@ -1629,6 +1639,7 @@ pub fn capability_catalog() -> Vec<CapabilityDescriptor> {
         ("application.launch", Effect::Mutating),
         ("application.open-file", Effect::Mutating),
         ("ui.evaluate", Effect::ReadOnly),
+        ("ui.capture", Effect::ReadOnly),
         ("ui.native-inspect", Effect::ReadOnly),
     ]);
     capabilities
@@ -1919,7 +1930,7 @@ fn contract(name: &str, effect: Effect) -> CapabilityDescriptor {
                 "args",
                 "terminateConflictingInstances",
             ],
-            60_000,
+            120_000,
             RollbackStrategy::Compensate {
                 capability: "process.stop".to_owned(),
             },
@@ -1991,6 +2002,7 @@ fn contract(name: &str, effect: Effect) -> CapabilityDescriptor {
             RollbackStrategy::None,
             vec!["automation-result"],
         ),
+        #[cfg(not(windows))]
         "ui.capture" => (
             vec!["cdp"],
             json!({
@@ -2003,6 +2015,20 @@ fn contract(name: &str, effect: Effect) -> CapabilityDescriptor {
             30_000,
             RollbackStrategy::None,
             vec!["screenshot"],
+        ),
+        #[cfg(windows)]
+        "ui.capture" => (
+            vec!["windows-desktop", "printwindow"],
+            json!({
+                "applicationPath": {"type": "string"},
+                "expectedWindowTitle": {"type": "string"},
+                "output": {"type": "string"}
+            }),
+            Vec::new(),
+            vec!["applicationPath", "expectedWindowTitle", "output"],
+            30_000,
+            RollbackStrategy::None,
+            vec!["screenshot", "capture-backend", "window-bounds"],
         ),
         "ui.native-inspect" => (
             vec![if cfg!(windows) {
@@ -2697,6 +2723,27 @@ fn io_error(code: &str, path: &Path, error: std::io::Error) -> RpcError {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn launch_admits_new_isolated_profile_but_keeps_path_policy() {
+        let directory = tempfile::tempdir().unwrap();
+        let runtime = ExecutorRuntime::new("local", vec![directory.path().to_path_buf()]).unwrap();
+        let params = json!({"applicationPath": directory.path(), "userDataDir": directory.path().join("new-profile"), "args": ["--example"], "bundleIdentifier": "test.app"});
+        let error = runtime
+            .dispatch("application.launch", params.clone())
+            .unwrap_err();
+        assert_eq!(error.code, "UNSAFE_CREDENTIAL_MODE");
+        let mut outside = params;
+        outside["userDataDir"] = json!(directory.path().parent().unwrap().join("outside-profile"));
+        assert_eq!(
+            runtime
+                .dispatch("application.launch", outside)
+                .unwrap_err()
+                .code,
+            "PATH_OUTSIDE_ALLOWED_ROOTS"
+        );
+    }
+
     #[test]
     fn runtime_record_preserves_marker_and_rejects_invalid_evidence() {
         let directory = tempfile::tempdir().unwrap();

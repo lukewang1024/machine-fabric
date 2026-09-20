@@ -716,6 +716,161 @@ $json=@{accessibilityTrusted=$true;processes=$items} | ConvertTo-Json -Depth 8 -
     )
 }
 
+pub fn capture_window(
+    application: &Path,
+    expected_window_title: Option<&str>,
+    output: &Path,
+) -> Result<Value, RpcError> {
+    let executable = find_executable(application).ok_or_else(|| {
+        RpcError::new("WINDOW_CAPTURE_FAILED", "application executable is missing")
+    })?;
+    let parent = output.parent().ok_or_else(|| {
+        RpcError::new(
+            "INVALID_PARAMS",
+            "capture output must have a parent directory",
+        )
+    })?;
+    fs::create_dir_all(parent)
+        .map_err(|error| RpcError::new("WINDOW_CAPTURE_FAILED", error.to_string()))?;
+    let metadata_path = parent.join(format!(
+        ".machine-fabric-window-capture-{}-{}.json",
+        std::process::id(),
+        now_ms()
+    ));
+    let quote = |path: &Path| path.to_string_lossy().replace('\'', "''");
+    let script = r#"
+Add-Type -AssemblyName System.Drawing
+Add-Type @'
+using System;
+using System.Runtime.InteropServices;
+public static class WorkbenchCapture {
+  public delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
+  [StructLayout(LayoutKind.Sequential)] public struct RECT { public int Left, Top, Right, Bottom; }
+  [DllImport("user32.dll")] public static extern bool EnumWindows(EnumWindowsProc callback, IntPtr lParam);
+  [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr hWnd);
+  [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint processId);
+  [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr hWnd, out RECT rect);
+  [DllImport("user32.dll")] public static extern int GetWindowTextLengthW(IntPtr hWnd);
+  [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern int GetWindowTextW(IntPtr hWnd, System.Text.StringBuilder text, int count);
+  [DllImport("user32.dll")] public static extern bool PrintWindow(IntPtr hWnd, IntPtr hdcBlt, uint flags);
+  [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);
+}
+'@
+function Normalize-WorkbenchPath([string]$value) {
+  $full=[IO.Path]::GetFullPath($value)
+  if($full.StartsWith('\\?\')) { $full=$full.Substring(4) }
+  $full.TrimEnd('\')
+}
+$target=Normalize-WorkbenchPath '@TARGET@'
+$expected='@EXPECTED@'
+$output=Normalize-WorkbenchPath '@OUTPUT@'
+$metadata=Normalize-WorkbenchPath '@METADATA@'
+$ErrorActionPreference='Stop'
+try {
+$pids=@(Get-CimInstance Win32_Process | Where-Object { $_.ExecutablePath -and ((Normalize-WorkbenchPath $_.ExecutablePath) -eq $target) } | ForEach-Object { [uint32]$_.ProcessId })
+$candidates=New-Object System.Collections.Generic.List[object]
+$callback=[WorkbenchCapture+EnumWindowsProc]{ param($hwnd,$unused)
+  if(-not [WorkbenchCapture]::IsWindowVisible($hwnd)) { return $true }
+  $windowPid=[uint32]0
+  [WorkbenchCapture]::GetWindowThreadProcessId($hwnd,[ref]$windowPid) | Out-Null
+  if($pids -notcontains $windowPid) { return $true }
+  $rect=New-Object WorkbenchCapture+RECT
+  if(-not [WorkbenchCapture]::GetWindowRect($hwnd,[ref]$rect)) { return $true }
+  $width=$rect.Right-$rect.Left; $height=$rect.Bottom-$rect.Top
+  if($width -lt 2 -or $height -lt 2) { return $true }
+  $length=[WorkbenchCapture]::GetWindowTextLengthW($hwnd)
+  $builder=New-Object Text.StringBuilder ($length+1)
+  [WorkbenchCapture]::GetWindowTextW($hwnd,$builder,$builder.Capacity) | Out-Null
+  $title=$builder.ToString()
+  $matches=[string]::IsNullOrWhiteSpace($expected) -or $title.IndexOf($expected,[StringComparison]::OrdinalIgnoreCase) -ge 0
+  $candidates.Add([pscustomobject]@{Hwnd=$hwnd;Pid=$windowPid;Rect=$rect;Title=$title;Matches=$matches;Area=([int64]$width*[int64]$height)})
+  return $true
+}
+[WorkbenchCapture]::EnumWindows($callback,[IntPtr]::Zero) | Out-Null
+$selected=$candidates | Sort-Object @{Expression='Matches';Descending=$true},@{Expression='Area';Descending=$true} | Select-Object -First 1
+if(-not $selected) { throw 'no visible application window found' }
+$rect=$selected.Rect; $width=$rect.Right-$rect.Left; $height=$rect.Bottom-$rect.Top
+function Measure-Bitmap([Drawing.Bitmap]$bitmap) {
+  $samples=0; $nonBlack=0; $minimum=765; $maximum=0; $sum=0L
+  $stepX=[Math]::Max(1,[int]($bitmap.Width/100)); $stepY=[Math]::Max(1,[int]($bitmap.Height/100))
+  for($y=0;$y -lt $bitmap.Height;$y+=$stepY) { for($x=0;$x -lt $bitmap.Width;$x+=$stepX) {
+    $pixel=$bitmap.GetPixel($x,$y); $value=$pixel.R+$pixel.G+$pixel.B
+    $samples++; $sum+=$value; if($value -gt 12){$nonBlack++}; if($value -lt $minimum){$minimum=$value}; if($value -gt $maximum){$maximum=$value}
+  }}
+  [pscustomobject]@{samples=$samples;nonBlackRatio=($nonBlack/[double]$samples);meanRgbSum=($sum/[double]$samples);range=($maximum-$minimum)}
+}
+function Capture-PrintWindow {
+  $bitmap=New-Object Drawing.Bitmap $width,$height,([Drawing.Imaging.PixelFormat]::Format32bppArgb)
+  $graphics=[Drawing.Graphics]::FromImage($bitmap); $hdc=$graphics.GetHdc(); $ok=$false
+  try { $ok=[WorkbenchCapture]::PrintWindow($selected.Hwnd,$hdc,2) } finally { $graphics.ReleaseHdc($hdc); $graphics.Dispose() }
+  [pscustomobject]@{Bitmap=$bitmap;Ok=$ok;Metrics=(Measure-Bitmap $bitmap)}
+}
+function Capture-ScreenDc {
+  [WorkbenchCapture]::SetForegroundWindow($selected.Hwnd) | Out-Null; Start-Sleep -Milliseconds 400
+  $bitmap=New-Object Drawing.Bitmap $width,$height,([Drawing.Imaging.PixelFormat]::Format32bppArgb)
+  $graphics=[Drawing.Graphics]::FromImage($bitmap)
+  try { $graphics.CopyFromScreen($rect.Left,$rect.Top,0,0,$bitmap.Size,[Drawing.CopyPixelOperation]::SourceCopy) } finally { $graphics.Dispose() }
+  [pscustomobject]@{Bitmap=$bitmap;Ok=$true;Metrics=(Measure-Bitmap $bitmap)}
+}
+$capture=Capture-PrintWindow; $backend='printwindow'
+if((-not $capture.Ok) -or $capture.Metrics.nonBlackRatio -lt 0.01 -or $capture.Metrics.range -lt 8) {
+  $capture.Bitmap.Dispose(); $capture=Capture-ScreenDc; $backend='screen-dc'
+}
+$capture.Bitmap.Save($output,[Drawing.Imaging.ImageFormat]::Png); $capture.Bitmap.Dispose()
+$result=[pscustomobject]@{
+  path=$output;backend=$backend;pid=$selected.Pid;handle=[int64]$selected.Hwnd;title=$selected.Title
+  width=$width;height=$height;originX=$rect.Left;originY=$rect.Top;metrics=$capture.Metrics
+}
+[IO.File]::WriteAllText($metadata,($result|ConvertTo-Json -Depth 5 -Compress),(New-Object Text.UTF8Encoding($false)))
+} catch {
+  $failure=[pscustomobject]@{error=$_.Exception.ToString();scriptStack=$_.ScriptStackTrace}
+  [IO.File]::WriteAllText($metadata,($failure|ConvertTo-Json -Depth 5 -Compress),(New-Object Text.UTF8Encoding($false)))
+}
+"#
+    .replace("@TARGET@", &quote(&executable))
+    .replace(
+        "@EXPECTED@",
+        &expected_window_title.unwrap_or_default().replace('\'', "''"),
+    )
+    .replace("@OUTPUT@", &quote(output))
+    .replace("@METADATA@", &quote(&metadata_path));
+    spawn_in_active_session(
+        Path::new(r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"),
+        &[
+            "-NoProfile".to_owned(),
+            "-NonInteractive".to_owned(),
+            "-Command".to_owned(),
+            script,
+        ],
+        parent,
+    )?;
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while !metadata_path.is_file() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(100));
+    }
+    let metadata = fs::read(&metadata_path)
+        .map_err(|error| RpcError::new("WINDOW_CAPTURE_FAILED", error.to_string()))?;
+    let _ = fs::remove_file(&metadata_path);
+    let capture: Value = serde_json::from_slice(&metadata)
+        .map_err(|error| RpcError::new("WINDOW_CAPTURE_FAILED", error.to_string()))?;
+    if let Some(error) = capture.get("error").and_then(Value::as_str) {
+        let mut failure = RpcError::new("WINDOW_CAPTURE_FAILED", error);
+        failure.details = capture;
+        return Err(failure);
+    }
+    let bytes = fs::metadata(output)
+        .map_err(|error| RpcError::new("WINDOW_CAPTURE_FAILED", error.to_string()))?
+        .len();
+    Ok(json!({
+        "applicationPath": application,
+        "executable": executable,
+        "path": output,
+        "bytes": bytes,
+        "capture": capture,
+        "capturedAt": now_ms(),
+    }))
+}
+
 fn cdp_json(port: u16, path: &str) -> Result<Value, RpcError> {
     let mut stream = TcpStream::connect_timeout(
         &format!("127.0.0.1:{port}").parse().expect("loopback"),
