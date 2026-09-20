@@ -15,6 +15,7 @@ use std::process::{Command, Stdio};
 use std::sync::{Condvar, Mutex};
 use std::time::{Duration, Instant};
 
+use crate::datapack::{DataPackResourceTree, pack_chromium_datapack};
 use crate::generation::{Overlay, activate, apply_overlays, materialize, record_state};
 use crate::process::ProcessTable;
 use crate::telemetry::{event_fields, request_event};
@@ -1161,6 +1162,58 @@ impl ExecutorRuntime {
                 }
                 apply_overlays(&application_path, &overlays)
             }
+            "artifact.pack-chromium-datapack" => {
+                let root_path = self.path(&params, "rootPath", true)?;
+                let resource_trees: Vec<DataPackResourceTree> =
+                    serde_json::from_value(params.get("resourceTrees").cloned().ok_or_else(
+                        || RpcError::new("INVALID_PARAMS", "resourceTrees are required"),
+                    )?)
+                    .map_err(|error| RpcError::new("INVALID_PARAMS", error.to_string()))?;
+                let base_pack_path = params
+                    .get("basePackPath")
+                    .and_then(Value::as_str)
+                    .map(|path| self.path(&json!({"path": path}), "path", true))
+                    .transpose()?;
+                self.path(
+                    &json!({"path": root_path.join(required_str(&params, "outputRelative")?)}),
+                    "path",
+                    false,
+                )?;
+                for tree in &resource_trees {
+                    self.path(
+                        &json!({"path": root_path.join(&tree.root_relative)}),
+                        "path",
+                        true,
+                    )?;
+                }
+                pack_chromium_datapack(
+                    &root_path,
+                    &resource_trees,
+                    Path::new(required_str(&params, "outputRelative")?),
+                    params
+                        .get("platform")
+                        .and_then(Value::as_str)
+                        .unwrap_or("win"),
+                    params.get("arch").and_then(Value::as_str).unwrap_or("x64"),
+                    params
+                        .get("bundleName")
+                        .and_then(Value::as_str)
+                        .unwrap_or("resources"),
+                    base_pack_path.as_deref(),
+                    params.get("basePackDigest").and_then(Value::as_str),
+                    &params
+                        .get("changedPrefixes")
+                        .and_then(Value::as_array)
+                        .map(|items| {
+                            items
+                                .iter()
+                                .filter_map(Value::as_str)
+                                .map(str::to_owned)
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default(),
+                )
+            }
             "application.generation.record" => {
                 let generation_root = self.path(&params, "generationRoot", true)?;
                 record_state(
@@ -1440,6 +1493,7 @@ pub fn capability_catalog() -> Vec<CapabilityDescriptor> {
         ("command.run", Effect::Mutating),
         ("artifact.build", Effect::Mutating),
         ("artifact.describe", Effect::ReadOnly),
+        ("artifact.pack-chromium-datapack", Effect::Mutating),
         ("artifact.relay.archive.create", Effect::ReadOnly),
         ("artifact.relay.archive.read", Effect::ReadOnly),
         ("artifact.relay.archive.remove", Effect::ReadOnly),
@@ -1635,6 +1689,25 @@ fn contract(name: &str, effect: Effect) -> CapabilityDescriptor {
             3_600_000,
             RollbackStrategy::None,
             vec!["artifact-relay-destination"],
+        ),
+        "artifact.pack-chromium-datapack" => (
+            vec!["chromium-datapack"],
+            json!({
+                "rootPath": {"type": "string"},
+                "resourceTrees": {"type": "array"},
+                "outputRelative": {"type": "string"},
+                "platform": {"type": "string"},
+                "arch": {"type": "string"},
+                "bundleName": {"type": "string"},
+                "basePackPath": {"type": "string"},
+                "basePackDigest": {"type": "string"},
+                "changedPrefixes": {"type": "array", "items": {"type": "string"}}
+            }),
+            vec!["datapack:${rootPath}/${outputRelative}"],
+            vec!["rootPath", "resourceTrees", "outputRelative"],
+            3_600_000,
+            RollbackStrategy::RetainPreviousGeneration,
+            vec!["packed-resource-digest", "packed-resource-manifest"],
         ),
         "application.materialize" => (
             vec!["filesystem-copy"],
@@ -2055,6 +2128,11 @@ fn output_schema(name: &str) -> Value {
         "application.launch" => json!({
             "applicationPath": {"type": "string"}, "pid": {"type": "integer"},
             "args": {"type": "array"}, "cdp": {"type": "object"}
+        }),
+        "artifact.pack-chromium-datapack" => json!({
+            "output": {"type": "string"}, "resources": {"type": "integer"},
+            "entries": {"type": "integer"}, "size": {"type": "integer"},
+            "sha256": {"type": "string"}, "contentHash": {"type": "string"}
         }),
         "application.apply-artifacts" => json!({
             "applied": {"type": "array"}

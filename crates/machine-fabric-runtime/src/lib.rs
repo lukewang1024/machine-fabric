@@ -1,5 +1,6 @@
 mod computer_use;
 mod controller;
+mod datapack;
 mod desktop;
 mod executor;
 mod generation;
