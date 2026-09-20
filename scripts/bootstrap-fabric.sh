@@ -235,7 +235,7 @@ install_linux_release() {
   if [ ! -f "$release_cache/$archive" ]; then
     curl -fsSL --retry 2 -H 'X-Tos-Access: internal' "$base/$archive" -o "$release_cache/$archive"
     curl -fsSL --retry 2 -H 'X-Tos-Access: internal' "$base/SHA256SUMS" -o "$release_cache/SHA256SUMS"
-    expected=$(awk -v name="$archive" '$2 == name {print $1}' "$release_cache/SHA256SUMS")
+    expected=$(awk -v name="$archive" '{sub(/^\*/, "", $2)} $2 == name {print $1}' "$release_cache/SHA256SUMS")
     test -n "$expected" || { printf '%s\n' 'bootstrap-fabric: checksum missing for Linux release' >&2; return 1; }
     if command -v sha256sum >/dev/null 2>&1; then
       actual=$(sha256sum "$release_cache/$archive" | awk '{print $1}')

@@ -26,7 +26,7 @@ temporary=$(mktemp -d "${TMPDIR:-/tmp}/machine-fabric.XXXXXX")
 trap 'rm -rf "$temporary"' EXIT HUP INT TERM
 curl -fsSL --retry 2 -H 'X-Tos-Access: internal' "$base/$archive" -o "$temporary/$archive"
 curl -fsSL --retry 2 -H 'X-Tos-Access: internal' "$base/SHA256SUMS" -o "$temporary/SHA256SUMS"
-expected=$(awk -v name="$archive" '$2 == name {print $1}' "$temporary/SHA256SUMS")
+expected=$(awk -v name="$archive" '{sub(/^\*/, "", $2)} $2 == name {print $1}' "$temporary/SHA256SUMS")
 test -n "$expected" || { echo "install-from-release: checksum missing" >&2; exit 1; }
 if command -v sha256sum >/dev/null 2>&1; then
   actual=$(sha256sum "$temporary/$archive" | awk '{print $1}')

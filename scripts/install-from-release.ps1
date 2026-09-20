@@ -32,9 +32,9 @@ New-Item -ItemType Directory -Path $temporary | Out-Null
 try {
   Invoke-WebRequest "$base/$archive" -Headers $headers -OutFile (Join-Path $temporary $archive)
   Invoke-WebRequest "$base/SHA256SUMS" -Headers $headers -OutFile (Join-Path $temporary "SHA256SUMS")
-  $sumLine = Get-Content (Join-Path $temporary "SHA256SUMS") | Where-Object { $_ -match ("  " + [regex]::Escape($archive) + '$') }
-  if (-not $sumLine) { throw "checksum missing for $archive" }
-  $expected = ($sumLine -split '\s+')[0].ToLowerInvariant()
+  $sumLines = @(Get-Content (Join-Path $temporary "SHA256SUMS") | Where-Object { $_ -match ('^[a-fA-F0-9]{64} [ *]' + [regex]::Escape($archive) + '$') })
+  if ($sumLines.Count -ne 1) { throw "expected one checksum for $archive" }
+  $expected = ($sumLines[0] -split '\s+')[0].ToLowerInvariant()
   $actual = (Get-FileHash -Algorithm SHA256 (Join-Path $temporary $archive)).Hash.ToLowerInvariant()
   if ($actual -ne $expected) { throw "checksum mismatch" }
   Expand-Archive -Path (Join-Path $temporary $archive) -DestinationPath $temporary
