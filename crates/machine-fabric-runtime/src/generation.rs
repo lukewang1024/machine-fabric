@@ -148,6 +148,7 @@ pub fn record_state(
         "finalized",
         "smoke-passed",
         "ready",
+        "active",
         "failed",
     ];
     if !STATES.contains(&state) {

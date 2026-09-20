@@ -2751,7 +2751,7 @@ mod tests {
         fs::create_dir_all(&generation).unwrap();
         fs::write(generation.join("generation.json"), b"{}").unwrap();
         let runtime = ExecutorRuntime::new("local", vec![directory.path().to_path_buf()]).unwrap();
-        let params = json!({"generationRoot": directory.path(), "generationId": "example", "state": "ready", "evidence": {"checked": true}, "runtimeMarker": {"build": "test"}});
+        let params = json!({"generationRoot": directory.path(), "generationId": "example", "state": "active", "evidence": {"checked": true}, "runtimeMarker": {"build": "test"}});
         runtime
             .dispatch("application.runtime.record", params.clone())
             .unwrap();
@@ -2759,6 +2759,7 @@ mod tests {
             serde_json::from_slice(&fs::read(generation.join("generation.json")).unwrap()).unwrap();
         assert_eq!(marker["evidence"]["runtimeMarker"]["build"], "test");
         assert_eq!(marker["evidence"]["checked"], true);
+        assert_eq!(marker["state"], "active");
         let mut invalid = params;
         invalid["evidence"] = Value::Null;
         assert!(
