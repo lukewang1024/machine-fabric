@@ -1931,6 +1931,7 @@ fn contract(name: &str, effect: Effect) -> CapabilityDescriptor {
                 "applicationPath",
                 "bundleIdentifier",
                 "args",
+                "env",
                 "terminateConflictingInstances",
             ],
             120_000,

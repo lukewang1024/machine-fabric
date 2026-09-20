@@ -553,6 +553,7 @@ mod tests {
 }
 
 /// Explicit application environment overrides, validated before spawning on either OS.
+#[cfg(any(target_os = "macos", windows, test))]
 pub(crate) fn application_environment(
     value: Option<&Value>,
 ) -> Result<BTreeMap<String, String>, RpcError> {

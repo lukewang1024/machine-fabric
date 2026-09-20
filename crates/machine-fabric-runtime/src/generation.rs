@@ -167,11 +167,9 @@ fn replace_tree(source: &Path, target: &Path) -> Result<(), RpcError> {
         return Err(error);
     }
     let had_previous = target.exists() || target.is_symlink();
-    if had_previous {
-        if let Err(error) = fs::rename(target, &previous) {
-            let _ = fs::remove_dir_all(&staging);
-            return Err(io_error("OVERLAY_REPLACE_FAILED", target, error));
-        }
+    if had_previous && let Err(error) = fs::rename(target, &previous) {
+        let _ = fs::remove_dir_all(&staging);
+        return Err(io_error("OVERLAY_REPLACE_FAILED", target, error));
     }
     if let Err(error) = fs::rename(&incoming, target) {
         if had_previous {
