@@ -1,10 +1,21 @@
 param(
   [Parameter(Mandatory = $true)][string]$Version,
   [string]$NodeId = $env:COMPUTERNAME,
+  [string]$AllowRootFile,
   [string[]]$AllowRoot = @("C:\Users", "C:\ProgramData\machine-fabric")
 )
 
 $ErrorActionPreference = "Stop"
+if ($AllowRootFile) {
+  $AllowRoot = @(Get-Content -LiteralPath $AllowRootFile -Encoding UTF8)
+  if ($AllowRoot.Count -eq 0) { throw "allow-root file must not be empty" }
+  foreach ($root in $AllowRoot) {
+    if ($root -notmatch '^(?:[A-Za-z]:[\\/]|\\\\[^\\]+\\[^\\]+(?:[\\/]|$))') {
+      throw "allow-root must be absolute: $root"
+    }
+  }
+}
+
 $Version = $Version.TrimStart("v")
 if ($Version -notmatch '^[0-9]+\.[0-9]+\.[0-9]+$') { throw "version must be exact semver: $Version" }
 $baseUrl = $env:MACHINE_FABRIC_RELEASE_BASE_URL
