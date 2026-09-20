@@ -551,3 +551,88 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 }
+
+/// Explicit application environment overrides, validated before spawning on either OS.
+pub(crate) fn application_environment(
+    value: Option<&Value>,
+) -> Result<BTreeMap<String, String>, RpcError> {
+    let env: BTreeMap<String, String> = match value {
+        None | Some(Value::Null) => BTreeMap::new(),
+        Some(value) => serde_json::from_value(value.clone())
+            .map_err(|_| RpcError::new("INVALID_PARAMS", "env must contain string values"))?,
+    };
+    if env
+        .iter()
+        .any(|(key, value)| key.is_empty() || key.contains(['=', '\0']) || value.contains('\0'))
+    {
+        return Err(RpcError::new(
+            "INVALID_PARAMS",
+            "invalid environment name or value",
+        ));
+    }
+    Ok(env)
+}
+
+#[cfg(any(windows, test))]
+pub(crate) fn merge_windows_environment(
+    inherited: &[u16],
+    overrides: &BTreeMap<String, String>,
+) -> Vec<u16> {
+    let mut entries: BTreeMap<String, Vec<u16>> = BTreeMap::new();
+    for entry in inherited
+        .split(|unit| *unit == 0)
+        .filter(|entry| !entry.is_empty())
+    {
+        // Windows also includes special entries such as =C:=C:/path.
+        let end = entry
+            .iter()
+            .enumerate()
+            .skip(1)
+            .find(|(_, unit)| **unit == b'=' as u16)
+            .map(|(index, _)| index)
+            .unwrap_or(entry.len());
+        entries.insert(
+            String::from_utf16_lossy(&entry[..end]).to_uppercase(),
+            entry.to_vec(),
+        );
+    }
+    for (key, value) in overrides {
+        entries.insert(
+            key.to_uppercase(),
+            format!("{key}={value}").encode_utf16().collect(),
+        );
+    }
+    let mut result: Vec<u16> = entries
+        .into_values()
+        .flat_map(|entry| entry.into_iter().chain([0]))
+        .collect();
+    if result.is_empty() {
+        result.push(0);
+    }
+    result.push(0);
+    result
+}
+
+#[cfg(test)]
+mod application_environment_tests {
+    use super::*;
+    #[test]
+    fn rejects_invalid_overrides_and_preserves_windows_environment() {
+        assert!(application_environment(Some(&json!({"BAD=KEY":"x"}))).is_err());
+        assert!(application_environment(Some(&json!({"KEY":42}))).is_err());
+        assert!(application_environment(Some(&json!({"KEY":"x\u{0}y"}))).is_err());
+        let env =
+            application_environment(Some(&json!({"path":"new", "UPDATE_DISABLED":"1"}))).unwrap();
+        let inherited: Vec<u16> = "Path=old\0USER=用户\0=C:=drive\0\0"
+            .encode_utf16()
+            .collect();
+        let merged = merge_windows_environment(&inherited, &env);
+        let text = String::from_utf16(&merged).unwrap();
+        assert!(text.contains("path=new\0"));
+        assert!(!text.contains("old"));
+        assert!(text.contains("USER=用户\0"));
+        assert!(text.contains("=C:=drive\0"));
+        assert!(text.ends_with("\0\0"));
+        assert_eq!(merge_windows_environment(&[], &BTreeMap::new()), vec![0, 0]);
+    }
+}

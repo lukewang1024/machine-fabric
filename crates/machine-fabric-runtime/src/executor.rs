@@ -1301,6 +1301,7 @@ impl ExecutorRuntime {
                         .and_then(Value::as_u64)
                         .unwrap_or(9222) as u16,
                     crate::macos::LaunchOptions {
+                        env: &crate::process::application_environment(params.get("env"))?,
                         user_data_dir: user_data_dir.as_deref(),
                         chromium_local_state_patch: params.get("chromiumLocalStatePatch"),
                         browser_executable_relative: params
@@ -1408,6 +1409,7 @@ impl ExecutorRuntime {
                     &application_path,
                     &string_array(&params, "args")?,
                     crate::windows::LaunchOptions {
+                        env: &crate::process::application_environment(params.get("env"))?,
                         user_data_dir: user_data_dir.as_deref(),
                         runtime_shadow_dir: runtime_shadow_dir.as_deref(),
                         chromium_local_state_path: chromium_local_state_path.as_deref(),
@@ -1910,6 +1912,7 @@ fn contract(name: &str, effect: Effect) -> CapabilityDescriptor {
                 "applicationPath": {"type": "string"},
                 "bundleIdentifier": {"type": "string"},
                 "args": {"type": "array", "items": {"type": "string"}},
+                "env": {"type": "object", "additionalProperties": {"type": "string"}},
                 "userDataDir": {"type": "string"},
                 "chromiumLocalStatePatch": {"type": "object"},
                 "browserExecutableRelative": {"type": "string"},
@@ -2152,6 +2155,34 @@ fn contract(name: &str, effect: Effect) -> CapabilityDescriptor {
         "fence",
         "approvalDigest",
     ];
+    // Schema presence is distinct from idempotency identity. Several native
+    // handlers provide defaults or only use these inputs for an optional mode.
+    let capability_optional_fields: &[&str] = match name {
+        "artifact.pack-chromium-datapack" => &[
+            "platform",
+            "arch",
+            "bundleName",
+            "basePackPath",
+            "basePackDigest",
+            "changedPrefixes",
+        ],
+        "application.generation.record" | "application.runtime.record" => {
+            &["evidence", "runtimeMarker"]
+        }
+        "application.finalize" => &["signingKeychain", "signingKeychainPasswordFile"],
+        "application.launch" => &[
+            "env",
+            "userDataDir",
+            "chromiumLocalStatePatch",
+            "browserExecutableRelative",
+            "runtimeShadowDir",
+            "chromiumLocalStatePath",
+            "chromiumLocalStateSettleMs",
+            "file",
+        ],
+        "application.open-file" => &["handlerPath"],
+        _ => &[],
+    };
     let schema_required: Vec<String> = properties
         .as_object()
         .map(|object| {
@@ -2159,6 +2190,7 @@ fn contract(name: &str, effect: Effect) -> CapabilityDescriptor {
                 .keys()
                 .filter(|key| {
                     !(optional_fields.contains(&key.as_str())
+                        || capability_optional_fields.contains(&key.as_str())
                         || name == "filesystem.write" && key.as_str() == "expectedDigest")
                 })
                 .cloned()
@@ -2798,6 +2830,41 @@ mod tests {
             descriptor.input_schema["properties"]["signingKeychainPasswordFile"]["type"],
             "string"
         );
+    }
+
+    #[test]
+    fn publish_contracts_do_not_require_optional_mode_inputs() {
+        for (name, required) in [
+            (
+                "artifact.pack-chromium-datapack",
+                json!(["outputRelative", "resourceTrees", "rootPath"]),
+            ),
+            (
+                "application.generation.record",
+                json!(["generationId", "generationRoot", "state"]),
+            ),
+            (
+                "application.runtime.record",
+                json!(["generationId", "generationRoot", "state"]),
+            ),
+            ("application.finalize", json!(["applicationPath", "units"])),
+            (
+                "application.launch",
+                json!([
+                    "applicationPath",
+                    "args",
+                    "bundleIdentifier",
+                    "terminateConflictingInstances"
+                ]),
+            ),
+            ("application.open-file", json!(["applicationPath", "file"])),
+        ] {
+            assert_eq!(
+                contract(name, Effect::Mutating).input_schema["required"],
+                required,
+                "{name}"
+            );
+        }
     }
 
     #[test]

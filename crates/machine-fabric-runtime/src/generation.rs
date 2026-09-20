@@ -20,6 +20,8 @@ pub struct MaterializedGeneration {
 pub struct Overlay {
     pub source: PathBuf,
     pub target_relative_path: PathBuf,
+    #[serde(default)]
+    pub replace: bool,
 }
 
 pub fn materialize(
@@ -123,15 +125,66 @@ pub fn apply_overlays(application_path: &Path, overlays: &[Overlay]) -> Result<V
     for overlay in overlays {
         validate_relative(&overlay.target_relative_path)?;
         let target = application_path.join(&overlay.target_relative_path);
-        // Merge-copy is deliberate: adapter artifacts may be partial overlays
-        // and must never delete runtime files supplied by the baseline.
-        copy_tree(&overlay.source, &target)?;
+        // Partial overlays retain baseline files; complete artifacts explicitly
+        // request replacement so obsolete chunks cannot survive deployment.
+        if overlay.replace {
+            replace_tree(&overlay.source, &target)?;
+        } else {
+            copy_tree(&overlay.source, &target)?;
+        }
         applied.push(serde_json::json!({
             "source": overlay.source,
             "target": target,
+            "replace": overlay.replace,
         }));
     }
     Ok(serde_json::json!({"applied": applied}))
+}
+
+fn replace_tree(source: &Path, target: &Path) -> Result<(), RpcError> {
+    let parent = target
+        .parent()
+        .ok_or_else(|| RpcError::new("INVALID_OVERLAY_PATH", "overlay target has no parent"))?;
+    fs::create_dir_all(parent)
+        .map_err(|error| io_error("OVERLAY_REPLACE_FAILED", parent, error))?;
+    let source_root = fs::canonicalize(source)
+        .map_err(|error| io_error("OVERLAY_REPLACE_FAILED", source, error))?;
+    let parent_root = fs::canonicalize(parent)
+        .map_err(|error| io_error("OVERLAY_REPLACE_FAILED", parent, error))?;
+    if parent_root.starts_with(&source_root) {
+        return Err(RpcError::new(
+            "INVALID_OVERLAY_PATH",
+            "replacement staging must not be inside its source",
+        ));
+    }
+    let staging = parent.join(format!(".overlay-{}-{}", std::process::id(), now_ms()));
+    fs::create_dir(&staging)
+        .map_err(|error| io_error("OVERLAY_REPLACE_FAILED", &staging, error))?;
+    let incoming = staging.join("incoming");
+    let previous = staging.join("previous");
+    if let Err(error) = copy_tree(source, &incoming) {
+        let _ = fs::remove_dir_all(&staging);
+        return Err(error);
+    }
+    let had_previous = target.exists() || target.is_symlink();
+    if had_previous {
+        if let Err(error) = fs::rename(target, &previous) {
+            let _ = fs::remove_dir_all(&staging);
+            return Err(io_error("OVERLAY_REPLACE_FAILED", target, error));
+        }
+    }
+    if let Err(error) = fs::rename(&incoming, target) {
+        if had_previous {
+            // Leave the recovery copy in place if restoration itself fails.
+            fs::rename(&previous, target)
+                .map_err(|error| io_error("OVERLAY_RESTORE_FAILED", &previous, error))?;
+        }
+        let _ = fs::remove_dir_all(&staging);
+        return Err(io_error("OVERLAY_REPLACE_FAILED", target, error));
+    }
+    fs::remove_dir_all(&staging)
+        .map_err(|error| io_error("OVERLAY_CLEANUP_FAILED", &staging, error))?;
+    Ok(())
 }
 
 pub fn record_state(
@@ -406,7 +459,8 @@ fn validate_generation_id(value: &str) -> Result<(), RpcError> {
 }
 
 fn validate_relative(path: &Path) -> Result<(), RpcError> {
-    if path.is_absolute()
+    if path.as_os_str().is_empty()
+        || path.is_absolute()
         || path
             .components()
             .any(|component| !matches!(component, Component::Normal(_)))
@@ -456,6 +510,7 @@ mod tests {
             &[Overlay {
                 source: overlay.clone(),
                 target_relative_path: PathBuf::from("runtime"),
+                replace: false,
             }],
         )
         .unwrap();
@@ -476,6 +531,51 @@ mod tests {
                 .unwrap()
                 .ends_with(Path::new("generations/one"))
         );
+    }
+
+    #[test]
+    fn complete_overlay_removes_stale_chunks_but_default_overlay_merges() {
+        let directory = tempfile::tempdir().unwrap();
+        let app = directory.path().join("app");
+        let runtime = app.join("runtime");
+        let source = directory.path().join("source");
+        fs::create_dir_all(&runtime).unwrap();
+        fs::create_dir(&source).unwrap();
+        fs::write(runtime.join("stale.js"), "old").unwrap();
+        fs::write(source.join("current.js"), "new").unwrap();
+        let mut overlay: Overlay = serde_json::from_value(serde_json::json!({
+            "source": source, "targetRelativePath": "runtime"
+        }))
+        .unwrap();
+        apply_overlays(&app, &[overlay.clone()]).unwrap();
+        assert!(runtime.join("stale.js").exists());
+        overlay.replace = true;
+        apply_overlays(&app, &[overlay]).unwrap();
+        assert!(!runtime.join("stale.js").exists());
+        assert_eq!(
+            fs::read_to_string(runtime.join("current.js")).unwrap(),
+            "new"
+        );
+    }
+
+    #[test]
+    fn failed_replacement_preserves_existing_runtime() {
+        let directory = tempfile::tempdir().unwrap();
+        let app = directory.path().join("app");
+        fs::create_dir_all(app.join("runtime")).unwrap();
+        fs::write(app.join("runtime/current.js"), "working").unwrap();
+        let overlay = Overlay {
+            source: directory.path().join("missing"),
+            target_relative_path: PathBuf::from("runtime"),
+            replace: true,
+        };
+        assert!(apply_overlays(&app, &[overlay]).is_err());
+        assert_eq!(
+            fs::read_to_string(app.join("runtime/current.js")).unwrap(),
+            "working"
+        );
+        assert_eq!(fs::read_dir(&app).unwrap().count(), 1);
+        assert!(validate_relative(Path::new("")).is_err());
     }
 
     #[test]

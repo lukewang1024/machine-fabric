@@ -67,6 +67,7 @@ pub fn inspect(application: &Path) -> Result<Value, RpcError> {
 }
 
 pub struct LaunchOptions<'a> {
+    pub env: &'a std::collections::BTreeMap<String, String>,
     pub user_data_dir: Option<&'a Path>,
     pub runtime_shadow_dir: Option<&'a Path>,
     pub chromium_local_state_path: Option<&'a Path>,
@@ -159,7 +160,12 @@ pub fn launch(
                 &runtime_application
             }
         });
-    let pid = spawn_in_active_session(&executable, &launch_args, working_directory)?;
+    let pid = spawn_in_active_session_with_env(
+        &executable,
+        &launch_args,
+        working_directory,
+        options.env,
+    )?;
     if options.chromium_local_state_patch.is_some() && options.chromium_local_state_settle_ms > 0 {
         thread::sleep(Duration::from_millis(
             options.chromium_local_state_settle_ms,
@@ -423,6 +429,15 @@ fn spawn_in_active_session(
     args: &[String],
     cwd: &Path,
 ) -> Result<u32, RpcError> {
+    spawn_in_active_session_with_env(executable, args, cwd, &Default::default())
+}
+
+fn spawn_in_active_session_with_env(
+    executable: &Path,
+    args: &[String],
+    cwd: &Path,
+    overrides: &std::collections::BTreeMap<String, String>,
+) -> Result<u32, RpcError> {
     let mut sessions = std::ptr::null_mut::<WTS_SESSION_INFOW>();
     let mut count = 0_u32;
     let enumerated = unsafe {
@@ -513,6 +528,17 @@ fn spawn_in_active_session(
             std::io::Error::last_os_error().to_string(),
         ));
     }
+    // CreateEnvironmentBlock owns a double-NUL-terminated UTF-16 block.
+    // Copy it before adding per-launch overrides; never mutate the user's environment.
+    let inherited = unsafe {
+        let start = environment.cast::<u16>();
+        let mut length = 0;
+        while !(*start.add(length) == 0 && *start.add(length + 1) == 0) {
+            length += 1;
+        }
+        std::slice::from_raw_parts(start, length + 2)
+    };
+    let mut launch_environment = crate::process::merge_windows_environment(inherited, overrides);
     let created = unsafe {
         CreateProcessAsUserW(
             primary_token,
@@ -522,7 +548,7 @@ fn spawn_in_active_session(
             std::ptr::null(),
             0,
             CREATE_UNICODE_ENVIRONMENT,
-            environment,
+            launch_environment.as_mut_ptr().cast(),
             cwd.as_ptr(),
             &startup,
             &mut process,

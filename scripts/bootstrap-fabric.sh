@@ -332,7 +332,8 @@ install_peer_service() {
   domain=gui/$(id -u)
   launchctl bootout "$domain/dev.machine-fabric.peer.$peer_host" 2>/dev/null || true
   launchctl bootstrap "$domain" "$plist"
-  launchctl kickstart -k "$domain/dev.machine-fabric.peer.$peer_host"
+  # RunAtLoad starts the new service. A second forced start can leave a ready
+  # status from the first process while its replacement has no IPC sockets yet.
 }
 
 reconcile_local_peer_services() {
@@ -413,7 +414,9 @@ wait_peer_ready() {
   attempt=0
   while [ "$attempt" -lt 200 ]; do
     if [ -f "$peer_state" ] && "$fabric" peer status --state "$peer_state" 2>/dev/null | grep '"state": "ready"' >/dev/null; then
-      return 0
+      if "$fabric" --socket "$peer_root/$peer_host/executor.sock" status >/dev/null 2>&1; then
+        return 0
+      fi
     fi
     attempt=$((attempt + 1))
     sleep 0.1

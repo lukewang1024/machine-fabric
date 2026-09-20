@@ -360,6 +360,7 @@ pub fn finalize(
 }
 
 pub struct LaunchOptions<'a> {
+    pub env: &'a std::collections::BTreeMap<String, String>,
     pub user_data_dir: Option<&'a Path>,
     pub chromium_local_state_patch: Option<&'a Value>,
     pub browser_executable_relative: Option<&'a str>,
@@ -417,6 +418,7 @@ pub fn launch(
         patch_chromium_local_state(profile, patch)?;
     }
     let mut child = Command::new(&executable)
+        .envs(options.env)
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -459,6 +461,7 @@ pub fn launch(
                     browser_args.push(format!("--saman-from-chat={}", child.id()));
                     browser_child = Some(
                         Command::new(&browser)
+                            .envs(options.env)
                             .args(&browser_args)
                             .stdin(Stdio::null())
                             .stdout(Stdio::null())
