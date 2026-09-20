@@ -12,6 +12,8 @@ mod rpc;
 mod telemetry;
 mod transport;
 #[cfg(windows)]
+mod windows;
+#[cfg(windows)]
 mod windows_computer_use;
 
 pub use controller::Controller;

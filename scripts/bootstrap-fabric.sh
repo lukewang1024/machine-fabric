@@ -598,11 +598,11 @@ for host in "$@"; do
       if [ -n "${MACHINE_FABRIC_NODE_ALLOW_ROOTS_DIR:-}" ]; then
         policy_file=$MACHINE_FABRIC_NODE_ALLOW_ROOTS_DIR/$host.txt
         test -s "$policy_file" || { printf 'missing node allow-root policy: %s\n' "$host" >&2; exit 2; }
-        scp -q "$policy_file" "$host:C:/ProgramData/machine-fabric/bootstrap-allow-roots.txt"
-        windows_policy_args="-AllowRootFile 'C:/ProgramData/machine-fabric/bootstrap-allow-roots.txt'"
+        scp -q "$policy_file" "$host:bootstrap-machine-fabric-allow-roots.txt"
+        windows_policy_args="-AllowRootFile 'bootstrap-machine-fabric-allow-roots.txt'"
       fi
       ssh -o BatchMode=yes -o ClearAllForwardings=yes "$host" \
-        "powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command \"\$env:MACHINE_FABRIC_RELEASE_BASE_URL='$release_base_url'; & './install-machine-fabric.ps1' -Version '$version' -NodeId '$host' $windows_policy_args; Remove-Item './install-machine-fabric.ps1'; Remove-Item 'C:/ProgramData/machine-fabric/bootstrap-allow-roots.txt' -ErrorAction SilentlyContinue\"" \
+        "powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command \"\$env:MACHINE_FABRIC_RELEASE_BASE_URL='$release_base_url'; & './install-machine-fabric.ps1' -Version '$version' -NodeId '$host' $windows_policy_args; Remove-Item './install-machine-fabric.ps1'; Remove-Item 'bootstrap-machine-fabric-allow-roots.txt' -ErrorAction SilentlyContinue\"" \
         >/dev/null
       resume_paused_peer_connection local "$local_id" "$host"
     else

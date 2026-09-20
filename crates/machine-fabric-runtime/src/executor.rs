@@ -1214,13 +1214,23 @@ impl ExecutorRuntime {
                         .unwrap_or_default(),
                 )
             }
-            "application.generation.record" => {
+            "application.generation.record" | "application.runtime.record" => {
                 let generation_root = self.path(&params, "generationRoot", true)?;
+                let mut evidence = params.get("evidence").cloned().unwrap_or_else(|| json!({}));
+                if let Some(marker) = params.get("runtimeMarker") {
+                    if !evidence.is_object() {
+                        return Err(RpcError::new(
+                            "INVALID_PARAMS",
+                            "evidence must be an object when runtimeMarker is supplied",
+                        ));
+                    }
+                    evidence["runtimeMarker"] = marker.clone();
+                }
                 record_state(
                     &generation_root,
                     required_str(&params, "generationId")?,
                     required_str(&params, "state")?,
-                    params.get("evidence").cloned().unwrap_or(Value::Null),
+                    evidence,
                 )
             }
             "application.activate" => {
@@ -1364,6 +1374,86 @@ impl ExecutorRuntime {
                         .get("requestPermission")
                         .and_then(Value::as_bool)
                         .unwrap_or(false),
+                )
+            }
+            #[cfg(windows)]
+            "application.inspect" => {
+                let application_path = self.path(&params, "applicationPath", true)?;
+                crate::windows::inspect(&application_path)
+            }
+            #[cfg(windows)]
+            "application.launch" => {
+                let application_path = self.path(&params, "applicationPath", true)?;
+                let user_data_dir = params
+                    .get("userDataDir")
+                    .and_then(Value::as_str)
+                    .map(|_| self.path(&params, "userDataDir", false))
+                    .transpose()?;
+                let runtime_shadow_dir = params
+                    .get("runtimeShadowDir")
+                    .and_then(Value::as_str)
+                    .map(|_| self.path(&params, "runtimeShadowDir", false))
+                    .transpose()?;
+                let chromium_local_state_path = params
+                    .get("chromiumLocalStatePath")
+                    .and_then(Value::as_str)
+                    .map(|_| self.path(&params, "chromiumLocalStatePath", false))
+                    .transpose()?;
+                let file = params
+                    .get("file")
+                    .and_then(Value::as_str)
+                    .map(|_| self.path(&params, "file", true))
+                    .transpose()?;
+                crate::windows::launch(
+                    &application_path,
+                    &string_array(&params, "args")?,
+                    crate::windows::LaunchOptions {
+                        user_data_dir: user_data_dir.as_deref(),
+                        runtime_shadow_dir: runtime_shadow_dir.as_deref(),
+                        chromium_local_state_path: chromium_local_state_path.as_deref(),
+                        chromium_local_state_patch: params.get("chromiumLocalStatePatch"),
+                        chromium_local_state_settle_ms: params
+                            .get("chromiumLocalStateSettleMs")
+                            .and_then(Value::as_u64)
+                            .unwrap_or(0),
+                        file: file.as_deref(),
+                        remote_debugging_port: params
+                            .get("remoteDebuggingPort")
+                            .and_then(Value::as_u64)
+                            .map(|port| port as u16),
+                        terminate_conflicting_instances: params
+                            .get("terminateConflictingInstances")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false),
+                    },
+                )
+            }
+            #[cfg(windows)]
+            "application.open-file" => {
+                let application_path = self.path(&params, "applicationPath", true)?;
+                let file = self.path(&params, "file", true)?;
+                let handler = params
+                    .get("handlerPath")
+                    .and_then(Value::as_str)
+                    .map(|_| self.path(&params, "handlerPath", true))
+                    .transpose()?;
+                crate::windows::open_file(&application_path, &file, handler.as_deref())
+            }
+            #[cfg(windows)]
+            "ui.evaluate" => crate::windows::cdp_evaluate(
+                params
+                    .get("remoteDebuggingPort")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(9222) as u16,
+                params.get("targetUrlPrefix").and_then(Value::as_str),
+                required_str(&params, "expression")?,
+            ),
+            #[cfg(windows)]
+            "ui.native-inspect" => {
+                let application_path = self.path(&params, "applicationPath", true)?;
+                crate::windows::native_inspect(
+                    &application_path,
+                    params.get("expectedWindowTitle").and_then(Value::as_str),
                 )
             }
             _ => Err(RpcError::new(
@@ -1517,6 +1607,7 @@ pub fn capability_catalog() -> Vec<CapabilityDescriptor> {
         ("application.materialize", Effect::Mutating),
         ("application.apply-artifacts", Effect::Mutating),
         ("application.generation.record", Effect::Mutating),
+        ("application.runtime.record", Effect::Mutating),
         ("application.activate", Effect::Mutating),
     ];
     #[cfg(target_os = "macos")]
@@ -1530,6 +1621,14 @@ pub fn capability_catalog() -> Vec<CapabilityDescriptor> {
         ("ui.evaluate", Effect::ReadOnly),
         ("ui.automate", Effect::Mutating),
         ("ui.capture", Effect::ReadOnly),
+        ("ui.native-inspect", Effect::ReadOnly),
+    ]);
+    #[cfg(windows)]
+    capabilities.extend([
+        ("application.inspect", Effect::ReadOnly),
+        ("application.launch", Effect::Mutating),
+        ("application.open-file", Effect::Mutating),
+        ("ui.evaluate", Effect::ReadOnly),
         ("ui.native-inspect", Effect::ReadOnly),
     ]);
     capabilities
@@ -1762,13 +1861,14 @@ fn contract(name: &str, effect: Effect) -> CapabilityDescriptor {
             RollbackStrategy::RetainPreviousGeneration,
             vec!["activation-record"],
         ),
-        "application.generation.record" => (
+        "application.generation.record" | "application.runtime.record" => (
             vec!["filesystem"],
             json!({
                 "generationRoot": {"type": "string"},
                 "generationId": {"type": "string"},
                 "state": {"type": "string"},
-                "evidence": {"type": "object"}
+                "evidence": {"type": "object"},
+                "runtimeMarker": {}
             }),
             vec!["generation:${generationRoot}/${generationId}"],
             vec!["generationRoot", "generationId", "state", "evidence"],
@@ -1777,7 +1877,11 @@ fn contract(name: &str, effect: Effect) -> CapabilityDescriptor {
             vec!["generation-record"],
         ),
         "application.inspect" => (
-            vec!["macos-application"],
+            vec![if cfg!(windows) {
+                "windows-application"
+            } else {
+                "macos-application"
+            }],
             json!({"applicationPath": {"type": "string"}}),
             Vec::new(),
             vec!["applicationPath"],
@@ -1786,7 +1890,11 @@ fn contract(name: &str, effect: Effect) -> CapabilityDescriptor {
             vec!["application-identity"],
         ),
         "application.launch" => (
-            vec!["macos-application"],
+            vec![if cfg!(windows) {
+                "windows-application"
+            } else {
+                "macos-application"
+            }],
             json!({
                 "applicationPath": {"type": "string"},
                 "bundleIdentifier": {"type": "string"},
@@ -1794,6 +1902,10 @@ fn contract(name: &str, effect: Effect) -> CapabilityDescriptor {
                 "userDataDir": {"type": "string"},
                 "chromiumLocalStatePatch": {"type": "object"},
                 "browserExecutableRelative": {"type": "string"},
+                "runtimeShadowDir": {"type": "string"},
+                "chromiumLocalStatePath": {"type": "string"},
+                "chromiumLocalStateSettleMs": {"type": "integer", "minimum": 0, "maximum": 30000},
+                "file": {"type": "string"},
                 "remoteDebuggingPort": {"type": "integer"},
                 "terminateConflictingInstances": {"type": "boolean"}
             }),
@@ -1814,7 +1926,11 @@ fn contract(name: &str, effect: Effect) -> CapabilityDescriptor {
             vec!["process", "readiness"],
         ),
         "application.open-file" => (
-            vec!["launch-services"],
+            vec![if cfg!(windows) {
+                "windows-shell"
+            } else {
+                "launch-services"
+            }],
             json!({
                 "applicationPath": {"type": "string"},
                 "file": {"type": "string"},
@@ -1827,7 +1943,11 @@ fn contract(name: &str, effect: Effect) -> CapabilityDescriptor {
             vec!["open-result"],
         ),
         "application.stop" => (
-            vec!["macos-application"],
+            vec![if cfg!(windows) {
+                "windows-application"
+            } else {
+                "macos-application"
+            }],
             json!({"applicationPath": {"type": "string"}}),
             vec!["application-instance:${applicationPath}"],
             vec!["applicationPath"],
@@ -1885,10 +2005,15 @@ fn contract(name: &str, effect: Effect) -> CapabilityDescriptor {
             vec!["screenshot"],
         ),
         "ui.native-inspect" => (
-            vec!["macos-accessibility"],
+            vec![if cfg!(windows) {
+                "windows-accessibility"
+            } else {
+                "macos-accessibility"
+            }],
             json!({
                 "applicationPath": {"type": "string"},
-                "requestPermission": {"type": "boolean"}
+                "requestPermission": {"type": "boolean"},
+                "expectedWindowTitle": {"type": "string"}
             }),
             Vec::new(),
             vec!["applicationPath"],
@@ -2113,7 +2238,7 @@ fn output_schema(name: &str) -> Value {
             "current": {"type": "string"}, "previous": {"type": ["string", "null"]},
             "generationId": {"type": "string"}, "activatedAt": {"type": "integer"}
         }),
-        "application.generation.record" => json!({
+        "application.generation.record" | "application.runtime.record" => json!({
             "generationId": {"type": "string"}, "state": {"type": "string"}
         }),
         "application.inspect" => json!({
@@ -2572,6 +2697,30 @@ fn io_error(code: &str, path: &Path, error: std::io::Error) -> RpcError {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn runtime_record_preserves_marker_and_rejects_invalid_evidence() {
+        let directory = tempfile::tempdir().unwrap();
+        let generation = directory.path().join("generations/example");
+        fs::create_dir_all(&generation).unwrap();
+        fs::write(generation.join("generation.json"), b"{}").unwrap();
+        let runtime = ExecutorRuntime::new("local", vec![directory.path().to_path_buf()]).unwrap();
+        let params = json!({"generationRoot": directory.path(), "generationId": "example", "state": "ready", "evidence": {"checked": true}, "runtimeMarker": {"build": "test"}});
+        runtime
+            .dispatch("application.runtime.record", params.clone())
+            .unwrap();
+        let marker: Value =
+            serde_json::from_slice(&fs::read(generation.join("generation.json")).unwrap()).unwrap();
+        assert_eq!(marker["evidence"]["runtimeMarker"]["build"], "test");
+        assert_eq!(marker["evidence"]["checked"], true);
+        let mut invalid = params;
+        invalid["evidence"] = Value::Null;
+        assert!(
+            runtime
+                .dispatch("application.runtime.record", invalid)
+                .is_err()
+        );
+    }
+
     use super::*;
 
     #[test]
