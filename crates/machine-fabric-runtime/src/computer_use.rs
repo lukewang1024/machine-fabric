@@ -35,6 +35,19 @@ impl Drop for Host {
 fn failed(error: impl std::fmt::Display) -> RpcError {
     RpcError::new("COMPUTER_USE_UNAVAILABLE", error.to_string())
 }
+
+fn retire_exited_host(host: &mut Option<Host>) {
+    // The host exits after its idle timeout. Retire a proven-dead local child
+    // before submitting a new request, rather than treating its stale socket
+    // as an ambiguous desktop operation. This never retries a sent request.
+    if host
+        .as_mut()
+        .and_then(|h| h.child.as_mut())
+        .is_some_and(|child| child.try_wait().ok().flatten().is_some())
+    {
+        *host = None;
+    }
+}
 fn read_frame(reader: &mut BufReader<TcpStream>) -> Result<Value, RpcError> {
     let mut bytes = Vec::new();
     reader
@@ -116,6 +129,7 @@ impl ComputerUseService {
         // Even observations may initialize/focus native helpers. All tool calls
         // require the same executor-wide desktop lease, including browser tools.
         let mut guard = self.0.lock().map_err(failed)?;
+        retire_exited_host(&mut guard);
         if !tools_only && guard.as_ref().is_some_and(|host| host.session != session) {
             *guard = None; // new owner/session invalidates every prior UI ref
         }
@@ -347,6 +361,26 @@ impl Host {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    #[cfg(unix)]
+    fn retires_a_confirmed_exited_host_before_another_request() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (_server, _) = listener.accept().unwrap();
+        let mut child = std::process::Command::new("/bin/sh")
+            .args(["-c", "exit 0"])
+            .spawn()
+            .unwrap();
+        child.wait().unwrap();
+        let mut host = Some(Host {
+            session: "discovery".into(),
+            identity: Value::Null,
+            stream: BufReader::new(client),
+            child: Some(child),
+        });
+        retire_exited_host(&mut host);
+        assert!(host.is_none());
+    }
     #[test]
     fn external_node_selection_is_absolute_and_legacy_fallback_is_preserved() {
         let directory = tempfile::tempdir().unwrap();
