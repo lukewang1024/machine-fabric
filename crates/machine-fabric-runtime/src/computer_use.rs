@@ -1,11 +1,14 @@
 //! Transport/lifecycle adapter for the unmodified pi-computer-use extension.
 //! OS automation and state-scoped UI refs belong entirely to the extension.
+#[cfg(windows)]
+use crate::windows_computer_use::HostProcess as Child;
 use machine_fabric_protocol::RpcError;
 use serde_json::{Value, json};
 use std::fs::{self, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
+#[cfg(not(windows))]
 use std::process::Child;
 #[cfg(not(windows))]
 use std::process::{Command, Stdio};
@@ -287,7 +290,7 @@ impl Host {
         #[cfg(windows)]
         let spawned: Result<Option<Child>, RpcError> =
             crate::windows_computer_use::spawn_hidden_in_active_session(&node, &args, &root)
-                .map(|_| None);
+                .map(Some);
         #[cfg(not(windows))]
         let spawned = Command::new(&node)
             .args(&args)
