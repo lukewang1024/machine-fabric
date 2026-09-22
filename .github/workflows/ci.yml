@@ -24,7 +24,9 @@ jobs:
       - run: cargo test --workspace
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - if: runner.os != 'Windows'
-        run: sh -n scripts/*.sh
+        run: |
+          sh -n scripts/*.sh
+          python3 -m unittest discover -s tests -p 'test_macos*.py'
       - if: runner.os == 'Windows'
         shell: pwsh
         run: |
