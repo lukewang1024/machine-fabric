@@ -416,7 +416,7 @@ foreach($candidate in $candidates) {{
 }}
 $remaining=@(Get-CimInstance Win32_Process | Where-Object {{ Matches-App $_.ExecutablePath }})
 if($remaining.Count -ne 0) {{ throw 'Application processes remain after stop' }}
-@{{applicationPath=$target;stoppedPids=$stopped;stoppedCount=$stopped.Count}} | ConvertTo-Json -Compress
+@{{applicationPath=$target;stopped=$stopped;stoppedPids=$stopped;stoppedCount=$stopped.Count}} | ConvertTo-Json -Compress
 "#
     );
     let output = Command::new("powershell.exe")
@@ -1137,11 +1137,19 @@ mod tests {
             );
         }
         let result = super::stop(&owned).unwrap();
+        let contract = crate::executor::capability_catalog()
+            .into_iter()
+            .find(|item| item.name == "application.stop")
+            .unwrap();
+        crate::controller::validate_schema(&contract.output_schema, &result, "output").unwrap();
+        assert_eq!(result["stopped"], result["stoppedPids"]);
         assert_eq!(result["stoppedCount"], 1);
         assert_eq!(result["stoppedPids"][0], children.0[0].id());
         assert!(children.0[0].try_wait().unwrap().is_some());
         assert!(children.0[1].try_wait().unwrap().is_none());
-        assert_eq!(super::stop(&owned).unwrap()["stoppedCount"], 0);
+        let repeated = super::stop(&owned).unwrap();
+        assert_eq!(repeated["stoppedCount"], 0);
+        crate::controller::validate_schema(&contract.output_schema, &repeated, "output").unwrap();
     }
 
     use super::*;
