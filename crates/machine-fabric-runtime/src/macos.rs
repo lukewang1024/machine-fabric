@@ -25,6 +25,8 @@ mod accessibility {
     type AXUIElementRef = *const c_void;
     type CFIndex = isize;
     type CFTypeID = usize;
+    type Boolean = u8;
+    type Float = f32;
 
     const UTF8: u32 = 0x0800_0100;
 
@@ -33,6 +35,9 @@ mod accessibility {
         fn AXIsProcessTrusted() -> bool;
         fn AXIsProcessTrustedWithOptions(options: CFTypeRef) -> bool;
         fn AXUIElementCreateApplication(pid: pid_t) -> AXUIElementRef;
+        fn AXUIElementCreateSystemWide() -> AXUIElementRef;
+        fn AXUIElementGetPid(element: AXUIElementRef, pid: *mut pid_t) -> i32;
+        fn AXUIElementSetMessagingTimeout(element: AXUIElementRef, timeout: Float) -> i32;
         fn AXUIElementCopyAttributeValue(
             element: AXUIElementRef,
             attribute: CFStringRef,
@@ -45,10 +50,13 @@ mod accessibility {
         static kCFBooleanTrue: CFTypeRef;
         fn CFRelease(value: CFTypeRef);
         fn CFGetTypeID(value: CFTypeRef) -> CFTypeID;
+        fn CFEqual(left: CFTypeRef, right: CFTypeRef) -> Boolean;
         fn CFArrayGetTypeID() -> CFTypeID;
         fn CFArrayGetCount(array: CFArrayRef) -> CFIndex;
         fn CFArrayGetValueAtIndex(array: CFArrayRef, index: CFIndex) -> CFTypeRef;
         fn CFStringGetTypeID() -> CFTypeID;
+        fn CFBooleanGetTypeID() -> CFTypeID;
+        fn CFBooleanGetValue(value: CFTypeRef) -> Boolean;
         fn CFStringGetCStringPtr(string: CFStringRef, encoding: u32) -> *const c_char;
         fn CFStringGetCString(
             string: CFStringRef,
@@ -210,6 +218,190 @@ mod accessibility {
             processes.push(json!({"pid": pid, "windows": windows}));
         }
         json!({"accessibilityTrusted": true, "processes": processes})
+    }
+
+    fn recovery_attribute(
+        element: AXUIElementRef,
+        name: &CStr,
+        deadline: std::time::Instant,
+    ) -> Option<Owned> {
+        if std::time::Instant::now() >= deadline || element.is_null() {
+            return None;
+        }
+        unsafe { AXUIElementSetMessagingTimeout(element, 0.1) };
+        unsafe { named_attribute(element, name) }
+    }
+
+    fn recovery_string(
+        element: AXUIElementRef,
+        name: &CStr,
+        deadline: std::time::Instant,
+    ) -> Option<String> {
+        let value = recovery_attribute(element, name, deadline)?;
+        unsafe { cf_string(value.0) }
+    }
+
+    fn recovery_bool(
+        element: AXUIElementRef,
+        name: &CStr,
+        deadline: std::time::Instant,
+    ) -> Option<bool> {
+        let value = recovery_attribute(element, name, deadline)?;
+        if unsafe { CFGetTypeID(value.0) } != unsafe { CFBooleanGetTypeID() } {
+            return None;
+        }
+        Some(unsafe { CFBooleanGetValue(value.0) != 0 })
+    }
+
+    fn recovery_window(
+        window: AXUIElementRef,
+        focused_window: CFTypeRef,
+        deadline: std::time::Instant,
+        sheet_budget: &mut usize,
+    ) -> Value {
+        let role = recovery_string(window, c"AXRole", deadline);
+        let subrole = recovery_string(window, c"AXSubrole", deadline);
+        let title = recovery_string(window, c"AXTitle", deadline)
+            .map(|title| title.chars().take(256).collect::<String>());
+        let is_focused = if focused_window.is_null() || window.is_null() {
+            None
+        } else {
+            Some(unsafe { CFEqual(window, focused_window) != 0 })
+        };
+        let is_main = recovery_bool(window, c"AXMain", deadline);
+        let is_minimized = recovery_bool(window, c"AXMinimized", deadline);
+        let modified = recovery_bool(window, c"AXModified", deadline);
+        let document_present = recovery_attribute(window, c"AXDocument", deadline).map(|_| true);
+        let mut sheets = Vec::new();
+        let mut sheets_readable = false;
+        let mut sheets_complete = false;
+        if *sheet_budget > 0
+            && std::time::Instant::now() < deadline
+            && let Some(array) = recovery_attribute(window, c"AXSheets", deadline)
+            && unsafe { CFGetTypeID(array.0) } == unsafe { CFArrayGetTypeID() }
+        {
+            sheets_readable = true;
+            let total_count = unsafe { CFArrayGetCount(array.0 as CFArrayRef) }.max(0) as usize;
+            let sheet_limit = (*sheet_budget).min(3);
+            let count = total_count.min(sheet_limit) as CFIndex;
+            sheets_complete = total_count <= sheet_limit;
+            for index in 0..count {
+                if std::time::Instant::now() >= deadline || *sheet_budget == 0 {
+                    sheets_complete = false;
+                    break;
+                }
+                let sheet = unsafe { CFArrayGetValueAtIndex(array.0 as CFArrayRef, index) };
+                if sheet.is_null() {
+                    continue;
+                }
+                *sheet_budget -= 1;
+                sheets.push(json!({
+                    "role": recovery_string(sheet, c"AXRole", deadline),
+                    "subrole": recovery_string(sheet, c"AXSubrole", deadline),
+                    "title": recovery_string(sheet, c"AXTitle", deadline)
+                        .map(|title| title.chars().take(256).collect::<String>()),
+                    "modified": recovery_bool(sheet, c"AXModified", deadline),
+                    "documentPresent": recovery_attribute(sheet, c"AXDocument", deadline)
+                        .map(|_| true),
+                }));
+            }
+            sheets_complete &= std::time::Instant::now() < deadline;
+        }
+        json!({
+            "role": role,
+            "subrole": subrole,
+            "title": title,
+            "focused": is_focused,
+            "main": is_main,
+            "minimized": is_minimized,
+            "modified": modified,
+            "documentPresent": document_present,
+            "sheets": sheets_readable.then_some(sheets),
+            "sheetsReadable": sheets_readable,
+            "sheetsComplete": sheets_complete,
+        })
+    }
+
+    pub fn recovery_inspect(pids: &[u64]) -> Value {
+        use std::time::{Duration, Instant};
+
+        let started = Instant::now();
+        let deadline = started + Duration::from_millis(1500);
+        let trusted = unsafe { AXIsProcessTrusted() };
+        if !trusted {
+            return json!({
+                "accessibilityTrusted": false,
+                "frontmostPid": null,
+                "processes": [],
+                "inspectionComplete": false,
+                "inspectionLimitMs": 1500,
+            });
+        }
+        let system = Owned(unsafe { AXUIElementCreateSystemWide() });
+        let focused_application = recovery_attribute(system.0, c"AXFocusedApplication", deadline);
+        let mut frontmost_pid = 0;
+        if let Some(application) = &focused_application {
+            unsafe { AXUIElementGetPid(application.0 as AXUIElementRef, &mut frontmost_pid) };
+        }
+        let focused_window = focused_application.as_ref().and_then(|application| {
+            recovery_attribute(
+                application.0 as AXUIElementRef,
+                c"AXFocusedWindow",
+                deadline,
+            )
+        });
+        let mut seen = BTreeSet::new();
+        let mut processes = Vec::new();
+        for pid in pids.iter().copied().filter(|pid| seen.insert(*pid)).take(8) {
+            if Instant::now() >= deadline {
+                break;
+            }
+            let application = Owned(unsafe { AXUIElementCreateApplication(pid as pid_t) });
+            unsafe { AXUIElementSetMessagingTimeout(application.0, 0.1) };
+            let mut windows = Vec::new();
+            let mut windows_readable = false;
+            let mut windows_complete = false;
+            let windows_attribute = recovery_attribute(application.0, c"AXWindows", deadline);
+            if let Some(array) = windows_attribute
+                && unsafe { CFGetTypeID(array.0) } == unsafe { CFArrayGetTypeID() }
+            {
+                windows_readable = true;
+                let total_count = unsafe { CFArrayGetCount(array.0 as CFArrayRef) }.max(0);
+                let count = total_count.min(6);
+                windows_complete = total_count <= 6;
+                let mut sheet_budget = 6;
+                for index in 0..count {
+                    if Instant::now() >= deadline {
+                        windows_complete = false;
+                        break;
+                    }
+                    let window = unsafe { CFArrayGetValueAtIndex(array.0 as CFArrayRef, index) };
+                    if !window.is_null() {
+                        windows.push(recovery_window(
+                            window,
+                            focused_window.as_ref().map_or(ptr::null(), |value| value.0),
+                            deadline,
+                            &mut sheet_budget,
+                        ));
+                    }
+                }
+                windows_complete &= Instant::now() < deadline;
+            }
+            processes.push(json!({
+                "pid": pid,
+                "frontmost": (frontmost_pid > 0).then_some(frontmost_pid as u64 == pid),
+                "windows": windows_readable.then_some(windows),
+                "windowsReadable": windows_readable,
+                "windowsComplete": windows_complete,
+            }));
+        }
+        json!({
+            "accessibilityTrusted": true,
+            "frontmostPid": (frontmost_pid > 0).then_some(frontmost_pid as u64),
+            "processes": processes,
+            "inspectionComplete": Instant::now() < deadline,
+            "inspectionLimitMs": 1500,
+        })
     }
 }
 
@@ -634,6 +826,19 @@ pub fn native_inspect(application: &Path, request_permission: bool) -> Result<Va
     }))
 }
 
+pub fn recovery_native_inspect(application: &Path) -> Result<Value, RpcError> {
+    let executable = application_executable(application)?;
+    let pids = matching_processes(&executable)?;
+    let inspection = accessibility::recovery_inspect(&pids);
+    Ok(json!({
+        "applicationPath": application,
+        "executable": executable,
+        "pids": pids,
+        "inspection": inspection,
+        "inspectedAt": now_ms(),
+    }))
+}
+
 pub fn cdp_pages(port: u16) -> Result<Value, RpcError> {
     cdp_json(port, "/json")
 }
@@ -860,7 +1065,62 @@ fn conflicting_instances(bundle_identifier: &str, expected: &Path) -> Result<Vec
             roots.push(root);
         }
     }
-    processes_for_snapshot_roots(&processes, &roots, true, bundle_identifier)
+    let conflicts = processes_for_snapshot_roots(&processes, &roots, true, bundle_identifier)?;
+    Ok(filter_finder_sync_launch_conflicts(conflicts))
+}
+
+fn filter_finder_sync_launch_conflicts(conflicts: Vec<Value>) -> Vec<Value> {
+    conflicts
+        .into_iter()
+        .filter(|process| {
+            let executable = Path::new(process["command"].as_str().unwrap_or_default());
+            !is_finder_sync_extension(executable)
+        })
+        .collect()
+}
+
+fn is_finder_sync_extension(executable: &Path) -> bool {
+    let Some(application_root) = outer_application_root(executable) else {
+        return false;
+    };
+    let plugin_root = application_root.join("Contents/PlugIns");
+    let Ok(relative) = executable.strip_prefix(&plugin_root) else {
+        return false;
+    };
+    let parts: Vec<_> = relative
+        .components()
+        .map(|component| component.as_os_str().to_string_lossy().into_owned())
+        .collect();
+    if parts.len() != 4
+        || !parts[0].ends_with(".appex")
+        || parts[1] != "Contents"
+        || parts[2] != "MacOS"
+    {
+        return false;
+    }
+
+    let info_plist = plugin_root.join(&parts[0]).join("Contents/Info.plist");
+    if !info_plist.is_file() {
+        return false;
+    }
+    let output = Command::new("/usr/libexec/PlistBuddy")
+        .args([
+            "-c",
+            "Print :CFBundlePackageType",
+            "-c",
+            "Print :NSExtension:NSExtensionPointIdentifier",
+        ])
+        .arg(info_plist)
+        .output();
+    let Ok(output) = output else {
+        return false;
+    };
+    if !output.status.success() {
+        return false;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let values: Vec<_> = stdout.lines().map(str::trim).collect();
+    values.as_slice() == ["XPC!", "com.apple.FinderSync"]
 }
 
 fn process_snapshot() -> Result<Vec<Value>, RpcError> {
@@ -1029,6 +1289,40 @@ mod tests {
     use super::*;
 
     #[test]
+    fn recovery_accessibility_inspection_stays_bounded_and_metadata_only() {
+        let source = include_str!("macos.rs");
+        let start = source.find("fn recovery_attribute(").unwrap();
+        let end = source.find("\n}\n\n#[derive(Debug, Deserialize)]").unwrap();
+        let recovery = &source[start..end];
+        for forbidden in [
+            "AXValue",
+            "AXDescription",
+            "AXRaise",
+            "AXUIElementPerformAction",
+            "AXIsProcessTrustedWithOptions",
+            "request_accessibility_permission",
+        ] {
+            assert!(
+                !recovery.contains(forbidden),
+                "recovery inspection must not use {forbidden}"
+            );
+        }
+        for required in [
+            "AXFocusedApplication",
+            "AXWindows",
+            "AXSheets",
+            "AXModified",
+            "AXDocument",
+            "Duration::from_millis(1500)",
+        ] {
+            assert!(
+                recovery.contains(required),
+                "recovery inspection must include {required}"
+            );
+        }
+    }
+
+    #[test]
     fn extracts_document_open_timestamp_for_fresh_target_selection() {
         assert_eq!(
             open_received_at(
@@ -1069,6 +1363,148 @@ mod tests {
             processes_for_snapshot_roots(&processes, &[target], false, "example.target").unwrap();
         assert_eq!(selected.len(), 2);
         assert!(selected.iter().all(|item| item["pid"] != 3));
+    }
+
+    fn finder_sync_test_root() -> PathBuf {
+        let state_home = std::env::var_os("XDG_STATE_HOME")
+            .map(PathBuf::from)
+            .or_else(|| {
+                std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/state"))
+            })
+            .unwrap_or_else(std::env::temp_dir);
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = state_home
+            .join("machine-fabric/test-fixtures")
+            .join(format!("finder-sync-{}-{nonce}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    fn extension_executable(application: &Path, name: &str, extension_point: &str) -> PathBuf {
+        let extension = application
+            .join("Contents/PlugIns")
+            .join(format!("{name}.appex"));
+        let executable = extension.join("Contents/MacOS").join(name);
+        std::fs::create_dir_all(executable.parent().unwrap()).unwrap();
+        std::fs::write(
+            extension.join("Contents/Info.plist"),
+            format!(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+                 <!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n\
+                 <plist version=\"1.0\"><dict>\n\
+                 <key>CFBundlePackageType</key><string>XPC!</string>\n\
+                 <key>NSExtension</key><dict>\n\
+                 <key>NSExtensionPointIdentifier</key><string>{extension_point}</string>\n\
+                 </dict></dict></plist>\n"
+            ),
+        )
+        .unwrap();
+        executable
+    }
+
+    fn selected_launch_conflicts(application: &Path, processes: &[Value]) -> Vec<Value> {
+        let selected = processes_for_snapshot_roots(
+            processes,
+            &[application.to_path_buf()],
+            false,
+            "example.target",
+        )
+        .unwrap();
+        filter_finder_sync_launch_conflicts(selected)
+    }
+
+    #[test]
+    fn finder_sync_extension_alone_is_not_a_launch_conflict() {
+        let root = finder_sync_test_root();
+        let application = root.join("Target.app");
+        let finder = extension_executable(&application, "Finder", "com.apple.FinderSync");
+        assert!(is_finder_sync_extension(&finder));
+
+        let conflicts = selected_launch_conflicts(
+            &application,
+            &[json!({"pid": 1, "command": finder.to_string_lossy()})],
+        );
+
+        assert!(conflicts.is_empty());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn finder_sync_extension_does_not_hide_a_surviving_browser_helper() {
+        let root = finder_sync_test_root();
+        let application = root.join("Target.app");
+        let finder = extension_executable(&application, "Finder", "com.apple.FinderSync");
+        let browser =
+            application.join("Contents/Helpers/Browser.app/Contents/MacOS/Browser Helper");
+
+        let conflicts = selected_launch_conflicts(
+            &application,
+            &[
+                json!({"pid": 1, "command": finder.to_string_lossy()}),
+                json!({"pid": 2, "command": browser.to_string_lossy()}),
+            ],
+        );
+
+        assert_eq!(conflicts.len(), 1);
+        assert_eq!(conflicts[0]["pid"], 2);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn main_application_process_remains_a_launch_conflict() {
+        let root = finder_sync_test_root();
+        let application = root.join("Target.app");
+        let main = application.join("Contents/MacOS/Target");
+
+        let conflicts = selected_launch_conflicts(
+            &application,
+            &[json!({"pid": 3, "command": main.to_string_lossy()})],
+        );
+
+        assert_eq!(conflicts.len(), 1);
+        assert_eq!(conflicts[0]["pid"], 3);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_different_application_bundle_is_not_selected() {
+        let root = finder_sync_test_root();
+        let application = root.join("Target.app");
+        let other = root.join("Other.app/Contents/MacOS/Other");
+
+        let conflicts = selected_launch_conflicts(
+            &application,
+            &[json!({"pid": 4, "command": other.to_string_lossy()})],
+        );
+
+        assert!(conflicts.is_empty());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn ordinary_helpers_and_non_finder_extensions_remain_conflicts() {
+        let root = finder_sync_test_root();
+        let application = root.join("Target.app");
+        let helper =
+            application.join("Contents/Helpers/Crashpad.app/Contents/MacOS/crashpad_handler");
+        let share_extension =
+            extension_executable(&application, "Share", "com.apple.share-services");
+
+        let conflicts = selected_launch_conflicts(
+            &application,
+            &[
+                json!({"pid": 5, "command": helper.to_string_lossy()}),
+                json!({"pid": 6, "command": share_extension.to_string_lossy()}),
+            ],
+        );
+
+        assert_eq!(conflicts.len(), 2);
+        assert!(conflicts.iter().any(|item| item["pid"] == 5));
+        assert!(conflicts.iter().any(|item| item["pid"] == 6));
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

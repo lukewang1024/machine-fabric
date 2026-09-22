@@ -17,6 +17,10 @@ pub(crate) struct DesktopQueue {
     blocked: bool,
     #[serde(default)]
     maintenance_owner: Option<String>,
+    // An in-memory barrier for the narrow read-only inspection allowed while
+    // blocked. It is deliberately not persisted; the durable blocked state is.
+    #[serde(skip)]
+    recovery_inspection_active: bool,
 }
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -39,6 +43,36 @@ fn field<'a>(v: &'a Value, name: &str) -> Result<&'a str, RpcError> {
         .as_str()
         .filter(|s| !s.is_empty() && s.len() <= 256)
         .ok_or_else(|| error("INVALID_PARAMS", format!("{name} must be 1..256 bytes")))
+}
+
+pub(crate) fn validate_recovery_inspection_params(
+    action: &str,
+    params: &Value,
+) -> Result<(), RpcError> {
+    if action != "ui.native-inspect" {
+        return Err(error(
+            "RECOVERY_INSPECT_ACTION_INVALID",
+            "recovery inspection only admits ui.native-inspect",
+        ));
+    }
+    let Some(object) = params.as_object() else {
+        return Err(error("INVALID_PARAMS", "input must be an object"));
+    };
+    if object.keys().any(|key| {
+        !matches!(
+            key.as_str(),
+            "applicationPath" | "requestPermission" | "recoveryInspection"
+        )
+    }) || params["recoveryInspection"] != true
+        || params["requestPermission"] != false
+        || params["applicationPath"].as_str().is_none_or(str::is_empty)
+    {
+        return Err(error(
+            "RECOVERY_INSPECT_PARAMS_INVALID",
+            "only applicationPath, recoveryInspection=true, and requestPermission=false are allowed",
+        ));
+    }
+    Ok(())
 }
 pub(crate) fn protected(action: &str) -> bool {
     action == "computer-use.call"
@@ -138,6 +172,12 @@ impl DesktopQueue {
         Ok(())
     }
     pub(crate) fn command(&mut self, action: &str, params: &Value) -> Result<Value, RpcError> {
+        if self.recovery_inspection_active && !matches!(action, "desktop.list" | "desktop.get") {
+            return Err(error(
+                "DESKTOP_RECOVERY_INSPECT_BUSY",
+                "queue mutation is unavailable during recovery inspection",
+            ));
+        }
         match action {
             "desktop.maintenance" => {
                 let owner = field(params, "owner")?;
@@ -239,7 +279,9 @@ impl DesktopQueue {
                     _ => {}
                 }
                 let value = serde_json::to_value(&self.jobs[i]).unwrap();
-                self.save()?;
+                if action != "desktop.get" {
+                    self.save()?;
+                }
                 Ok(value)
             }
             "desktop.recover" => {
@@ -259,6 +301,32 @@ impl DesktopQueue {
             }
             _ => Err(error("UNKNOWN_ACTION", action)),
         }
+    }
+
+    pub(crate) fn begin_recovery_inspection(
+        &mut self,
+        action: &str,
+        params: &Value,
+    ) -> Result<(), RpcError> {
+        validate_recovery_inspection_params(action, params)?;
+        if self.recovery_inspection_active {
+            return Err(error(
+                "DESKTOP_RECOVERY_INSPECT_BUSY",
+                "another recovery inspection is active",
+            ));
+        }
+        if !self.blocked || self.in_flight {
+            return Err(error(
+                "DESKTOP_RECOVERY_REQUIRED",
+                "recovery inspection requires a blocked queue with no in-flight action",
+            ));
+        }
+        self.recovery_inspection_active = true;
+        Ok(())
+    }
+
+    pub(crate) fn end_recovery_inspection(&mut self) {
+        self.recovery_inspection_active = false;
     }
     pub(crate) fn begin(&mut self, action: &str, params: &mut Value) -> Result<(), RpcError> {
         if self.blocked {
@@ -496,5 +564,125 @@ mod tests {
         assert!(q.blocked);
         assert_eq!(q.jobs[1].state, "queued");
         assert_eq!(submit(&mut DesktopQueue::default(), "c")["state"], "active");
+    }
+
+    #[test]
+    fn recovery_inspection_is_strict_read_only_and_preserves_blocked_state() {
+        let mut q = DesktopQueue {
+            epoch: 7,
+            jobs: vec![Job {
+                id: "job-1".into(),
+                owner: "owner-1".into(),
+                request_key: "key-1".into(),
+                token: "secret-token".into(),
+                state: "queued".into(),
+                epoch: 0,
+                ttl_ms: 1000,
+                submitted_at: 10,
+                expires_at: 0,
+            }],
+            blocked: true,
+            ..DesktopQueue::default()
+        };
+        let params = json!({
+            "applicationPath": "/Applications/Example.app",
+            "requestPermission": false,
+            "recoveryInspection": true
+        });
+        let before = serde_json::to_value(&q).unwrap();
+        q.begin_recovery_inspection("ui.native-inspect", &params)
+            .unwrap();
+        assert_eq!(
+            q.command("desktop.list", &json!({})).unwrap()["blocked"],
+            true
+        );
+        assert_eq!(
+            q.command(
+                "desktop.get",
+                &json!({"owner":"owner-1", "token":"secret-token"})
+            )
+            .unwrap()["state"],
+            "queued"
+        );
+        for action in [
+            "desktop.submit",
+            "desktop.maintenance",
+            "desktop.renew",
+            "desktop.finish",
+            "desktop.cancel",
+            "desktop.recover",
+        ] {
+            assert_eq!(
+                q.command(action, &json!({})).unwrap_err().code,
+                "DESKTOP_RECOVERY_INSPECT_BUSY",
+                "{action} must not mutate during recovery inspection"
+            );
+        }
+        for action in [
+            "ui.inspect",
+            "ui.evaluate",
+            "application.launch",
+            "clipboard.write",
+        ] {
+            assert_eq!(
+                q.begin(action, &mut json!({})).unwrap_err().code,
+                "DESKTOP_RECOVERY_REQUIRED",
+                "ordinary protected action {action} must remain blocked"
+            );
+        }
+        assert_eq!(
+            q.begin_recovery_inspection("ui.native-inspect", &params)
+                .unwrap_err()
+                .code,
+            "DESKTOP_RECOVERY_INSPECT_BUSY"
+        );
+        assert_eq!(serde_json::to_value(&q).unwrap(), before);
+        q.end_recovery_inspection();
+        assert_eq!(serde_json::to_value(&q).unwrap(), before);
+    }
+
+    #[test]
+    fn recovery_inspection_rejects_unblocked_inflight_and_injected_fields() {
+        let valid = json!({
+            "applicationPath": "/Applications/Example.app",
+            "requestPermission": false,
+            "recoveryInspection": true
+        });
+        for (blocked, in_flight, expected) in [
+            (false, false, "DESKTOP_RECOVERY_REQUIRED"),
+            (true, true, "DESKTOP_RECOVERY_REQUIRED"),
+        ] {
+            let mut q = DesktopQueue {
+                blocked,
+                in_flight,
+                ..DesktopQueue::default()
+            };
+            assert_eq!(
+                q.begin_recovery_inspection("ui.native-inspect", &valid)
+                    .unwrap_err()
+                    .code,
+                expected
+            );
+            assert!(!q.recovery_inspection_active);
+        }
+        for invalid in [
+            json!({"applicationPath":"/Applications/Example.app", "requestPermission":true, "recoveryInspection":true}),
+            json!({"applicationPath":"/Applications/Example.app", "requestPermission":false, "recoveryInspection":true, "expression":"1+1"}),
+            json!({"applicationPath":"/Applications/Example.app", "requestPermission":false, "recoveryInspection":true, "_authority": []}),
+            json!({"applicationPath":"/Applications/Example.app", "requestPermission":false, "recoveryInspection":true, "_workspaceSessionId":"session"}),
+        ] {
+            assert_eq!(
+                validate_recovery_inspection_params("ui.native-inspect", &invalid)
+                    .unwrap_err()
+                    .code,
+                "RECOVERY_INSPECT_PARAMS_INVALID"
+            );
+        }
+        assert_eq!(
+            validate_recovery_inspection_params("ui.evaluate", &valid)
+                .unwrap_err()
+                .code,
+            "RECOVERY_INSPECT_ACTION_INVALID"
+        );
     }
 }

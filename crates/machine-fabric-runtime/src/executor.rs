@@ -32,6 +32,20 @@ pub struct ExecutorRuntime {
     desktop_execution: Mutex<()>,
 }
 
+struct RecoveryInspectionGuard<'a> {
+    runtime: &'a ExecutorRuntime,
+}
+
+impl Drop for RecoveryInspectionGuard<'_> {
+    fn drop(&mut self) {
+        let mut desktop = match self.runtime.desktop.lock() {
+            Ok(desktop) => desktop,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        desktop.end_recovery_inspection();
+    }
+}
+
 #[derive(Debug)]
 struct ExecutionCapacity {
     maximum: usize,
@@ -331,9 +345,11 @@ impl ExecutorRuntime {
                 .and_then(|resources| self.execution.acquire(resources))
                 .map(Some)
         };
+        let recovery_inspection = request.action == "ui.native-inspect"
+            && params.get("recoveryInspection") == Some(&Value::Bool(true));
         let result = match permit {
             Ok(_permit) => self
-                .reconcile_desktop()
+                .reconcile_desktop_if(!recovery_inspection)
                 .and_then(|()| self.issue_authority(&request.action, &mut params))
                 .and_then(|()| self.desktop_dispatch(&request.action, params)),
             Err(error) => Err(error),
@@ -410,6 +426,11 @@ impl ExecutorRuntime {
     }
 
     fn desktop_dispatch(&self, action: &str, mut params: Value) -> Result<Value, RpcError> {
+        if action == "ui.native-inspect"
+            && params.get("recoveryInspection") == Some(&Value::Bool(true))
+        {
+            return self.recovery_inspection_dispatch(action, &params);
+        }
         if action.starts_with("desktop.") {
             let result = self
                 .desktop
@@ -439,15 +460,20 @@ impl ExecutorRuntime {
             .map_err(|error| RpcError::new("DESKTOP_STATE_FAILED", error.to_string()))?
             .begin(action, &mut params)?;
         let result = self.dispatch(action, params);
-        let uncertain = result.as_ref().is_err_and(|error| {
-            let message = error.message.to_ascii_lowercase();
-            error.code == "COMPUTER_USE_UNAVAILABLE"
-                || error.code.contains("TIMEOUT")
-                || (error.code == "COMPUTER_USE_TOOL_FAILED"
-                    && (message.contains("timeout")
-                        || message.contains("timed out")
-                        || message.contains("abort")))
-        });
+        let uncertain = match &result {
+            Err(error) => {
+                let message = error.message.to_ascii_lowercase();
+                error.code == "COMPUTER_USE_UNAVAILABLE"
+                    || error.code.contains("TIMEOUT")
+                    || (error.code == "COMPUTER_USE_TOOL_FAILED"
+                        && (message.contains("timeout")
+                            || message.contains("timed out")
+                            || message.contains("abort")))
+            }
+            Ok(value) => {
+                action == "computer-use.call" && has_structured_computer_use_unknown(value)
+            }
+        };
         self.desktop
             .lock()
             .map_err(|error| RpcError::new("DESKTOP_STATE_FAILED", error.to_string()))?
@@ -455,6 +481,62 @@ impl ExecutorRuntime {
         drop(gate);
         self.reconcile_desktop()?;
         result
+    }
+
+    fn recovery_inspection_dispatch(
+        &self,
+        action: &str,
+        params: &Value,
+    ) -> Result<Value, RpcError> {
+        crate::desktop::validate_recovery_inspection_params(action, params)?;
+        if !cfg!(target_os = "macos") {
+            return Err(RpcError::new(
+                "RECOVERY_INSPECT_UNSUPPORTED_PLATFORM",
+                "recovery inspection is supported only on macOS",
+            ));
+        }
+
+        self.recovery_inspection_dispatch_using(
+            action,
+            params,
+            crate::macos::recovery_native_inspect,
+        )
+    }
+
+    fn recovery_inspection_dispatch_using<F>(
+        &self,
+        action: &str,
+        params: &Value,
+        inspect: F,
+    ) -> Result<Value, RpcError>
+    where
+        F: FnOnce(&Path) -> Result<Value, RpcError>,
+    {
+        crate::desktop::validate_recovery_inspection_params(action, params)?;
+        let guard = self.begin_recovery_inspection(action, params)?;
+        let application_path = self.application_path(params, "applicationPath")?;
+        let result = inspect(&application_path);
+        drop(guard);
+        result
+    }
+
+    fn begin_recovery_inspection<'a>(
+        &'a self,
+        action: &str,
+        params: &Value,
+    ) -> Result<RecoveryInspectionGuard<'a>, RpcError> {
+        let desktop_gate = self
+            .desktop_execution
+            .lock()
+            .map_err(|error| RpcError::new("DESKTOP_STATE_FAILED", error.to_string()))?;
+        let admission = self
+            .desktop
+            .lock()
+            .map_err(|error| RpcError::new("DESKTOP_STATE_FAILED", error.to_string()))?
+            .begin_recovery_inspection(action, params);
+        drop(desktop_gate);
+        admission?;
+        Ok(RecoveryInspectionGuard { runtime: self })
     }
 
     fn reconcile_desktop(&self) -> Result<(), RpcError> {
@@ -482,6 +564,14 @@ impl ExecutorRuntime {
             .cleanup_done(closed.is_ok())?;
         drop(gate);
         closed
+    }
+
+    fn reconcile_desktop_if(&self, enabled: bool) -> Result<(), RpcError> {
+        if enabled {
+            self.reconcile_desktop()
+        } else {
+            Ok(())
+        }
     }
 
     fn dispatch(&self, action: &str, params: Value) -> Result<Value, RpcError> {
@@ -774,11 +864,14 @@ impl ExecutorRuntime {
                 };
                 Ok(json!({
                     "digest": digest,
+                    "digestAlgorithm": if kind == "directory" { "sha256-tree-posix-v2" } else { "sha256-file-v1" },
                     "size": size,
+                    "bytes": size,
                     "files": files,
                     "kind": kind,
                     "path": path,
                     "executorId": self.id,
+                    "describedAt": now_ms(),
                 }))
             }
             "artifact.relay.archive.create" => {
@@ -2043,7 +2136,8 @@ fn contract(name: &str, effect: Effect) -> CapabilityDescriptor {
             json!({
                 "applicationPath": {"type": "string"},
                 "requestPermission": {"type": "boolean"},
-                "expectedWindowTitle": {"type": "string"}
+                "expectedWindowTitle": {"type": "string"},
+                "recoveryInspection": {"type": "boolean"}
             }),
             Vec::new(),
             vec!["applicationPath"],
@@ -2182,6 +2276,11 @@ fn contract(name: &str, effect: Effect) -> CapabilityDescriptor {
             "file",
         ],
         "application.open-file" => &["handlerPath"],
+        "ui.native-inspect" => &[
+            "requestPermission",
+            "expectedWindowTitle",
+            "recoveryInspection",
+        ],
         _ => &[],
     };
     let schema_required: Vec<String> = properties
@@ -2207,7 +2306,7 @@ fn contract(name: &str, effect: Effect) -> CapabilityDescriptor {
             "type": "object",
             "properties": properties,
             "required": schema_required,
-            "additionalProperties": true
+            "additionalProperties": name != "ui.native-inspect"
         }),
         output_schema: output_schema(name),
         required_executor_features: required.into_iter().map(str::to_owned).collect(),
@@ -2272,9 +2371,11 @@ fn output_schema(name: &str) -> Value {
             "path": {"type": "string"}, "created": {"type": "boolean"}
         }),
         "artifact.describe" => json!({
-            "digest": {"type": "string"}, "size": {"type": "integer"},
+            "digest": {"type": "string"}, "digestAlgorithm": {"type": "string"},
+            "size": {"type": "integer"}, "bytes": {"type": "integer"},
             "files": {"type": "integer"}, "kind": {"type": "string"},
-            "path": {"type": "string"}, "executorId": {"type": "string"}
+            "path": {"type": "string"}, "executorId": {"type": "string"},
+            "describedAt": {"type": "integer"}
         }),
         "command.run" => json!({
             "cwd": {"type": "string"}, "argv": {"type": "array"},
@@ -2311,7 +2412,7 @@ fn output_schema(name: &str) -> Value {
         }),
         "application.launch" => json!({
             "applicationPath": {"type": "string"}, "pid": {"type": "integer"},
-            "args": {"type": "array"}, "cdp": {"type": "object"}
+            "args": {"type": "array"}, "cdp": {"type": ["object", "null"]}
         }),
         "artifact.pack-chromium-datapack" => json!({
             "output": {"type": "string"}, "resources": {"type": "integer"},
@@ -2508,7 +2609,11 @@ fn digest_file(path: &Path) -> Result<String, RpcError> {
 }
 
 fn digest_tree(root: &Path) -> Result<(String, u64, u64), RpcError> {
-    fn collect(root: &Path, directory: &Path, paths: &mut Vec<PathBuf>) -> Result<(), RpcError> {
+    fn collect(
+        root: &Path,
+        directory: &Path,
+        paths: &mut Vec<(String, PathBuf)>,
+    ) -> Result<(), RpcError> {
         for entry in fs::read_dir(directory)
             .map_err(|error| io_error("ARTIFACT_READ_FAILED", directory, error))?
         {
@@ -2520,30 +2625,30 @@ fn digest_tree(root: &Path) -> Result<(String, u64, u64), RpcError> {
             if metadata.is_dir() {
                 collect(root, &path, paths)?;
             } else if metadata.is_file() || metadata.file_type().is_symlink() {
-                paths.push(
-                    path.strip_prefix(root)
-                        .expect("child is below root")
-                        .to_path_buf(),
-                );
+                let relative = path
+                    .strip_prefix(root)
+                    .expect("child is below root")
+                    .to_path_buf();
+                paths.push((portable_path_text(&relative)?, relative));
             }
         }
         Ok(())
     }
     let mut paths = Vec::new();
     collect(root, root, &mut paths)?;
-    paths.sort();
+    paths.sort_by(|left, right| left.0.cmp(&right.0));
     let mut digest = Sha256::new();
     let mut size = 0_u64;
-    for relative in &paths {
+    for (portable_relative, relative) in &paths {
         let path = root.join(relative);
-        digest.update(relative.as_os_str().as_encoded_bytes());
+        digest.update(portable_relative.as_bytes());
         digest.update([0]);
         let metadata = fs::symlink_metadata(&path)
             .map_err(|error| io_error("ARTIFACT_READ_FAILED", &path, error))?;
         if metadata.file_type().is_symlink() {
             let target = fs::read_link(&path)
                 .map_err(|error| io_error("ARTIFACT_READ_FAILED", &path, error))?;
-            digest.update(target.as_os_str().as_encoded_bytes());
+            digest.update(portable_path_text(&target)?.as_bytes());
         } else {
             let bytes =
                 fs::read(&path).map_err(|error| io_error("ARTIFACT_READ_FAILED", &path, error))?;
@@ -2557,6 +2662,16 @@ fn digest_tree(root: &Path) -> Result<(String, u64, u64), RpcError> {
         size,
         paths.len() as u64,
     ))
+}
+
+fn portable_path_text(path: &Path) -> Result<String, RpcError> {
+    let value = path.to_str().ok_or_else(|| {
+        RpcError::new(
+            "NON_PORTABLE_ARTIFACT_PATH",
+            format!("artifact path is not valid UTF-8: {}", path.display()),
+        )
+    })?;
+    Ok(value.replace(std::path::MAIN_SEPARATOR, "/"))
 }
 
 fn safe_relative(value: &str) -> Result<PathBuf, RpcError> {
@@ -2750,12 +2865,166 @@ fn search_tree(
     Ok(())
 }
 
+fn has_structured_computer_use_unknown(value: &Value) -> bool {
+    if value.pointer("/details/tool").and_then(Value::as_str) != Some("act_ui")
+        || value.pointer("/details/status").and_then(Value::as_str)
+            != Some("dispatch_outcome_unknown")
+    {
+        return false;
+    }
+
+    let transport_unknown = value
+        .pointer("/details/execution/transport/outcome")
+        .and_then(Value::as_str)
+        == Some("unknown");
+    let partial_hid_unknown = value
+        .pointer("/details/execution/inputDispatch/outcome")
+        .and_then(Value::as_str)
+        == Some("unknown")
+        && value
+            .pointer("/details/execution/inputDispatch/kind")
+            .and_then(Value::as_str)
+            == Some("partial_hid")
+        && value
+            .pointer("/details/execution/inputDispatch/eventsDispatched")
+            .and_then(Value::as_u64)
+            .is_some_and(|count| count > 0)
+        && value
+            .pointer("/details/execution/inputDispatch/recoveryRequired")
+            .and_then(Value::as_bool)
+            == Some(true)
+        && value
+            .pointer("/details/execution/inputDispatch/retrySafe")
+            .and_then(Value::as_bool)
+            == Some(false)
+        && value.pointer("/details/error/code").and_then(Value::as_str)
+            == Some("foreground_interrupted_after_partial_hid");
+
+    transport_unknown || partial_hid_unknown
+}
+
 fn io_error(code: &str, path: &Path, error: std::io::Error) -> RpcError {
     RpcError::new(code, format!("{}: {error}", path.display()))
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn recovery_inspection_guard_preserves_queue_and_cleans_up_all_exits() {
+        use std::panic::{AssertUnwindSafe, catch_unwind};
+
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        let application = root.join("Example.app");
+        fs::create_dir_all(&application).unwrap();
+        fs::write(
+            root.join("desktop-queue.json"),
+            br#"{"epoch":7,"jobs":[],"inFlight":false,"blocked":true}"#,
+        )
+        .unwrap();
+        let runtime = ExecutorRuntime::open(
+            "local",
+            vec![root.to_path_buf()],
+            root.join("executor-state.json"),
+        )
+        .unwrap();
+        let params = json!({
+            "applicationPath": application,
+            "requestPermission": false,
+            "recoveryInspection": true
+        });
+        let queue_path = root.join("desktop-queue.json");
+        let before = fs::read(&queue_path).unwrap();
+
+        let success = runtime
+            .recovery_inspection_dispatch_using("ui.native-inspect", &params, |path| {
+                assert_eq!(path, application.canonicalize().unwrap());
+                Ok(json!({"fakeInspection":true}))
+            })
+            .unwrap();
+        assert_eq!(success["fakeInspection"], true);
+        assert_eq!(fs::read(&queue_path).unwrap(), before);
+
+        let error = runtime
+            .recovery_inspection_dispatch_using("ui.native-inspect", &params, |_path| {
+                Err(RpcError::new("FAKE_AX_TIMEOUT", "test timeout"))
+            })
+            .unwrap_err();
+        assert_eq!(error.code, "FAKE_AX_TIMEOUT");
+        assert_eq!(fs::read(&queue_path).unwrap(), before);
+
+        let panic = catch_unwind(AssertUnwindSafe(|| {
+            let _ = runtime.recovery_inspection_dispatch_using(
+                "ui.native-inspect",
+                &params,
+                |_path| -> Result<Value, RpcError> { panic!("simulated AX panic") },
+            );
+        }));
+        assert!(panic.is_err());
+        assert_eq!(fs::read(&queue_path).unwrap(), before);
+
+        let outside = tempfile::tempdir().unwrap();
+        let outside_application = outside.path().join("Outside.app");
+        fs::create_dir_all(&outside_application).unwrap();
+        let outside_params = json!({
+            "applicationPath": outside_application,
+            "requestPermission": false,
+            "recoveryInspection": true
+        });
+        let invoked = std::cell::Cell::new(false);
+        let outside_error = runtime
+            .recovery_inspection_dispatch_using("ui.native-inspect", &outside_params, |_path| {
+                invoked.set(true);
+                Ok(json!({}))
+            })
+            .unwrap_err();
+        assert_eq!(outside_error.code, "PATH_OUTSIDE_APPLICATION_ROOTS");
+        assert!(!invoked.get());
+        assert_eq!(fs::read(&queue_path).unwrap(), before);
+    }
+
+    #[test]
+    fn recovery_inspection_blocks_concurrent_recovery_but_keeps_queue_reads_available() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        fs::write(
+            root.join("desktop-queue.json"),
+            br#"{"epoch":7,"jobs":[],"inFlight":false,"blocked":true}"#,
+        )
+        .unwrap();
+        let runtime = std::sync::Arc::new(
+            ExecutorRuntime::open(
+                "local",
+                vec![root.to_path_buf()],
+                root.join("executor-state.json"),
+            )
+            .unwrap(),
+        );
+        let params = json!({
+            "applicationPath": "/Applications/Example.app",
+            "requestPermission": false,
+            "recoveryInspection": true
+        });
+        let before = fs::read(root.join("desktop-queue.json")).unwrap();
+        let guard = runtime
+            .begin_recovery_inspection("ui.native-inspect", &params)
+            .unwrap();
+
+        let recovering_runtime = std::sync::Arc::clone(&runtime);
+        let recovery = std::thread::spawn(move || {
+            recovering_runtime
+                .desktop_dispatch("desktop.recover", json!({"confirmDesktopReset":true}))
+        });
+        assert_eq!(
+            recovery.join().unwrap().unwrap_err().code,
+            "DESKTOP_RECOVERY_INSPECT_BUSY"
+        );
+        let listed = runtime.desktop_dispatch("desktop.list", json!({})).unwrap();
+        assert_eq!(listed["blocked"], true);
+        drop(guard);
+        assert_eq!(fs::read(root.join("desktop-queue.json")).unwrap(), before);
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn launch_admits_new_isolated_profile_but_keeps_path_policy() {
@@ -2818,6 +3087,51 @@ mod tests {
                 .iter()
                 .any(|field| field == "terminateConflictingInstances")
         );
+        assert_eq!(
+            descriptor.output_schema["properties"]["cdp"]["type"],
+            json!(["object", "null"]),
+            "Windows launch reports cdp=null until a separate UI capability attaches",
+        );
+    }
+
+    #[test]
+    fn artifact_tree_digest_uses_portable_relative_paths() {
+        let directory = tempfile::tempdir().unwrap();
+        let nested = directory.path().join("nested folder");
+        fs::create_dir_all(&nested).unwrap();
+        fs::write(nested.join("asset.txt"), b"portable digest\n").unwrap();
+
+        let (digest, size, files) = digest_tree(directory.path()).unwrap();
+        let mut expected = Sha256::new();
+        expected.update(b"nested folder/asset.txt");
+        expected.update([0]);
+        expected.update(b"portable digest\n");
+        expected.update([0]);
+
+        assert_eq!(
+            digest,
+            format!("sha256:{}", hex::encode(expected.finalize()))
+        );
+        assert_eq!(size, b"portable digest\n".len() as u64);
+        assert_eq!(files, 1);
+        assert_eq!(
+            portable_path_text(Path::new("nested folder/asset.txt")).unwrap(),
+            "nested folder/asset.txt",
+        );
+    }
+
+    #[test]
+    fn artifact_describe_reports_digest_algorithm_version() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(directory.path().join("file.txt"), b"content").unwrap();
+        let runtime = ExecutorRuntime::new("local", vec![directory.path().to_path_buf()]).unwrap();
+        let result = runtime
+            .dispatch("artifact.describe", json!({"path": directory.path()}))
+            .unwrap();
+
+        assert_eq!(result["digestAlgorithm"], "sha256-tree-posix-v2");
+        assert_eq!(result["files"], 1);
+        assert_eq!(result["size"], 7);
     }
 
     #[test]
@@ -3152,5 +3466,158 @@ mod tests {
         ));
         assert!(built.ok, "{built:?}");
         assert_eq!(built.result.unwrap()["artifact"]["files"], 1);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn host_tool_result_unknown_blocks_executor_desktop_before_next_dispatch() {
+        use std::os::unix::fs::PermissionsExt;
+
+        for mode in ["transport", "partial_hid"] {
+            let directory = tempfile::tempdir().unwrap();
+            let root = directory.path();
+            let runtime_root = root.join("runtime");
+            let host_root = root.join("host");
+            let state_root = root.join("computer-use");
+            let package = runtime_root.join("node_modules/@injaneity/pi-computer-use");
+            fs::create_dir_all(&package).unwrap();
+            fs::create_dir_all(&host_root).unwrap();
+            fs::create_dir_all(&state_root).unwrap();
+            fs::write(state_root.join("fake-host-mode"), mode).unwrap();
+            fs::write(package.join("package.json"), b"{}\n").unwrap();
+            fs::write(host_root.join("host.mjs"), b"// fake transport host\n").unwrap();
+            fs::write(
+                &state_root.join("runtime-root"),
+                runtime_root.to_string_lossy().as_bytes(),
+            )
+            .unwrap();
+            fs::write(
+                &state_root.join("host-root"),
+                host_root.to_string_lossy().as_bytes(),
+            )
+            .unwrap();
+
+            let calls_path = state_root.join("fake-host-calls");
+            let fake_node = root.join("fake-node");
+            let fake_node_script = String::from(
+                r##"#!/usr/bin/env python3
+import json, socket, sys
+_host_script, endpoint, handshake, state_dir, _runtime_root = sys.argv[1:6]
+token = open(handshake, encoding='utf-8').read()
+mode = open(state_dir + '/fake-host-mode', encoding='utf-8').read().strip()
+host, port = endpoint.rsplit(':', 1)
+sock = socket.create_connection((host, int(port)), timeout=5)
+stream = sock.makefile('rwb', buffering=0)
+stream.write((json.dumps({'token': token}) + '\n').encode())
+while True:
+    line = stream.readline()
+    if not line:
+        break
+    request = json.loads(line)
+    with open('__CALLS_PATH__', 'a', encoding='utf-8') as calls:
+        calls.write(request.get('method', '') + '\n')
+    # OMW host.mjs returns a resolved tool result verbatim under result in an
+    # ok:true JSON-lines response, even when details say unknown.
+    if mode == 'partial_hid':
+        result = {'content': [{'type': 'text', 'text': 'partial HID input; do not retry'}],
+            'details': {'tool': 'act_ui', 'status': 'dispatch_outcome_unknown',
+                'execution': {'inputDispatch': {'outcome': 'unknown', 'kind': 'partial_hid',
+                    'eventsDispatched': 3, 'unreleasedKeys': [1], 'unreleasedMouseButtons': [],
+                    'recoveryRequired': True, 'retrySafe': False}},
+                'error': {'code': 'foreground_interrupted_after_partial_hid',
+                    'message': 'foreground changed after partial HID dispatch'}}}
+    else:
+        result = {'content': [{'type': 'text', 'text': 'native result unknown'}],
+            'details': {'tool': 'act_ui', 'status': 'dispatch_outcome_unknown',
+                'execution': {'transport': {'outcome': 'unknown', 'command': 'act',
+                    'requestId': 'helper-fake-request-01',
+                    'requestWriteAttempted': True}},
+                'error': {'code': 'helper_transport_unknown',
+                    'message': 'helper reply ended with outcome unknown'}}}
+    response = {'id': request['id'], 'ok': True,
+        'identity': {'component': 'computer-use-host', 'version': '0.1.2', 'protocol': 1},
+        'result': result}
+    stream.write((json.dumps(response, separators=(',', ':')) + '\n').encode())
+sock.close()
+"##,
+            )
+            .replace("__CALLS_PATH__", calls_path.to_string_lossy().as_ref());
+            fs::write(&fake_node, fake_node_script).unwrap();
+            fs::set_permissions(&fake_node, fs::Permissions::from_mode(0o755)).unwrap();
+            let syntax = Command::new("python3")
+                .args(["-m", "py_compile"])
+                .arg(&fake_node)
+                .output()
+                .expect("python3 is required by the Unix fake-host test");
+            assert!(
+                syntax.status.success(),
+                "fake host syntax failed: {}",
+                String::from_utf8_lossy(&syntax.stderr)
+            );
+            fs::write(
+                runtime_root.join("node-path"),
+                fake_node.to_string_lossy().as_bytes(),
+            )
+            .unwrap();
+
+            let runtime = ExecutorRuntime::new("local", vec![root.to_path_buf()]).unwrap();
+            let submitted = runtime.handle(Request::new(
+                "desktop.submit",
+                json!({"owner": "fake-host-test", "requestKey": "unknown-gate", "ttlMs": 60_000}),
+            ));
+            assert!(submitted.ok, "{submitted:?}");
+            let job = submitted.result.unwrap();
+            let call_params = || {
+                json!({
+                    "sessionId": "discovery",
+                    "tool": "act_ui",
+                    "arguments": {"stateId": "cu-state", "actions": [{"action": "click", "ref": "@e1"}]},
+                    "_desktop": {"owner": "fake-host-test", "token": job["token"]}
+                })
+            };
+
+            let first = runtime.handle(Request::new("computer-use.call", call_params()));
+            assert!(
+                first.ok,
+                "the CU bridge result is a normal successful tool result: {first:?}; fake host log: {}",
+                fs::read_to_string(&calls_path).unwrap_or_default()
+            );
+            let returned = first.result.unwrap();
+            assert_eq!(returned["details"]["status"], "dispatch_outcome_unknown");
+            if mode == "partial_hid" {
+                assert_eq!(
+                    returned["details"]["error"]["code"],
+                    "foreground_interrupted_after_partial_hid"
+                );
+                assert!(returned["details"]["execution"].get("transport").is_none());
+                assert_eq!(
+                    returned["details"]["execution"]["inputDispatch"]["eventsDispatched"],
+                    3
+                );
+                assert_eq!(
+                    returned["details"]["execution"]["inputDispatch"]["unreleasedKeys"],
+                    json!([1])
+                );
+            } else {
+                assert_eq!(
+                    returned["details"]["execution"]["transport"]["requestId"],
+                    "helper-fake-request-01",
+                    "the OMW host result envelope must preserve the CU requestId",
+                );
+            }
+
+            let desktop = runtime.handle(Request::new("desktop.list", json!({})));
+            assert!(desktop.ok, "{desktop:?}");
+            assert_eq!(desktop.result.unwrap()["blocked"], true);
+
+            let later_write = runtime.handle(Request::new("computer-use.call", call_params()));
+            assert!(
+                !later_write.ok,
+                "a later desktop write must be rejected before host dispatch"
+            );
+            assert_eq!(later_write.error.unwrap().code, "DESKTOP_RECOVERY_REQUIRED");
+            let calls = fs::read_to_string(calls_path).unwrap();
+            assert_eq!(calls.lines().collect::<Vec<_>>(), ["act_ui"]);
+        }
     }
 }

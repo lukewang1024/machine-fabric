@@ -3009,6 +3009,193 @@ mod tests {
     }
 
     #[test]
+    fn controller_invokes_recovery_inspector_through_readonly_contract() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("allowed");
+        let application = root.join("Example.app");
+        std::fs::create_dir_all(&application).unwrap();
+        let socket = directory.path().join("executor.sock");
+        let server_socket = socket.clone();
+        let server_application = application.clone();
+        let allowed_root = root.canonicalize().unwrap();
+        let (received_tx, received_rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            RpcServer::new(server_socket)
+                .serve(move |request| match request.action.as_str() {
+                    "status" => Response::success(
+                        request.request_id,
+                        json!({
+                            "executorId": "executor-recovery",
+                            "allowedRoots": [allowed_root.clone()],
+                            "capabilities": crate::capability_catalog(),
+                        }),
+                    ),
+                    "ui.native-inspect" => {
+                        let input = request.params.clone();
+                        let result = crate::desktop::validate_recovery_inspection_params(
+                            "ui.native-inspect",
+                            &input,
+                        );
+                        if result.is_err() {
+                            return Response::failure(request.request_id, result.unwrap_err());
+                        }
+                        let path_allowed = input["applicationPath"]
+                            .as_str()
+                            .and_then(|raw| std::path::PathBuf::from(raw).canonicalize().ok())
+                            .is_some_and(|path| path.starts_with(&allowed_root));
+                        if !path_allowed {
+                            return Response::failure(
+                                request.request_id,
+                                RpcError::new(
+                                    "PATH_OUTSIDE_APPLICATION_ROOTS",
+                                    "application path is outside the fake Executor manifest roots",
+                                ),
+                            );
+                        }
+                        let _ = received_tx.send(input.clone());
+                        Response::success(
+                            request.request_id,
+                            json!({
+                                "applicationPath": input["applicationPath"],
+                                "executable": server_application.join("Contents/MacOS/Example"),
+                                "pids": [],
+                                "inspection": {"accessibilityTrusted": null, "processes": []},
+                                "inspectedAt": 123,
+                            }),
+                        )
+                    }
+                    _ => Response::failure(
+                        request.request_id,
+                        RpcError::new("UNKNOWN_ACTION", request.action),
+                    ),
+                })
+                .unwrap();
+        });
+        for _ in 0..100 {
+            if socket.exists() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        let controller = Controller::open_with_id(
+            JsonStore::new(directory.path().join("controller.json")),
+            Some("controller-local".to_owned()),
+        )
+        .unwrap();
+        let registered = controller.handle(Request::new(
+            "executor.register",
+            json!({
+                "executorId": "executor-recovery",
+                "endpoint": {"transport": "local", "socket": socket}
+            }),
+        ));
+        assert!(registered.ok, "{:?}", registered.error);
+        let session = controller.handle(Request::new(
+            "session.put",
+            json!({
+                "apiVersion": "machine-fabric.dev/v1",
+                "metadata": {"id": "recovery-session", "labels": {}, "createdAt": 1, "updatedAt": 1},
+                "objective": "exercise read-only recovery inspection",
+                "state": "active"
+            }),
+        ));
+        assert!(session.ok, "{:?}", session.error);
+
+        let input = json!({
+            "applicationPath": application,
+            "requestPermission": false,
+            "recoveryInspection": true
+        });
+        let invoked = controller.handle(Request::new(
+            "capability.invoke",
+            json!({
+                "executorId": "executor-recovery",
+                "capability": "ui.native-inspect",
+                "workspaceSessionId": "recovery-session",
+                "owner": "luna",
+                "idempotencyKey": "recovery-inspect-1",
+                "input": input
+            }),
+        ));
+        assert!(invoked.ok, "{:?}", invoked.error);
+        let delivered = received_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(
+            delivered,
+            json!({
+                "applicationPath": application,
+                "requestPermission": false,
+                "recoveryInspection": true
+            })
+        );
+        assert!(delivered.get("_workspaceSessionId").is_none());
+        assert!(delivered.get("_authority").is_none());
+
+        let denied = controller.handle(Request::new(
+            "capability.invoke",
+            json!({
+                "executorId": "executor-recovery",
+                "capability": "ui.native-inspect",
+                "workspaceSessionId": "recovery-session",
+                "owner": "luna",
+                "idempotencyKey": "recovery-inspect-invalid-1",
+                "input": {
+                    "applicationPath": application,
+                    "requestPermission": false,
+                    "recoveryInspection": true,
+                    "expression": "document.body.innerText"
+                }
+            }),
+        ));
+        assert!(
+            !denied.ok,
+            "arbitrary business keys must fail Controller schema validation"
+        );
+        assert!(received_rx.try_recv().is_err());
+
+        let outside_application = directory.path().join("Outside.app");
+        std::fs::create_dir_all(&outside_application).unwrap();
+        let outside = controller.handle(Request::new(
+            "capability.invoke",
+            json!({
+                "executorId": "executor-recovery",
+                "capability": "ui.native-inspect",
+                "workspaceSessionId": "recovery-session",
+                "owner": "luna",
+                "idempotencyKey": "recovery-inspect-outside-root",
+                "input": {
+                    "applicationPath": outside_application,
+                    "requestPermission": false,
+                    "recoveryInspection": true
+                }
+            }),
+        ));
+        assert_eq!(
+            outside.error.unwrap().code,
+            "PATH_OUTSIDE_APPLICATION_ROOTS"
+        );
+        assert!(received_rx.try_recv().is_err());
+
+        let unauthorized = controller.handle(Request::new(
+            "capability.invoke",
+            json!({
+                "executorId": "executor-recovery",
+                "capability": "ui.native-inspect",
+                "workspaceSessionId": "missing-session",
+                "owner": "luna",
+                "idempotencyKey": "recovery-inspect-invalid-2",
+                "input": {
+                    "applicationPath": application,
+                    "requestPermission": false,
+                    "recoveryInspection": true
+                }
+            }),
+        ));
+        assert_eq!(unauthorized.error.unwrap().code, "SESSION_NOT_FOUND");
+        assert!(received_rx.try_recv().is_err());
+    }
+
+    #[test]
     fn readiness_wait_polls_until_the_executor_reports_ready() {
         let directory = tempfile::tempdir().unwrap();
         let socket = directory.path().join("readiness.sock");
