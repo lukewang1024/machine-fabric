@@ -500,13 +500,15 @@ impl ExecutorRuntime {
         params: &Value,
     ) -> Result<Value, RpcError> {
         crate::desktop::validate_recovery_inspection_params(action, params)?;
-        if !cfg!(target_os = "macos") {
+        #[cfg(not(target_os = "macos"))]
+        {
             return Err(RpcError::new(
                 "RECOVERY_INSPECT_UNSUPPORTED_PLATFORM",
                 "recovery inspection is supported only on macOS",
             ));
         }
 
+        #[cfg(target_os = "macos")]
         self.recovery_inspection_dispatch_using(
             action,
             params,
