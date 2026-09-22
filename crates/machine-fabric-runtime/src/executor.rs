@@ -1597,6 +1597,11 @@ impl ExecutorRuntime {
                 )
             }
             #[cfg(windows)]
+            "application.stop" => {
+                let application_path = self.path(&params, "applicationPath", true)?;
+                crate::windows::stop(&application_path)
+            }
+            #[cfg(windows)]
             "application.open-file" => {
                 let application_path = self.path(&params, "applicationPath", true)?;
                 let file = self.path(&params, "file", true)?;
@@ -1975,6 +1980,7 @@ pub fn capability_catalog() -> Vec<CapabilityDescriptor> {
         ("application.inspect", Effect::ReadOnly),
         ("application.launch", Effect::Mutating),
         ("application.open-file", Effect::Mutating),
+        ("application.stop", Effect::Mutating),
         ("ui.evaluate", Effect::ReadOnly),
         ("ui.capture", Effect::ReadOnly),
         ("ui.native-inspect", Effect::ReadOnly),
