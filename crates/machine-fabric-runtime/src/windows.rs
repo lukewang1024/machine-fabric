@@ -383,6 +383,56 @@ fn terminate_process_trees(
         .map_err(|error| RpcError::new("APPLICATION_TERMINATE_FAILED", error.to_string()))
 }
 
+/// Stop only processes whose executable belongs to the requested application.
+/// Never match by basename or a Chromium argument substring: other isolated
+/// clients can use the same executable name and must remain untouched.
+pub fn stop(application: &Path) -> Result<Value, RpcError> {
+    let target = application.to_string_lossy().replace('\'', "''");
+    let script = format!(
+        r#"$ErrorActionPreference='Stop'
+function Normalize-AppPath([string]$p) {{ return $p.Replace('\\?\','').Replace('/','\').TrimEnd('\') }}
+$target=Normalize-AppPath '{target}'
+$isFile=Test-Path -LiteralPath '{target}' -PathType Leaf
+$prefix=$target+'\'
+function Matches-App([string]$p) {{
+ if(!$p) {{ return $false }}
+ $p=Normalize-AppPath $p
+ if($isFile) {{ return $p.Equals($target,[StringComparison]::OrdinalIgnoreCase) }}
+ return $p.StartsWith($prefix,[StringComparison]::OrdinalIgnoreCase)
+}}
+$candidates=@(Get-CimInstance Win32_Process | Where-Object {{ Matches-App $_.ExecutablePath }})
+$stopped=@()
+foreach($candidate in $candidates) {{
+ $p=Get-Process -Id $candidate.ProcessId -ErrorAction SilentlyContinue
+ if($null -eq $p) {{ continue }}
+ try {{
+  $handle=$p.Handle
+  if($p.HasExited) {{ continue }}
+  if(!(Matches-App $p.Path)) {{ throw 'Application process identity changed' }}
+  $p.Kill()
+  if(!$p.WaitForExit(5000)) {{ throw 'Application process did not exit' }}
+  $stopped += $p.Id
+ }} finally {{ $p.Dispose() }}
+}}
+$remaining=@(Get-CimInstance Win32_Process | Where-Object {{ Matches-App $_.ExecutablePath }})
+if($remaining.Count -ne 0) {{ throw 'Application processes remain after stop' }}
+@{{applicationPath=$target;stoppedPids=$stopped;stoppedCount=$stopped.Count}} | ConvertTo-Json -Compress
+"#
+    );
+    let output = Command::new("powershell.exe")
+        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+        .output()
+        .map_err(|error| RpcError::new("APPLICATION_STOP_FAILED", error.to_string()))?;
+    if !output.status.success() {
+        return Err(RpcError::new(
+            "APPLICATION_STOP_FAILED",
+            String::from_utf8_lossy(&output.stderr).trim(),
+        ));
+    }
+    serde_json::from_slice(&output.stdout)
+        .map_err(|error| RpcError::new("APPLICATION_STOP_FAILED", error.to_string()))
+}
+
 pub fn open_file(
     application: &Path,
     file: &Path,
@@ -1048,6 +1098,52 @@ fn find_directory(root: &Path, name: &str) -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    #[ignore = "subprocess fixture for application stop"]
+    fn stop_test_child() {
+        if std::env::var_os("MF_APPLICATION_STOP_CHILD").is_some() {
+            std::thread::sleep(std::time::Duration::from_secs(60));
+        }
+    }
+
+    #[test]
+    fn application_stop_preserves_same_named_sibling_application() {
+        struct Children(Vec<std::process::Child>);
+        impl Drop for Children {
+            fn drop(&mut self) {
+                for child in &mut self.0 {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
+            }
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let owned = directory.path().join("owned app");
+        let sibling = directory.path().join("owned app sibling");
+        let executable = std::env::current_exe().unwrap();
+        let mut children = Children(Vec::new());
+        for path in [&owned, &sibling] {
+            std::fs::create_dir(path).unwrap();
+            let copy = path.join("stop-fixture.exe");
+            std::fs::copy(&executable, &copy).unwrap();
+            children.0.push(
+                std::process::Command::new(copy)
+                    .args(["--exact", "windows::tests::stop_test_child", "--ignored"])
+                    .env("MF_APPLICATION_STOP_CHILD", "1")
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .spawn()
+                    .unwrap(),
+            );
+        }
+        let result = super::stop(&owned).unwrap();
+        assert_eq!(result["stoppedCount"], 1);
+        assert_eq!(result["stoppedPids"][0], children.0[0].id());
+        assert!(children.0[0].try_wait().unwrap().is_some());
+        assert!(children.0[1].try_wait().unwrap().is_none());
+        assert_eq!(super::stop(&owned).unwrap()["stoppedCount"], 0);
+    }
+
     use super::*;
 
     #[test]
