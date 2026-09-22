@@ -513,6 +513,7 @@ mod tests {
     use super::readiness_once;
     #[cfg(unix)]
     use super::{ProcessTable, ReadinessState};
+    #[cfg(unix)]
     use serde_json::Value;
     use serde_json::json;
     use std::fs;
