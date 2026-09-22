@@ -30,6 +30,7 @@ pub struct ExecutorRuntime {
     computer_use: crate::computer_use::ComputerUseService,
     desktop: Mutex<crate::desktop::DesktopQueue>,
     desktop_execution: Mutex<()>,
+    tunnel_mutation: Mutex<()>,
 }
 
 struct RecoveryInspectionGuard<'a> {
@@ -281,6 +282,7 @@ impl ExecutorRuntime {
             computer_use: crate::computer_use::ComputerUseService::default(),
             desktop: Mutex::new(crate::desktop::DesktopQueue::default()),
             desktop_execution: Mutex::new(()),
+            tunnel_mutation: Mutex::new(()),
         })
     }
 
@@ -321,6 +323,12 @@ impl ExecutorRuntime {
     }
 
     pub fn handle(&self, request: Request) -> Response {
+        if !matches!(
+            request.action.as_str(),
+            "tunnel.ensure" | "tunnel.stop" | "tunnel.get" | "tunnel.list"
+        ) {
+            self.reconcile_tunnels();
+        }
         let started = std::time::Instant::now();
         request_event(
             "info",
@@ -648,6 +656,40 @@ impl ExecutorRuntime {
                     "selectedVersion": descriptor.version,
                     "contract": descriptor,
                 }))
+            }
+            "tunnel.ensure" => self.tunnel_ensure(&params),
+            "tunnel.get" => self.tunnel_get(&params),
+            "tunnel.list" => Ok(json!({
+                "tunnels": self.processes.list().iter()
+                    .filter(|record| record.metadata.get("kind").and_then(Value::as_str) == Some("tunnel"))
+                    .map(|record| tunnel_view(record, false))
+                    .collect::<Vec<_>>()
+            })),
+            "tunnel.stop" => {
+                let _tunnel_guard = self
+                    .tunnel_mutation
+                    .lock()
+                    .map_err(|error| RpcError::new("TUNNEL_STATE_FAILED", error.to_string()))?;
+                let tunnel_id = required_str(&params, "tunnelId")?;
+                validate_resource_id(tunnel_id)?;
+                let process_id = format!("tunnel-{tunnel_id}");
+                let existing = self.processes.get(&process_id)?;
+                require_tunnel_record(&existing)?;
+                let mut metadata = existing.metadata;
+                metadata["desiredState"] = Value::String("stopped".to_owned());
+                self.processes.update_metadata(&process_id, metadata)?;
+                let record = self.processes.stop(&process_id)?;
+                let ssh_config_path = record
+                    .cwd
+                    .join(format!(".workbench-{process_id}.ssh-config"));
+                match fs::remove_file(&ssh_config_path) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => {
+                        return Err(RpcError::new("SSH_CONFIG_REMOVE_FAILED", error.to_string()));
+                    }
+                }
+                Ok(tunnel_view(&record, false))
             }
             "fs.stat" | "filesystem.stat" => {
                 let path = self.path(&params, "path", false)?;
@@ -1193,6 +1235,8 @@ impl ExecutorRuntime {
                     env,
                     log_path,
                     params.get("readiness").cloned(),
+                    false,
+                    json!({}),
                 )?)
                 .expect("process serializes"))
             }
@@ -1568,6 +1612,168 @@ impl ExecutorRuntime {
         }
     }
 
+    fn tunnel_ensure(&self, params: &Value) -> Result<Value, RpcError> {
+        let _tunnel_guard = self
+            .tunnel_mutation
+            .lock()
+            .map_err(|error| RpcError::new("TUNNEL_STATE_FAILED", error.to_string()))?;
+        let tunnel_id = required_str(params, "tunnelId")?;
+        validate_resource_id(tunnel_id)?;
+        let process_id = format!("tunnel-{tunnel_id}");
+        let direction = required_str(params, "direction")?;
+        if !matches!(direction, "local-forward" | "remote-forward") {
+            return Err(RpcError::new(
+                "INVALID_PARAMS",
+                "unsupported tunnel direction",
+            ));
+        }
+        let bind_host = required_str(params, "bindHost")?;
+        let bind_port = required_port(params, "bindPort")?;
+        let target_host = required_str(params, "targetHost")?;
+        let target_port = required_port(params, "targetPort")?;
+        let ssh_host = required_str(params, "sshHost")?;
+        let metadata = json!({
+            "kind": "tunnel", "tunnelId": tunnel_id,
+            "workspaceSessionId": params.get("workspaceSessionId"),
+            "sshHost": ssh_host, "direction": direction,
+            "source": {"host": bind_host, "port": bind_port},
+            "destination": {"host": target_host, "port": target_port},
+            "desiredState": "running"
+        });
+        if let Some(conflict) = self.processes.list().into_iter().find(|record| {
+            record.id != process_id
+                && record.metadata.get("kind").and_then(Value::as_str) == Some("tunnel")
+                && record.state == crate::process::ProcessState::Running
+                && record
+                    .metadata
+                    .pointer("/source/host")
+                    .and_then(Value::as_str)
+                    == Some(bind_host)
+                && record
+                    .metadata
+                    .pointer("/source/port")
+                    .and_then(Value::as_u64)
+                    == Some(u64::from(bind_port))
+        }) {
+            let mut error = RpcError::new(
+                "TUNNEL_BIND_CONFLICT",
+                format!(
+                    "bind {}:{} is held by {}",
+                    bind_host, bind_port, conflict.id
+                ),
+            );
+            error.details = tunnel_view(&conflict, false);
+            return Err(error);
+        }
+        if let Ok(existing) = self.processes.get(&process_id)
+            && existing.state == crate::process::ProcessState::Running
+        {
+            if !existing.identity_verified {
+                let mut error = RpcError::new(
+                    "PROCESS_IDENTITY_UNKNOWN",
+                    "recorded tunnel PID cannot be verified; port occupancy is not established",
+                );
+                error.details = tunnel_view(&existing, false);
+                return Err(error);
+            }
+            if !tunnel_definition_matches(&existing.metadata, &metadata) {
+                let mut error = RpcError::new(
+                    "TUNNEL_CONFLICT",
+                    format!(
+                        "tunnel {tunnel_id} has a verified live process with a different definition"
+                    ),
+                );
+                error.details = tunnel_view(&existing, false);
+                error.details["requestedBinding"] = tunnel_bind_observation(&metadata);
+                return Err(error);
+            }
+            return Ok(tunnel_view(&existing, true));
+        }
+        let cwd = self.path(params, "cwd", true)?;
+        let log_path = if params.get("logPath").and_then(Value::as_str).is_some() {
+            self.path(params, "logPath", false)?
+        } else {
+            cwd.join(format!(".workbench-{process_id}.log"))
+        };
+        let ssh_config_path = cwd.join(format!(".workbench-{process_id}.ssh-config"));
+        write_tunnel_ssh_config(ssh_host, &ssh_config_path)?;
+        let mut argv = tunnel_ssh_argv(
+            ssh_host,
+            &ssh_config_path,
+            direction,
+            bind_host,
+            bind_port,
+            target_host,
+            target_port,
+        );
+        if params
+            .get("knownHostsFile")
+            .and_then(Value::as_str)
+            .is_some()
+        {
+            let known_hosts = self.path(params, "knownHostsFile", false)?;
+            argv.splice(
+                argv.len() - 1..argv.len() - 1,
+                [
+                    "-o".to_owned(),
+                    format!("UserKnownHostsFile={}", known_hosts.display()),
+                ],
+            );
+        }
+        let readiness = (direction == "local-forward").then(|| json!({"type":"tcp","host":bind_host,"port":bind_port,"timeoutMs":8_000,"intervalMs":250}));
+        let record = self.processes.start(
+            process_id,
+            cwd,
+            argv,
+            BTreeMap::new(),
+            log_path,
+            readiness,
+            true,
+            metadata,
+        )?;
+        if direction == "local-forward" {
+            // Local forwards are not ready merely because ssh spawned. Wait for
+            // the ProcessTable TCP probe so callers receive observed readiness.
+            let _ = self.processes.wait_ready(&record.id, 8_000)?;
+        }
+        Ok(tunnel_view(&self.processes.get(&record.id)?, false))
+    }
+
+    fn tunnel_get(&self, params: &Value) -> Result<Value, RpcError> {
+        let tunnel_id = required_str(params, "tunnelId")?;
+        validate_resource_id(tunnel_id)?;
+        let record = self.processes.get(&format!("tunnel-{tunnel_id}"))?;
+        require_tunnel_record(&record)?;
+        Ok(tunnel_view(&record, false))
+    }
+
+    fn reconcile_tunnels(&self) {
+        let Ok(_tunnel_guard) = self.tunnel_mutation.lock() else {
+            return;
+        };
+        let now = now_ms();
+        for record in self.processes.list().into_iter().filter(|record| {
+            record.metadata.get("kind").and_then(Value::as_str) == Some("tunnel")
+                && record.metadata.get("desiredState").and_then(Value::as_str) == Some("running")
+                && matches!(
+                    record.state,
+                    crate::process::ProcessState::Failed | crate::process::ProcessState::Stopped
+                )
+                && now.saturating_sub(
+                    record
+                        .metadata
+                        .get("lastReconcileAttemptAt")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0),
+                ) >= 5_000
+        }) {
+            let mut metadata = record.metadata.clone();
+            metadata["lastReconcileAttemptAt"] = Value::from(now);
+            let _ = self.processes.update_metadata(&record.id, metadata);
+            let _ = self.processes.restart(&record.id);
+        }
+    }
+
     fn path(&self, params: &Value, key: &str, must_exist: bool) -> Result<PathBuf, RpcError> {
         let raw = params
             .get(key)
@@ -1707,6 +1913,10 @@ pub fn capability_catalog() -> Vec<CapabilityDescriptor> {
         ("process.events", Effect::ReadOnly),
         ("logs.read", Effect::ReadOnly),
         ("port.check", Effect::ReadOnly),
+        ("tunnel.ensure", Effect::Mutating),
+        ("tunnel.get", Effect::ReadOnly),
+        ("tunnel.list", Effect::ReadOnly),
+        ("tunnel.stop", Effect::Mutating),
         ("agent.start", Effect::Mutating),
         ("agent.stop", Effect::Mutating),
         ("application.materialize", Effect::Mutating),
@@ -2197,6 +2407,44 @@ fn contract(name: &str, effect: Effect) -> CapabilityDescriptor {
             RollbackStrategy::None,
             vec!["port-status"],
         ),
+        "tunnel.ensure" => (
+            vec!["network", "process"],
+            json!({"tunnelId":{"type":"string"},"sshHost":{"type":"string"},"direction":{"type":"string"},"bindHost":{"type":"string"},"bindPort":{"type":"integer","minimum":1,"maximum":65535},"targetHost":{"type":"string"},"targetPort":{"type":"integer","minimum":1,"maximum":65535},"cwd":{"type":"string"},"workspaceSessionId":{"type":"string"},"knownHostsFile":{"type":"string"},"logPath":{"type":"string"}}),
+            vec!["tunnel:${tunnelId}", "bind:${bindHost}:${bindPort}"],
+            vec![
+                "tunnelId",
+                "sshHost",
+                "direction",
+                "bindHost",
+                "bindPort",
+                "targetHost",
+                "targetPort",
+                "cwd",
+            ],
+            30_000,
+            RollbackStrategy::Compensate {
+                capability: "tunnel.stop".to_owned(),
+            },
+            vec!["tunnel-record", "readiness"],
+        ),
+        "tunnel.get" | "tunnel.stop" => (
+            vec!["network", "process"],
+            json!({"tunnelId":{"type":"string"}}),
+            vec!["tunnel:${tunnelId}"],
+            vec!["tunnelId"],
+            30_000,
+            RollbackStrategy::None,
+            vec!["tunnel-record"],
+        ),
+        "tunnel.list" => (
+            vec!["network", "process"],
+            json!({}),
+            Vec::new(),
+            Vec::new(),
+            30_000,
+            RollbackStrategy::None,
+            vec!["tunnel-list"],
+        ),
         "agent.start" => (
             vec!["process", "agent-runtime"],
             json!({
@@ -2249,6 +2497,8 @@ fn contract(name: &str, effect: Effect) -> CapabilityDescriptor {
         "tail",
         "fence",
         "approvalDigest",
+        "workspaceSessionId",
+        "knownHostsFile",
     ];
     // Schema presence is distinct from idempotency identity. Several native
     // handlers provide defaults or only use these inputs for an optional mode.
@@ -2444,6 +2694,13 @@ fn output_schema(name: &str) -> Value {
         "port.check" => json!({
             "port": {"type": "integer"}, "available": {"type": "boolean"}
         }),
+        "tunnel.ensure" | "tunnel.get" | "tunnel.stop" => json!({
+            "id": {}, "workspaceSessionId": {}, "sshHost": {}, "direction": {},
+            "source": {}, "destination": {}, "desiredState": {}, "observedState": {},
+            "state": {}, "readiness": {}, "processId": {}, "startedAt": {}, "updatedAt": {},
+            "lastProbeAt": {}, "observation": {}, "reused": {}
+        }),
+        "tunnel.list" => json!({"tunnels": {"type": "array"}}),
         "ui.evaluate" => json!({
             "target": {"type": "object"}, "value": {}, "evaluatedAt": {"type": "integer"}
         }),
@@ -2553,6 +2810,203 @@ fn required_str<'a>(params: &'a Value, key: &str) -> Result<&'a str, RpcError> {
         .and_then(Value::as_str)
         .filter(|value| !value.is_empty())
         .ok_or_else(|| RpcError::new("INVALID_PARAMS", format!("{key} is required")))
+}
+
+fn required_port(params: &Value, key: &str) -> Result<u16, RpcError> {
+    let value = params
+        .get(key)
+        .and_then(Value::as_u64)
+        .and_then(|value| u16::try_from(value).ok())
+        .filter(|value| *value > 0)
+        .ok_or_else(|| RpcError::new("INVALID_PARAMS", format!("{key} must be a TCP port")))?;
+    Ok(value)
+}
+
+fn validate_resource_id(value: &str) -> Result<(), RpcError> {
+    if value.is_empty()
+        || value.len() > 128
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte))
+    {
+        return Err(RpcError::new(
+            "INVALID_PARAMS",
+            "resource id contains unsupported characters",
+        ));
+    }
+    Ok(())
+}
+
+fn tunnel_ssh_argv(
+    ssh_host: &str,
+    ssh_config_path: &Path,
+    direction: &str,
+    bind_host: &str,
+    bind_port: u16,
+    target_host: &str,
+    target_port: u16,
+) -> Vec<String> {
+    let forward = format!("{bind_host}:{bind_port}:{target_host}:{target_port}");
+    vec![
+        "ssh".into(),
+        "-F".into(),
+        ssh_config_path.display().to_string(),
+        "-N".into(),
+        "-C".into(),
+        "-o".into(),
+        "BatchMode=yes".into(),
+        "-o".into(),
+        "PreferredAuthentications=publickey".into(),
+        "-o".into(),
+        "ConnectTimeout=8".into(),
+        "-o".into(),
+        "ConnectionAttempts=1".into(),
+        if direction == "local-forward" {
+            "-L"
+        } else {
+            "-R"
+        }
+        .into(),
+        forward,
+        "-o".into(),
+        "ExitOnForwardFailure=yes".into(),
+        "-o".into(),
+        "ServerAliveInterval=10".into(),
+        "-o".into(),
+        "ServerAliveCountMax=3".into(),
+        ssh_host.into(),
+    ]
+}
+
+fn write_tunnel_ssh_config(ssh_host: &str, path: &Path) -> Result<(), RpcError> {
+    let output = Command::new("ssh")
+        .args(["-G", ssh_host])
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|e| RpcError::new("SSH_CONFIG_RESOLVE_FAILED", e.to_string()))?;
+    if !output.status.success() {
+        return Err(RpcError::new(
+            "SSH_CONFIG_RESOLVE_FAILED",
+            String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+        ));
+    }
+    let resolved = String::from_utf8(output.stdout)
+        .map_err(|e| RpcError::new("SSH_CONFIG_RESOLVE_FAILED", e.to_string()))?;
+    fs::write(path, sanitize_tunnel_ssh_config(&resolved))
+        .map_err(|e| RpcError::new("SSH_CONFIG_WRITE_FAILED", e.to_string()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+            .map_err(|e| RpcError::new("SSH_CONFIG_WRITE_FAILED", e.to_string()))?;
+    }
+    Ok(())
+}
+
+fn sanitize_tunnel_ssh_config(resolved: &str) -> String {
+    let mut out = resolved
+        .lines()
+        .filter(|line| {
+            !matches!(
+                line.split_whitespace().next(),
+                Some("localforward" | "remoteforward" | "dynamicforward" | "clearallforwardings")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    out.push('\n');
+    out
+}
+
+fn require_tunnel_record(record: &crate::process::ProcessRecord) -> Result<(), RpcError> {
+    if record.metadata.get("kind").and_then(Value::as_str) != Some("tunnel") {
+        return Err(RpcError::new(
+            "TUNNEL_NOT_FOUND",
+            "process is not a managed tunnel",
+        ));
+    }
+    Ok(())
+}
+
+fn tunnel_definition_matches(left: &Value, right: &Value) -> bool {
+    [
+        "kind",
+        "tunnelId",
+        "workspaceSessionId",
+        "sshHost",
+        "direction",
+        "source",
+        "destination",
+    ]
+    .iter()
+    .all(|key| left.get(*key) == right.get(*key))
+}
+
+fn tunnel_view(record: &crate::process::ProcessRecord, reused: bool) -> Value {
+    let checked_at = now_ms();
+    let fresh_identity = record.identity_verified
+        && record.observed_at.is_some_and(|at| {
+            at <= checked_at && checked_at - at < crate::process::OBSERVATION_TTL_MS
+        });
+    let reachable = tunnel_source_is_reachable(&record.metadata);
+    let observed_state = if record.state == crate::process::ProcessState::Stopped {
+        "stopped"
+    } else if record.state == crate::process::ProcessState::Failed {
+        "failed"
+    } else if !fresh_identity {
+        "unknown"
+    } else if record.metadata["direction"] == "remote-forward" {
+        "running"
+    } else if reachable {
+        "ready"
+    } else if record.readiness.state == crate::process::ReadinessState::Pending {
+        "starting"
+    } else {
+        "degraded"
+    };
+    json!({"id":record.metadata.get("tunnelId"),"workspaceSessionId":record.metadata.get("workspaceSessionId"),"sshHost":record.metadata.get("sshHost"),"direction":record.metadata.get("direction"),"source":record.metadata.get("source"),"destination":record.metadata.get("destination"),"desiredState":record.metadata.get("desiredState"),"observedState":observed_state,"state":record.state,"readiness":record.readiness,"processId":record.id,"startedAt":record.started_at,"updatedAt":record.updated_at,"lastProbeAt":record.last_successful_probe_at,"observation":{"checkedAt":checked_at,"expiresAt":checked_at.saturating_add(crate::process::OBSERVATION_TTL_MS),"ttlMs":crate::process::OBSERVATION_TTL_MS,"identityVerified":fresh_identity,"sourceReachable":reachable,"binding":tunnel_bind_observation(&record.metadata)},"reused":reused})
+}
+
+fn tunnel_bind_observation(metadata: &Value) -> Value {
+    if metadata["direction"] != "local-forward" {
+        return json!({"state":"unknown","reason":"bind endpoint is remote"});
+    }
+    let Some(host) = metadata["source"]["host"].as_str() else {
+        return json!({"state":"unknown"});
+    };
+    let Some(port) = metadata["source"]["port"]
+        .as_u64()
+        .and_then(|p| u16::try_from(p).ok())
+    else {
+        return json!({"state":"unknown"});
+    };
+    match std::net::TcpListener::bind((host, port)) {
+        Ok(_) => json!({"state":"available"}),
+        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => json!({"state":"in-use"}),
+        Err(e) => json!({"state":"unknown","reason":e.to_string()}),
+    }
+}
+
+fn tunnel_source_is_reachable(metadata: &Value) -> bool {
+    if metadata.get("direction").and_then(Value::as_str) != Some("local-forward") {
+        return false;
+    }
+    let Some(host) = metadata["source"]["host"].as_str() else {
+        return false;
+    };
+    let Some(port) = metadata["source"]["port"]
+        .as_u64()
+        .and_then(|p| u16::try_from(p).ok())
+    else {
+        return false;
+    };
+    std::net::ToSocketAddrs::to_socket_addrs(&(host, port))
+        .ok()
+        .into_iter()
+        .flatten()
+        .any(|address| {
+            std::net::TcpStream::connect_timeout(&address, Duration::from_millis(200)).is_ok()
+        })
 }
 
 fn string_array(params: &Value, key: &str) -> Result<Vec<String>, RpcError> {
@@ -3619,5 +4073,118 @@ sock.close()
             let calls = fs::read_to_string(calls_path).unwrap();
             assert_eq!(calls.lines().collect::<Vec<_>>(), ["act_ui"]);
         }
+    }
+
+    #[test]
+    fn tunnel_contract_exposes_typed_locks_and_authority() {
+        let ensure = capability_catalog()
+            .into_iter()
+            .find(|item| item.name == "tunnel.ensure")
+            .unwrap();
+        assert_eq!(ensure.effect, Effect::Mutating);
+        assert!(
+            ensure
+                .locks
+                .iter()
+                .any(|lock| lock.key == "tunnel:${tunnelId}")
+        );
+        assert!(
+            ensure
+                .locks
+                .iter()
+                .any(|lock| lock.key == "bind:${bindHost}:${bindPort}")
+        );
+        assert!(
+            ensure.input_schema["required"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|v| v == "sshHost")
+        );
+        let stop = capability_catalog()
+            .into_iter()
+            .find(|item| item.name == "tunnel.stop")
+            .unwrap();
+        assert!(
+            stop.locks
+                .iter()
+                .any(|lock| lock.key == "tunnel:${tunnelId}")
+        );
+    }
+
+    #[test]
+    fn tunnel_ssh_argv_forbids_raw_forwarding_and_sanitizes_config() {
+        let argv = tunnel_ssh_argv(
+            "host",
+            Path::new("/tmp/tunnel.conf"),
+            "local-forward",
+            "127.0.0.1",
+            18083,
+            "127.0.0.1",
+            8080,
+        );
+        assert!(
+            argv.windows(2)
+                .any(|pair| pair == ["-L", "127.0.0.1:18083:127.0.0.1:8080"])
+        );
+        assert!(argv.iter().any(|arg| arg == "ExitOnForwardFailure=yes"));
+        let config =
+            sanitize_tunnel_ssh_config("host host\nlocalforward 1\nclearallforwardings yes\n");
+        assert!(!config.contains("localforward"));
+        assert!(!config.contains("clearallforwardings"));
+    }
+
+    #[test]
+    fn tunnel_resources_serialize_bind_and_identity_scopes() {
+        let params = json!({"tunnelId":"demo","bindHost":"127.0.0.1","bindPort":18083});
+        let resources = execution_resources("tunnel.ensure", &params, "mac").unwrap();
+        assert!(resources.contains(&"bind:127.0.0.1:18083".to_owned()));
+        assert!(resources.contains(&"tunnel:demo".to_owned()));
+        let stop = execution_resources("tunnel.stop", &json!({"tunnelId":"demo"}), "mac").unwrap();
+        assert_eq!(stop, vec!["tunnel:demo"]);
+        assert!(execution_resources("tunnel.ensure", &json!({"tunnelId":"demo"}), "mac").is_err());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn tunnel_ensure_rejects_an_existing_unverified_identity_before_reuse() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().to_path_buf();
+        let state_path = root.join("executor.json");
+        let process_state_path = state_path.with_file_name("executor-processes.json");
+        let metadata = json!({
+            "kind":"tunnel", "tunnelId":"demo", "workspaceSessionId":"s1",
+            "sshHost":"fake-target", "direction":"remote-forward",
+            "source":{"host":"127.0.0.1","port":43127},
+            "destination":{"host":"127.0.0.1","port":8080}, "desiredState":"running"
+        });
+        fs::write(
+            &process_state_path,
+            serde_json::to_vec(&json!({
+                "tunnel-demo": {
+                    "id":"tunnel-demo", "pid":std::process::id(), "identityVerified":false,
+                    "observedAt":1, "cwd":root, "argv":["sleep","30"], "env":{},
+                    "restartable":true, "metadata":metadata, "logPath":directory.path().join("tunnel.log"),
+                    "state":"running", "readiness":{"state":"not-configured","attempts":0},
+                    "readinessSpec":null, "readinessDeadlineAt":null, "startedAt":1,
+                    "updatedAt":1, "lastSuccessfulProbeAt":null
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        fs::write(&state_path, b"{}").unwrap();
+        let runtime = ExecutorRuntime::open("local", vec![root.clone()], state_path).unwrap();
+        let error = runtime
+            .dispatch(
+                "tunnel.ensure",
+                json!({
+                    "tunnelId":"demo", "sshHost":"fake-target", "direction":"remote-forward",
+                    "bindHost":"127.0.0.1", "bindPort":43127, "targetHost":"127.0.0.1",
+                    "targetPort":8080, "cwd":root, "workspaceSessionId":"s1"
+                }),
+            )
+            .unwrap_err();
+        assert_eq!(error.code, "PROCESS_IDENTITY_UNKNOWN");
     }
 }

@@ -6,12 +6,15 @@ use machine_fabric_schema::{
     ActivationTransaction, AgentInstance, AgentState, Approval, ApprovalState, Artifact,
     ArtifactLocation, CapabilityDescriptor, ControllerPeer, Executor, ExecutorEndpoint, Generation,
     GenerationState, Handoff, HealthStatus, LeaseKind, Metadata, Provenance, SessionAuthority,
-    SessionState, Task, TaskState, TransactionJournalEntry, TransactionState, TransactionStepState,
-    WorkspaceSession,
+    SessionState, Task, TaskPayloadRef, TaskState, TransactionJournalEntry, TransactionState,
+    TransactionStepState, WorkspaceSession,
 };
 use serde_json::{Value, json};
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::fs;
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -27,6 +30,11 @@ struct TraceContext {
 }
 
 thread_local! { static CURRENT_TRACE: RefCell<Option<TraceContext>> = const { RefCell::new(None) }; }
+
+const TASK_PAYLOAD_INLINE_LIMIT: usize = 64 * 1024;
+const TASK_LIST_DEFAULT_LIMIT: usize = 100;
+const TASK_LIST_MAX_LIMIT: usize = 200;
+const TASK_SUMMARY_TEXT_LIMIT: usize = 512;
 
 fn traced_request(action: impl Into<String>, params: Value) -> Request {
     let mut request = Request::new(action, params);
@@ -95,6 +103,7 @@ pub struct Controller {
     leases: Mutex<LeaseTable>,
     tasks: Mutex<TaskTable>,
     session_gates: Mutex<HashMap<String, Arc<Mutex<()>>>>,
+    persist_lock: Mutex<()>,
 }
 
 impl Controller {
@@ -136,7 +145,7 @@ impl Controller {
         let mut leases =
             LeaseTable::from_snapshot(state.leases.clone(), state.lease_fences.clone());
         let reaped = leases.reap_expired();
-        let mut tasks = TaskTable::from_tasks(state.tasks.clone());
+        let mut tasks = TaskTable::from_tasks(std::mem::take(&mut state.tasks));
         let recovered = tasks.recover_orphans();
         if identity_changed || compacted || !reaped.is_empty() || !recovered.is_empty() {
             state.leases = leases.snapshot();
@@ -144,11 +153,16 @@ impl Controller {
             state.tasks = tasks.snapshot();
             store.save(&state)?;
         }
+        // TaskTable is the single resident owner of task history.  FabricState
+        // keeps the field empty between commits so opening a large legacy state
+        // does not retain a second in-memory copy.
+        state.tasks.clear();
         Ok(Self {
             id,
             leases: Mutex::new(leases),
             tasks: Mutex::new(tasks),
             session_gates: Mutex::new(HashMap::new()),
+            persist_lock: Mutex::new(()),
             state: Mutex::new(state),
             store,
         })
@@ -300,16 +314,20 @@ impl Controller {
                 Ok(serde_json::to_value(capability).expect("capability serializes"))
             }
             "status" => {
-                let state = self.state.lock().expect("state lock");
-                let mut controllers = state.controllers.clone();
-                let mut executors = state.executors.clone();
+                let (mut controllers, mut executors) = {
+                    let state = self.state.lock().expect("state lock");
+                    (state.controllers.clone(), state.executors.clone())
+                };
                 refresh_local_endpoint_health(&mut controllers, &mut executors);
+                let task_table = self.tasks.lock().expect("task lock");
+                let tasks =
+                    bounded_task_page_from_table(&task_table, None, TASK_LIST_DEFAULT_LIMIT, 0);
                 Ok(json!({
                     "controller": {"id": self.id, "status": "ready"},
                     "controllers": controllers,
                     "executors": executors,
                     "leases": self.leases.lock().expect("lease lock").snapshot(),
-                    "tasks": self.tasks.lock().expect("task lock").snapshot(),
+                    "tasks": tasks,
                 }))
             }
             "executor.list" => Ok(serde_json::to_value(
@@ -609,7 +627,8 @@ impl Controller {
                     let id = handoff.id.clone();
                     upsert_by(&mut state.handoffs, handoff, |existing| existing.id == id);
                 }
-                *self.tasks.lock().expect("task lock") = TaskTable::from_tasks(state.tasks.clone());
+                *self.tasks.lock().expect("task lock") =
+                    TaskTable::from_tasks(std::mem::take(&mut state.tasks));
                 drop(state);
                 self.persist()?;
                 Ok(serde_json::to_value(session).expect("session serializes"))
@@ -1234,6 +1253,7 @@ impl Controller {
                 let task = if reused {
                     match task.state {
                         TaskState::Succeeded => {
+                            let task = task_with_payload(&self.store, &task)?;
                             return Ok(
                                 json!({"task": task, "reused": true, "result": task.output}),
                             );
@@ -1526,16 +1546,43 @@ impl Controller {
             }
             "task.get" => {
                 let id = required_str(&params, "taskId")?;
-                let tasks = self.tasks.lock().expect("task lock");
-                let task = tasks.get(id).ok_or_else(|| {
-                    RpcError::new("TASK_NOT_FOUND", format!("unknown task: {id}"))
-                })?;
+                let task = self
+                    .tasks
+                    .lock()
+                    .expect("task lock")
+                    .get(id)
+                    .cloned()
+                    .ok_or_else(|| {
+                        RpcError::new("TASK_NOT_FOUND", format!("unknown task: {id}"))
+                    })?;
+                let task = task_with_payload(&self.store, &task)?;
                 Ok(serde_json::to_value(task).expect("task serializes"))
             }
-            "task.list" => Ok(serde_json::to_value(
-                self.tasks.lock().expect("task lock").snapshot(),
-            )
-            .expect("tasks serialize")),
+            "task.list" => {
+                let state_filter = params.get("state").and_then(Value::as_str);
+                let limit = params
+                    .get("limit")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(TASK_LIST_DEFAULT_LIMIT as u64)
+                    .clamp(1, TASK_LIST_MAX_LIMIT as u64) as usize;
+                let cursor = params
+                    .get("cursor")
+                    .and_then(|value| value.as_u64().or_else(|| value.as_str()?.parse().ok()))
+                    .unwrap_or(0) as usize;
+                if params.get("includeDetails").and_then(Value::as_bool) == Some(true) {
+                    return Err(RpcError::new(
+                        "TASK_DETAILS_EXPLICIT",
+                        "use task.get for one complete task payload",
+                    ));
+                }
+                let task_table = self.tasks.lock().expect("task lock");
+                Ok(bounded_task_page_from_table(
+                    &task_table,
+                    state_filter,
+                    limit,
+                    cursor,
+                ))
+            }
             "task.events" => {
                 let id = required_str(&params, "taskId")?;
                 let tasks = self.tasks.lock().expect("task lock");
@@ -1563,6 +1610,7 @@ impl Controller {
                             RpcError::new("TASK_NOT_FOUND", format!("unknown task: {id}"))
                         })?;
                     if task.state.terminal() {
+                        let task = task_with_payload(&self.store, &task)?;
                         break Ok(serde_json::to_value(task).expect("task serializes"));
                     }
                     if Instant::now() >= deadline {
@@ -2404,11 +2452,15 @@ impl Controller {
                     .and_then(Value::as_str)
                     .and_then(|id| state.agents.iter().find(|agent| agent.id == id))
                     .map(|agent| agent.workspace_session_id.clone()),
-                name if name.starts_with("task.") => params
-                    .get("taskId")
-                    .and_then(Value::as_str)
-                    .and_then(|id| state.tasks.iter().find(|task| task.id == id))
-                    .map(|task| task.workspace_session_id.clone()),
+                name if name.starts_with("task.") => {
+                    params.get("taskId").and_then(Value::as_str).and_then(|id| {
+                        self.tasks
+                            .lock()
+                            .expect("task lock")
+                            .get(id)
+                            .map(|task| task.workspace_session_id.clone())
+                    })
+                }
                 name if name.starts_with("transaction.") => params
                     .get("transactionId")
                     .and_then(Value::as_str)
@@ -2451,16 +2503,212 @@ impl Controller {
     }
 
     fn persist(&self) -> Result<(), RpcError> {
-        let mut state = self.state.lock().expect("state lock");
+        let _commit_guard = self.persist_lock.lock().map_err(|error| {
+            RpcError::new("STATE_COMMIT_FAILED", format!("persist lock: {error}"))
+        })?;
+        let mut state = self.state.lock().expect("state lock").clone();
         let leases = self.leases.lock().expect("lease lock");
         state.leases = leases.snapshot();
         state.lease_fences = leases.fence_snapshot();
         drop(leases);
         state.tasks = self.tasks.lock().expect("task lock").snapshot();
-        self.store
-            .save(&state)
-            .map_err(|error| RpcError::new("STATE_WRITE_FAILED", error.to_string()))
+        let updates = externalize_task_payloads(&self.store, &mut state.tasks)?;
+        self.store.save(&state).map_err(|error| {
+            RpcError::new(
+                "STATE_WRITE_FAILED",
+                format!("state commit {}: {error}", self.store.path().display()),
+            )
+        })?;
+        let mut tasks = self.tasks.lock().expect("task lock");
+        for update in updates {
+            if let Some((marker, reference)) = update.input {
+                tasks.replace_input_ref_if_unchanged(
+                    &update.id,
+                    update.revision,
+                    marker,
+                    reference,
+                );
+            }
+            if let Some((marker, reference)) = update.output {
+                tasks.replace_output_ref_if_unchanged(
+                    &update.id,
+                    update.revision,
+                    marker,
+                    reference,
+                );
+            }
+        }
+        Ok(())
     }
+}
+
+struct PayloadUpdate {
+    id: String,
+    revision: u64,
+    input: Option<(Value, TaskPayloadRef)>,
+    output: Option<(Value, TaskPayloadRef)>,
+}
+
+fn task_with_payload(store: &JsonStore, task: &Task) -> Result<Task, RpcError> {
+    let mut hydrated = task.clone();
+    if let Some(reference) = hydrated.input_ref.as_ref() {
+        hydrated.input = read_task_payload(store, reference)?;
+    }
+    if let Some(reference) = hydrated.output_ref.as_ref() {
+        hydrated.output = Some(read_task_payload(store, reference)?);
+    }
+    Ok(hydrated)
+}
+
+fn read_task_payload(store: &JsonStore, reference: &TaskPayloadRef) -> Result<Value, RpcError> {
+    if !valid_payload_digest(&reference.digest) {
+        return Err(payload_error(reference, "invalid digest"));
+    }
+    let expected_locator = format!("task-payloads/{}.json", reference.digest);
+    if reference.locator != expected_locator {
+        return Err(payload_error(
+            reference,
+            "locator is not the canonical digest path",
+        ));
+    }
+    let path = store
+        .path()
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."))
+        .join(expected_locator);
+    let bytes = fs::read(&path)
+        .map_err(|error| payload_error(reference, format!("read {}: {error}", path.display())))?;
+    if bytes.len() as u64 != reference.bytes {
+        return Err(payload_error(reference, "byte count mismatch"));
+    }
+    if sha256_bytes(&bytes) != reference.digest {
+        return Err(payload_error(reference, "SHA-256 mismatch"));
+    }
+    serde_json::from_slice(&bytes)
+        .map_err(|error| payload_error(reference, format!("invalid JSON: {error}")))
+}
+
+fn valid_payload_digest(digest: &str) -> bool {
+    let Some(hex) = digest.strip_prefix("sha256:") else {
+        return false;
+    };
+    hex.len() == 64 && hex.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn payload_error(reference: &TaskPayloadRef, reason: impl Into<String>) -> RpcError {
+    RpcError::new(
+        "TASK_PAYLOAD_UNAVAILABLE",
+        format!(
+            "{} (digest={}, locator={})",
+            reason.into(),
+            reference.digest,
+            reference.locator
+        ),
+    )
+}
+
+fn externalize_task_payloads(
+    store: &JsonStore,
+    tasks: &mut [Task],
+) -> Result<Vec<PayloadUpdate>, RpcError> {
+    let mut updates = Vec::new();
+    for task in tasks.iter_mut().filter(|task| task.state.terminal()) {
+        let mut update = PayloadUpdate {
+            id: task.id.clone(),
+            revision: task.revision,
+            input: None,
+            output: None,
+        };
+        if task.input_ref.is_none() {
+            let bytes = serde_json::to_vec(&task.input)
+                .map_err(|error| RpcError::new("STATE_PAYLOAD_ENCODE_FAILED", error.to_string()))?;
+            if bytes.len() > TASK_PAYLOAD_INLINE_LIMIT {
+                let reference = write_task_payload(store, &bytes)?;
+                task.input = json!({"$taskPayloadRef": reference.digest, "bytes": reference.bytes});
+                update.input = Some((task.input.clone(), reference.clone()));
+                task.input_ref = Some(reference);
+            }
+        }
+        if let Some(output) = task.output.as_ref()
+            && task.output_ref.is_none()
+        {
+            let bytes = serde_json::to_vec(output)
+                .map_err(|error| RpcError::new("STATE_PAYLOAD_ENCODE_FAILED", error.to_string()))?;
+            if bytes.len() > TASK_PAYLOAD_INLINE_LIMIT {
+                let reference = write_task_payload(store, &bytes)?;
+                let marker = json!({"$taskPayloadRef": reference.digest, "bytes": reference.bytes});
+                task.output = Some(marker.clone());
+                update.output = Some((marker, reference.clone()));
+                task.output_ref = Some(reference);
+            }
+        }
+        if update.input.is_some() || update.output.is_some() {
+            updates.push(update);
+        }
+    }
+    Ok(updates)
+}
+
+fn write_task_payload(store: &JsonStore, bytes: &[u8]) -> Result<TaskPayloadRef, RpcError> {
+    let digest = sha256_bytes(bytes);
+    let locator = format!("task-payloads/{digest}.json");
+    let path = store
+        .path()
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."))
+        .join(&locator);
+    if path.exists() {
+        let existing = fs::read(&path).map_err(|error| {
+            RpcError::new(
+                "STATE_PAYLOAD_WRITE_FAILED",
+                format!("verify {}: {error}", path.display()),
+            )
+        })?;
+        if existing.len() as u64 != bytes.len() as u64 || sha256_bytes(&existing) != digest {
+            return Err(RpcError::new(
+                "STATE_PAYLOAD_WRITE_FAILED",
+                format!("existing sidecar {} does not match digest", path.display()),
+            ));
+        }
+    } else {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(|error| {
+                RpcError::new(
+                    "STATE_PAYLOAD_WRITE_FAILED",
+                    format!("create {}: {error}", parent.display()),
+                )
+            })?;
+        }
+        let temporary = path.with_file_name(format!(
+            ".{}.{}.tmp",
+            path.file_name().unwrap().to_string_lossy(),
+            Uuid::new_v4().simple()
+        ));
+        let write_result = (|| {
+            let mut options = fs::OpenOptions::new();
+            options.create_new(true).write(true);
+            #[cfg(unix)]
+            options.mode(0o600);
+            let mut file = options
+                .open(&temporary)
+                .map_err(|error| format!("open {}: {error}", temporary.display()))?;
+            std::io::Write::write_all(&mut file, bytes)
+                .and_then(|()| file.sync_all())
+                .map_err(|error| format!("write {}: {error}", temporary.display()))?;
+            fs::rename(&temporary, &path)
+                .map_err(|error| format!("rename {}: {error}", temporary.display()))
+        })();
+        if let Err(error) = write_result {
+            let _ = fs::remove_file(&temporary);
+            return Err(RpcError::new("STATE_PAYLOAD_WRITE_FAILED", error));
+        }
+    }
+    Ok(TaskPayloadRef {
+        digest,
+        bytes: bytes.len() as u64,
+        locator,
+        chunk: None,
+    })
 }
 
 fn required_str<'a>(params: &'a Value, key: &str) -> Result<&'a str, RpcError> {
@@ -2469,6 +2717,73 @@ fn required_str<'a>(params: &'a Value, key: &str) -> Result<&'a str, RpcError> {
         .and_then(Value::as_str)
         .filter(|value| !value.is_empty())
         .ok_or_else(|| RpcError::new("INVALID_PARAMS", format!("{key} is required")))
+}
+
+fn bounded_task_page_from_table(
+    tasks: &TaskTable,
+    state_filter: Option<&str>,
+    limit: usize,
+    cursor: usize,
+) -> Value {
+    let (total, page) = tasks.page_by(cursor, limit, |task| {
+        state_filter.is_none_or(|state| task_state_name(&task.state) == state)
+    });
+    let items = page
+        .iter()
+        .map(|task| task_summary(task))
+        .collect::<Vec<_>>();
+    let end = cursor.saturating_add(items.len()).min(total);
+    json!({
+        "tasks": items,
+        "total": total,
+        "cursor": cursor,
+        "limit": limit,
+        "nextCursor": (end < total).then_some(end),
+    })
+}
+
+fn task_state_name(state: &TaskState) -> &'static str {
+    match state {
+        TaskState::Queued => "queued",
+        TaskState::Running => "running",
+        TaskState::Succeeded => "succeeded",
+        TaskState::Failed => "failed",
+        TaskState::Cancelled => "cancelled",
+        TaskState::TimedOut => "timed-out",
+        TaskState::OutcomeUnknown => "outcome-unknown",
+    }
+}
+
+fn task_summary(task: &Task) -> Value {
+    json!({
+        "id": bounded_text(&task.id),
+        "correlationId": task.correlation_id.as_deref().map(bounded_text),
+        "requestId": task.request_id.as_deref().map(bounded_text),
+        "workspaceSessionId": bounded_text(&task.workspace_session_id),
+        "executorId": bounded_text(&task.executor_id),
+        "capability": bounded_text(&task.capability),
+        "idempotencyKey": bounded_text(&task.idempotency_key),
+        "state": task_state_name(&task.state),
+        "attempt": task.attempt,
+        "revision": task.revision,
+        "createdAt": task.created_at,
+        "updatedAt": task.updated_at,
+        "inputBytes": task.input_ref.as_ref().map(|reference| reference.bytes),
+        "outputBytes": task.output_ref.as_ref().map(|reference| reference.bytes),
+        "hasOutput": task.output.is_some(),
+        "error": task.error.as_ref().map(|error| json!({
+            "code": bounded_text(&error.code),
+            "message": bounded_text(&error.message),
+            "retryable": error.retryable,
+        })),
+        "eventCount": task.events.len(),
+        "inputRef": task.input_ref,
+        "outputRef": task.output_ref,
+    })
+}
+
+fn bounded_text(value: &str) -> String {
+    value.chars().take(TASK_SUMMARY_TEXT_LIMIT).collect()
 }
 
 fn optional_array<T: serde::de::DeserializeOwned>(
@@ -3838,5 +4153,566 @@ mod tests {
         assert_eq!(compact["inspection"]["processCount"], 1);
         assert!(compact["inspection"].get("processes").is_none());
         assert_eq!(retained_task_output("ui.evaluate", &output), output);
+    }
+
+    #[test]
+    fn task_list_is_bounded_and_preserves_active_inputs() {
+        let directory = tempfile::tempdir().unwrap();
+        let controller =
+            Controller::open(JsonStore::new(directory.path().join("state.json"))).unwrap();
+        let active = controller
+            .tasks
+            .lock()
+            .unwrap()
+            .submit(
+                "session",
+                "executor",
+                "command.run",
+                json!({"argv":["echo"]}),
+                "active",
+            )
+            .0;
+        let terminal = controller
+            .tasks
+            .lock()
+            .unwrap()
+            .submit(
+                "session",
+                "executor",
+                "filesystem.read",
+                json!({"path":"/tmp"}),
+                "done",
+            )
+            .0;
+        controller
+            .tasks
+            .lock()
+            .unwrap()
+            .transition(&terminal.id, TaskState::Running, None, None)
+            .unwrap();
+        controller
+            .tasks
+            .lock()
+            .unwrap()
+            .transition(
+                &terminal.id,
+                TaskState::Succeeded,
+                Some(json!({"blob":"hidden"})),
+                None,
+            )
+            .unwrap();
+        let page = controller.handle(Request::new("task.list", json!({"limit":1,"cursor":0})));
+        assert!(page.ok, "{:?}", page.error);
+        let page = page.result.unwrap();
+        assert_eq!(page["tasks"].as_array().unwrap().len(), 1);
+        assert_eq!(page["total"].as_u64(), Some(2));
+        let active_summary = task_summary(&active);
+        assert!(active_summary.get("input").is_none());
+        assert_eq!(active_summary["eventCount"], 1);
+        let terminal_summary = task_summary(&terminal);
+        assert!(terminal_summary.get("output").is_none());
+        let mut noisy = terminal.clone();
+        noisy.error = Some(machine_fabric_schema::TaskError {
+            code: "ERR".to_owned(),
+            message: "m".repeat(TASK_SUMMARY_TEXT_LIMIT * 4),
+            retryable: true,
+            details: Value::Null,
+        });
+        assert_eq!(
+            task_summary(&noisy)["error"]["message"]
+                .as_str()
+                .unwrap()
+                .len(),
+            TASK_SUMMARY_TEXT_LIMIT
+        );
+    }
+
+    #[test]
+    fn status_and_ping_do_not_serialize_large_terminal_payloads() {
+        let directory = tempfile::tempdir().unwrap();
+        let controller = Arc::new(
+            Controller::open(JsonStore::new(directory.path().join("state.json"))).unwrap(),
+        );
+        let task = controller
+            .tasks
+            .lock()
+            .unwrap()
+            .submit(
+                "session",
+                "executor",
+                "artifact.relay.archive.read",
+                Value::Null,
+                "large-status",
+            )
+            .0;
+        controller
+            .tasks
+            .lock()
+            .unwrap()
+            .transition(&task.id, TaskState::Running, None, None)
+            .unwrap();
+        controller
+            .tasks
+            .lock()
+            .unwrap()
+            .transition(
+                &task.id,
+                TaskState::Succeeded,
+                Some(json!({"archive":"x".repeat(2 * 1024 * 1024)})),
+                None,
+            )
+            .unwrap();
+        let status_controller = Arc::clone(&controller);
+        let status_thread = std::thread::spawn(move || {
+            status_controller.handle(Request::new("status", Value::Null))
+        });
+        let started = Instant::now();
+        let ping = controller.handle(Request::new("ping", Value::Null));
+        assert!(ping.ok, "{:?}", ping.error);
+        assert!(started.elapsed() < Duration::from_secs(1));
+        let status = status_thread.join().unwrap();
+        assert!(status.ok, "{:?}", status.error);
+        assert!(
+            status.result.unwrap()["tasks"]["tasks"][0]
+                .get("output")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn terminal_task_payloads_are_externalized_and_hydrated_after_restart() {
+        let directory = tempfile::tempdir().unwrap();
+        let state_path = directory.path().join("state.json");
+        let controller = Controller::open(JsonStore::new(&state_path)).unwrap();
+        let task = controller
+            .tasks
+            .lock()
+            .unwrap()
+            .submit(
+                "session",
+                "executor",
+                "artifact.relay.archive.read",
+                json!({"path":"/tmp"}),
+                "payload",
+            )
+            .0;
+        controller
+            .tasks
+            .lock()
+            .unwrap()
+            .transition(&task.id, TaskState::Running, None, None)
+            .unwrap();
+        let large = json!({"archive":"x".repeat(TASK_PAYLOAD_INLINE_LIMIT + 1024)});
+        controller
+            .tasks
+            .lock()
+            .unwrap()
+            .transition(&task.id, TaskState::Succeeded, Some(large.clone()), None)
+            .unwrap();
+        controller.persist().unwrap();
+        let payloads = directory.path().join("task-payloads");
+        assert!(payloads.is_dir());
+        assert!(fs::read_dir(payloads).unwrap().next().is_some());
+        drop(controller);
+        let reopened = Controller::open(JsonStore::new(&state_path)).unwrap();
+        let status = reopened.handle(Request::new("status", Value::Null));
+        assert!(status.ok, "{:?}", status.error);
+        assert!(
+            status.result.unwrap()["tasks"]["tasks"][0]
+                .get("output")
+                .is_none()
+        );
+        let result = reopened.handle(Request::new("task.get", json!({"taskId":task.id.clone()})));
+        assert!(result.ok, "{:?}", result.error);
+        assert_eq!(result.result.unwrap()["output"], large);
+        let waited = reopened.handle(Request::new(
+            "task.wait",
+            json!({"taskId":task.id.clone(),"timeoutMs":0}),
+        ));
+        assert!(waited.ok, "{:?}", waited.error);
+        assert_eq!(waited.result.unwrap()["output"], large);
+        reopened.persist().unwrap();
+        let persisted: Value = serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
+        assert!(persisted["tasks"][0]["output"]["$taskPayloadRef"].is_string());
+
+        let locator = persisted["tasks"][0]["outputRef"]["locator"]
+            .as_str()
+            .unwrap();
+        fs::write(directory.path().join(locator), b"corrupt").unwrap();
+        let failed = reopened.handle(Request::new("task.get", json!({"taskId":task.id})));
+        assert!(!failed.ok);
+        assert_eq!(failed.error.unwrap().code, "TASK_PAYLOAD_UNAVAILABLE");
+        let failed_wait = reopened.handle(Request::new(
+            "task.wait",
+            json!({"taskId":task.id,"timeoutMs":0}),
+        ));
+        assert!(!failed_wait.ok);
+        assert_eq!(failed_wait.error.unwrap().code, "TASK_PAYLOAD_UNAVAILABLE");
+    }
+
+    #[test]
+    fn failed_externalized_input_survives_retry_without_executing_marker() {
+        let directory = tempfile::tempdir().unwrap();
+        let state_path = directory.path().join("state.json");
+        let controller = Controller::open(JsonStore::new(&state_path)).unwrap();
+        let original_input = json!({
+            "fixture": "clean-task",
+            "bytes": "i".repeat(TASK_PAYLOAD_INLINE_LIMIT + 1024)
+        });
+        let task = controller
+            .tasks
+            .lock()
+            .unwrap()
+            .submit(
+                "session",
+                "executor",
+                "artifact.relay.archive.read",
+                original_input.clone(),
+                "failed-retry",
+            )
+            .0;
+        controller
+            .tasks
+            .lock()
+            .unwrap()
+            .transition(&task.id, TaskState::Running, None, None)
+            .unwrap();
+        controller
+            .tasks
+            .lock()
+            .unwrap()
+            .transition(
+                &task.id,
+                TaskState::Failed,
+                None,
+                Some(machine_fabric_schema::TaskError {
+                    code: "TRANSPORT_UNKNOWN".to_owned(),
+                    message: "transport ended before receipt".to_owned(),
+                    retryable: true,
+                    details: Value::Null,
+                }),
+            )
+            .unwrap();
+        controller.persist().unwrap();
+        drop(controller);
+
+        let reopened = Controller::open(JsonStore::new(&state_path)).unwrap();
+        let stored = reopened
+            .tasks
+            .lock()
+            .unwrap()
+            .get(&task.id)
+            .unwrap()
+            .clone();
+        assert!(stored.input.get("$taskPayloadRef").is_some());
+        assert!(stored.input_ref.is_some());
+        assert_eq!(
+            task_with_payload(&reopened.store, &stored).unwrap().input,
+            original_input
+        );
+
+        let retried = reopened.tasks.lock().unwrap().retry(&task.id).unwrap();
+        assert_eq!(retried.state, TaskState::Queued);
+        assert!(retried.input.get("$taskPayloadRef").is_some());
+        assert_eq!(
+            task_with_payload(&reopened.store, &retried).unwrap().input,
+            original_input
+        );
+        reopened.persist().unwrap();
+        let after_persist = reopened
+            .tasks
+            .lock()
+            .unwrap()
+            .get(&task.id)
+            .unwrap()
+            .clone();
+        assert_eq!(
+            task_with_payload(&reopened.store, &after_persist)
+                .unwrap()
+                .input,
+            original_input
+        );
+    }
+
+    #[test]
+    fn legacy_inline_state_becomes_single_reference_owner_after_first_persist() {
+        let directory = tempfile::tempdir().unwrap();
+        let state_path = directory.path().join("state.json");
+        let seed = Controller::open(JsonStore::new(&state_path)).unwrap();
+        let task = seed
+            .tasks
+            .lock()
+            .unwrap()
+            .submit(
+                "session",
+                "executor",
+                "artifact.relay.archive.read",
+                Value::Null,
+                "legacy-inline",
+            )
+            .0;
+        seed.tasks
+            .lock()
+            .unwrap()
+            .transition(&task.id, TaskState::Running, None, None)
+            .unwrap();
+        seed.tasks
+            .lock()
+            .unwrap()
+            .transition(
+                &task.id,
+                TaskState::Succeeded,
+                Some(json!({"archive":"x".repeat(TASK_PAYLOAD_INLINE_LIMIT + 2048)})),
+                None,
+            )
+            .unwrap();
+        let legacy_task = seed.tasks.lock().unwrap().snapshot().pop().unwrap();
+        let mut legacy_state = FabricState::default();
+        legacy_state.tasks.push(legacy_task);
+        JsonStore::new(&state_path).save(&legacy_state).unwrap();
+        drop(seed);
+
+        let reopened = Controller::open(JsonStore::new(&state_path)).unwrap();
+        assert!(reopened.state.lock().unwrap().tasks.is_empty());
+        reopened.persist().unwrap();
+        let first_size = fs::metadata(&state_path).unwrap().len();
+        let persisted: Value = serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
+        assert!(persisted["tasks"][0]["outputRef"].is_object());
+        reopened.persist().unwrap();
+        let second_size = fs::metadata(&state_path).unwrap().len();
+        assert_eq!(first_size, second_size);
+        drop(reopened);
+        let reopened_again = Controller::open(JsonStore::new(&state_path)).unwrap();
+        assert!(reopened_again.state.lock().unwrap().tasks.is_empty());
+        reopened_again.persist().unwrap();
+        assert_eq!(second_size, fs::metadata(&state_path).unwrap().len());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn controller_tunnel_behavior_harness_proves_authority_idempotence_and_bind_ownership() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("executor-root");
+        let fake_bin = directory.path().join("bin");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&fake_bin).unwrap();
+        let exit_marker = directory.path().join("exit-next");
+        let ssh = fake_bin.join("ssh");
+        std::fs::write(
+            &ssh,
+            format!(
+                "#!/bin/sh\nif [ \"$1\" = \"-G\" ]; then echo 'host fake-target'; exit 0; fi\nif [ -f '{}' ]; then rm -f '{}'; exit 0; fi\ntrap 'exit 0' TERM INT\nwhile :; do sleep 1; done\n",
+                exit_marker.display(),
+                exit_marker.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&ssh, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        // ProcessTable intentionally inherits PATH. Keep this test serialized by
+        // the process-wide environment lock and restore PATH before returning.
+        static PATH_LOCK: Mutex<()> = Mutex::new(());
+        let _path_guard = PATH_LOCK.lock().unwrap();
+        let old_path = std::env::var_os("PATH");
+        let mut path = fake_bin.as_os_str().to_owned();
+        path.push(":");
+        if let Some(old_path) = old_path.as_deref() {
+            path.push(old_path);
+        }
+        unsafe { std::env::set_var("PATH", &path) };
+
+        let runtime =
+            Arc::new(crate::ExecutorRuntime::new("tunnel-executor", vec![root.clone()]).unwrap());
+        let socket = directory.path().join("executor.sock");
+        let server_runtime = Arc::clone(&runtime);
+        std::thread::spawn(move || {
+            RpcServer::new(socket)
+                .serve(move |request| server_runtime.handle(request))
+                .unwrap()
+        });
+        let socket = directory.path().join("executor.sock");
+        for _ in 0..100 {
+            if socket.exists() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        let controller = Controller::open_with_id(
+            JsonStore::new(directory.path().join("controller.json")),
+            Some("controller-a".to_owned()),
+        )
+        .unwrap();
+        assert!(controller
+            .handle(Request::new(
+                "executor.register",
+                json!({"executorId":"tunnel-executor","endpoint":{"transport":"local","socket":socket}}),
+            ))
+            .ok);
+        for session_id in ["session-a", "session-b"] {
+            assert!(
+                controller
+                    .handle(Request::new(
+                        "session.put",
+                        json!({
+                            "apiVersion":"machine-fabric.dev/v1",
+                            "metadata":{"id":session_id,"labels":{},"createdAt":1,"updatedAt":1},
+                            "objective":"tunnel behavior harness","state":"active"
+                        }),
+                    ))
+                    .ok
+            );
+        }
+        let lease = controller.handle(Request::new(
+            "driver.take",
+            json!({"resource":"workspace:session-a","owner":"agent-a","ttlMs":600_000}),
+        ));
+        assert!(lease.ok, "{:?}", lease.error);
+        let token = lease.result.unwrap()["token"].as_str().unwrap().to_owned();
+        let input = json!({
+            "tunnelId":"demo",
+            "sshHost":"fake-target",
+            "direction":"remote-forward",
+            "bindHost":"127.0.0.1",
+            "bindPort":43127,
+            "targetHost":"127.0.0.1",
+            "targetPort":8080,
+            "cwd":root,
+            "workspaceSessionId":"session-a"
+        });
+        let invoke = |session: &str,
+                      owner: &str,
+                      driver_token: Option<&str>,
+                      capability: &str,
+                      idempotency_key: &str,
+                      input: Value| {
+            let mut params = json!({
+                "executorId":"tunnel-executor",
+                "capability":capability,
+                "workspaceSessionId":session,
+                "owner":owner,
+                "idempotencyKey":idempotency_key,
+                "input":input
+            });
+            if let Some(driver_token) = driver_token {
+                params["driverToken"] = Value::String(driver_token.to_owned());
+            }
+            controller.handle(Request::new("capability.invoke", params))
+        };
+
+        let first = invoke(
+            "session-a",
+            "agent-a",
+            Some(&token),
+            "tunnel.ensure",
+            "tunnel-ensure-1",
+            input.clone(),
+        );
+        assert!(first.ok, "{:?}", first.error);
+        assert_eq!(first.result.as_ref().unwrap()["result"]["state"], "running");
+
+        let second = invoke(
+            "session-a",
+            "agent-a",
+            Some(&token),
+            "tunnel.ensure",
+            "tunnel-ensure-2",
+            input.clone(),
+        );
+        assert!(second.ok, "{:?}", second.error);
+        assert_eq!(second.result.unwrap()["result"]["reused"], true);
+
+        let bind_conflict = invoke(
+            "session-a",
+            "agent-a",
+            Some(&token),
+            "tunnel.ensure",
+            "tunnel-ensure-conflict",
+            {
+                let mut value = input.clone();
+                value["tunnelId"] = Value::String("other".to_owned());
+                value
+            },
+        );
+        assert!(!bind_conflict.ok);
+        assert_eq!(bind_conflict.error.unwrap().code, "TUNNEL_BIND_CONFLICT");
+
+        let wrong_session = invoke(
+            "session-b",
+            "agent-a",
+            Some(&token),
+            "tunnel.stop",
+            "tunnel-stop-wrong-session",
+            json!({"tunnelId":"demo"}),
+        );
+        assert!(!wrong_session.ok);
+        assert!(matches!(
+            wrong_session.error.unwrap().code.as_str(),
+            "LEASE_NOT_FOUND" | "LEASE_OWNER_MISMATCH" | "LEASE_TOKEN_MISMATCH"
+        ));
+
+        let wrong_owner = invoke(
+            "session-a",
+            "agent-b",
+            Some(&token),
+            "tunnel.stop",
+            "tunnel-stop-wrong-owner",
+            json!({"tunnelId":"demo"}),
+        );
+        assert!(!wrong_owner.ok);
+        assert!(matches!(
+            wrong_owner.error.unwrap().code.as_str(),
+            "LEASE_OWNER_MISMATCH" | "LEASE_OWNED_BY_OTHER"
+        ));
+
+        let stopped = invoke(
+            "session-a",
+            "agent-a",
+            Some(&token),
+            "tunnel.stop",
+            "tunnel-stop-1",
+            json!({"tunnelId":"demo"}),
+        );
+        assert!(stopped.ok, "{:?}", stopped.error);
+        assert_eq!(stopped.result.unwrap()["result"]["state"], "stopped");
+
+        // A stopped tunnel can be explicitly ensured again; the fake ssh marker
+        // makes this second process exit, proving the observed exit is retained.
+        std::fs::write(&exit_marker, b"exit").unwrap();
+        let restarted = invoke(
+            "session-a",
+            "agent-a",
+            Some(&token),
+            "tunnel.ensure",
+            "tunnel-ensure-restart",
+            input,
+        );
+        assert!(restarted.ok, "{:?}", restarted.error);
+        let mut observed_state = Value::Null;
+        for attempt in 0..20 {
+            let observed = invoke(
+                "session-a",
+                "agent-a",
+                Some(&token),
+                "tunnel.get",
+                &format!("tunnel-get-after-exit-{attempt}"),
+                json!({"tunnelId":"demo"}),
+            );
+            assert!(observed.ok, "{:?}", observed.error);
+            observed_state = observed.result.unwrap()["result"]["state"].clone();
+            if observed_state == "stopped" {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert_eq!(observed_state, "stopped");
+
+        if let Some(old_path) = old_path {
+            unsafe { std::env::set_var("PATH", old_path) };
+        } else {
+            unsafe { std::env::remove_var("PATH") };
+        }
     }
 }

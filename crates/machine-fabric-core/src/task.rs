@@ -1,5 +1,5 @@
 use crate::now_ms;
-use machine_fabric_schema::{Task, TaskError as TaskFailure, TaskEvent, TaskState};
+use machine_fabric_schema::{Task, TaskError as TaskFailure, TaskEvent, TaskPayloadRef, TaskState};
 use serde_json::Value;
 use std::collections::BTreeMap;
 use thiserror::Error;
@@ -89,11 +89,14 @@ impl TaskTable {
             executor_id,
             capability,
             input,
+            input_ref: None,
             output: None,
+            output_ref: None,
             error: None,
             idempotency_key: idempotency_key.clone(),
             state: TaskState::Queued,
             attempt: 0,
+            revision: 1,
             created_at: now,
             updated_at: now,
             events: Vec::new(),
@@ -131,8 +134,10 @@ impl TaskTable {
         if matches!(state, TaskState::Running) {
             task.attempt += 1;
         }
+        task.revision = task.revision.saturating_add(1);
         task.state = state;
         task.output = output;
+        task.output_ref = None;
         task.error = error;
         task.updated_at = now_ms();
         let event_type = format!(
@@ -159,7 +164,9 @@ impl TaskTable {
             });
         }
         task.state = TaskState::Queued;
+        task.revision = task.revision.saturating_add(1);
         task.output = None;
+        task.output_ref = None;
         task.error = None;
         task.updated_at = now_ms();
         Self::push_event(task, "task.retried", Value::Null);
@@ -168,6 +175,57 @@ impl TaskTable {
 
     pub fn snapshot(&self) -> Vec<Task> {
         self.tasks.values().cloned().collect()
+    }
+
+    pub fn page_by<F>(&self, cursor: usize, limit: usize, predicate: F) -> (usize, Vec<&Task>)
+    where
+        F: Fn(&Task) -> bool,
+    {
+        let mut total = 0;
+        let mut page = Vec::new();
+        for task in self.tasks.values().filter(|task| predicate(task)) {
+            if total >= cursor && page.len() < limit {
+                page.push(task);
+            }
+            total += 1;
+        }
+        (total, page)
+    }
+
+    pub fn replace_input_ref_if_unchanged(
+        &mut self,
+        id: &str,
+        revision: u64,
+        marker: Value,
+        reference: TaskPayloadRef,
+    ) -> bool {
+        let Some(task) = self.tasks.get_mut(id) else {
+            return false;
+        };
+        if task.revision != revision || task.input_ref.is_some() {
+            return false;
+        }
+        task.input = marker;
+        task.input_ref = Some(reference);
+        true
+    }
+
+    pub fn replace_output_ref_if_unchanged(
+        &mut self,
+        id: &str,
+        revision: u64,
+        marker: Value,
+        reference: TaskPayloadRef,
+    ) -> bool {
+        let Some(task) = self.tasks.get_mut(id) else {
+            return false;
+        };
+        if task.revision != revision || task.output_ref.is_some() {
+            return false;
+        }
+        task.output = Some(marker);
+        task.output_ref = Some(reference);
+        true
     }
 
     pub fn prune_terminal_before(&mut self, cutoff: u64) -> Vec<Task> {
@@ -200,6 +258,7 @@ impl TaskTable {
             .filter(|task| matches!(task.state, TaskState::Queued | TaskState::Running))
         {
             task.state = TaskState::OutcomeUnknown;
+            task.revision = task.revision.saturating_add(1);
             task.error = Some(TaskFailure {
                 code: "CONTROLLER_RESTARTED".to_owned(),
                 message: "controller restarted before the task outcome was recorded".to_owned(),
@@ -280,5 +339,45 @@ mod tests {
         assert_eq!(recovered.len(), 1);
         assert_eq!(recovered[0].state, TaskState::OutcomeUnknown);
         assert!(recovered[0].error.as_ref().unwrap().retryable);
+    }
+
+    #[test]
+    fn payload_reference_revision_rejects_same_millisecond_retry() {
+        let mut table = TaskTable::default();
+        let (task, _) = table.submit("s", "e", "artifact.read", Value::Null, "revision");
+        table
+            .transition(&task.id, TaskState::Running, None, None)
+            .unwrap();
+        let terminal = table
+            .transition(
+                &task.id,
+                TaskState::Failed,
+                Some(Value::String("large".to_owned())),
+                None,
+            )
+            .unwrap();
+        let reference = TaskPayloadRef {
+            digest: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                .to_owned(),
+            bytes: 5,
+            locator: "task-payloads/placeholder.json".to_owned(),
+            chunk: None,
+        };
+        assert!(table.replace_output_ref_if_unchanged(
+            &task.id,
+            terminal.revision,
+            Value::String("$ref".to_owned()),
+            reference.clone(),
+        ));
+        let before_retry = table.get(&task.id).unwrap().revision;
+        table.retry(&task.id).unwrap();
+        assert!(table.get(&task.id).unwrap().revision > before_retry);
+        assert!(!table.replace_output_ref_if_unchanged(
+            &task.id,
+            before_retry,
+            Value::String("stale".to_owned()),
+            reference,
+        ));
+        assert!(table.get(&task.id).unwrap().output.is_none());
     }
 }

@@ -13,13 +13,25 @@ use std::process::{Command, Stdio};
 use std::sync::Mutex;
 use std::time::Duration;
 
+pub const OBSERVATION_TTL_MS: u64 = 30_000;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProcessRecord {
     pub id: String,
     pub pid: u32,
+    #[serde(default)]
+    pub identity_verified: bool,
+    #[serde(default)]
+    pub observed_at: Option<u64>,
     pub cwd: PathBuf,
     pub argv: Vec<String>,
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
+    #[serde(default)]
+    pub restartable: bool,
+    #[serde(default)]
+    pub metadata: Value,
     pub log_path: PathBuf,
     pub state: ProcessState,
     pub readiness: ReadinessStatus,
@@ -29,6 +41,8 @@ pub struct ProcessRecord {
     readiness_deadline_at: Option<u64>,
     pub started_at: u64,
     pub updated_at: u64,
+    #[serde(default)]
+    pub last_successful_probe_at: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -88,6 +102,8 @@ impl ProcessTable {
         env: BTreeMap<String, String>,
         log_path: PathBuf,
         readiness: Option<Value>,
+        restartable: bool,
+        metadata: Value,
     ) -> Result<ProcessRecord, RpcError> {
         if argv.is_empty() {
             return Err(RpcError::new("INVALID_PARAMS", "argv must not be empty"));
@@ -120,13 +136,13 @@ impl ProcessTable {
         command
             .args(&argv[1..])
             .current_dir(&cwd)
-            .envs(env)
+            .envs(env.clone())
             .stdin(Stdio::null())
             .stdout(Stdio::from(stdout))
             .stderr(Stdio::from(stderr));
         #[cfg(unix)]
         command.process_group(0);
-        let child = command
+        let mut child = command
             .spawn()
             .map_err(|error| RpcError::new("PROCESS_START_FAILED", error.to_string()))?;
         let now = now_ms();
@@ -140,8 +156,13 @@ impl ProcessTable {
         let record = ProcessRecord {
             id: id.clone(),
             pid: child.id(),
+            identity_verified: true,
+            observed_at: Some(now),
             cwd,
             argv,
+            env,
+            restartable,
+            metadata,
             log_path,
             state: ProcessState::Running,
             readiness: ReadinessStatus {
@@ -156,8 +177,13 @@ impl ProcessTable {
             readiness_deadline_at,
             started_at: now,
             updated_at: now,
+            last_successful_probe_at: None,
         };
-        drop(child);
+        // Keep a lightweight reaper so short-lived managed processes do not
+        // remain zombies and readiness/identity refresh can observe exit.
+        std::thread::spawn(move || {
+            let _ = child.wait();
+        });
         let mut records = self.records.lock().expect("process lock");
         records.insert(id, record.clone());
         self.persist(&records)?;
@@ -197,6 +223,68 @@ impl ProcessTable {
         let result = record.clone();
         self.persist(&records)?;
         Ok(result)
+    }
+
+    pub fn update_metadata(&self, id: &str, metadata: Value) -> Result<ProcessRecord, RpcError> {
+        let mut records = self.records.lock().expect("process lock");
+        let record = records
+            .get_mut(id)
+            .ok_or_else(|| RpcError::new("PROCESS_NOT_FOUND", format!("unknown process: {id}")))?;
+        record.metadata = metadata;
+        record.updated_at = now_ms();
+        let result = record.clone();
+        self.persist(&records)?;
+        Ok(result)
+    }
+
+    pub fn restart(&self, id: &str) -> Result<ProcessRecord, RpcError> {
+        let record = self.get(id)?;
+        if !record.restartable || record.argv.is_empty() {
+            return Err(RpcError::new(
+                "PROCESS_NOT_RESTARTABLE",
+                format!("process {id} is not restartable"),
+            ));
+        }
+        let _ = self.stop(id);
+        self.start(
+            id.to_owned(),
+            record.cwd,
+            record.argv,
+            record.env,
+            record.log_path,
+            record.readiness_spec,
+            record.restartable,
+            record.metadata,
+        )
+    }
+
+    pub fn wait_ready(&self, id: &str, timeout_ms: u64) -> Result<ProcessRecord, RpcError> {
+        let deadline = std::time::Instant::now() + Duration::from_millis(timeout_ms.max(1));
+        loop {
+            let record = self.get(id)?;
+            if record.readiness.state == ReadinessState::Ready {
+                return Ok(record);
+            }
+            if record.state != ProcessState::Running {
+                return Err(RpcError::new(
+                    "PROCESS_EXITED",
+                    format!("process {id} exited"),
+                ));
+            }
+            if record.readiness.state == ReadinessState::Failed {
+                return Err(RpcError::new(
+                    "READINESS_MARKER_MISSING",
+                    format!("process {id} readiness failed"),
+                ));
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(RpcError::new(
+                    "READINESS_TIMEOUT",
+                    format!("process {id} readiness timed out"),
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
     }
 
     pub fn logs(&self, id: &str, tail: usize) -> Result<Value, RpcError> {
@@ -264,7 +352,10 @@ fn refresh(record: &mut ProcessRecord) {
             .map(|spec| readiness_once(spec, &record.log_path))
             .transpose();
         match ready {
-            Ok(Some(true)) => record.readiness.state = ReadinessState::Ready,
+            Ok(Some(true)) => {
+                record.readiness.state = ReadinessState::Ready;
+                record.last_successful_probe_at = Some(now_ms());
+            }
             Ok(Some(false))
                 if record
                     .readiness_deadline_at
@@ -394,11 +485,33 @@ fn readiness_once(spec: &Value, log_path: &Path) -> Result<bool, RpcError> {
     }
 }
 
+#[cfg(any(target_os = "macos", windows, test))]
+pub(crate) fn application_environment(
+    value: Option<&Value>,
+) -> Result<BTreeMap<String, String>, RpcError> {
+    let env: BTreeMap<String, String> = match value {
+        None | Some(Value::Null) => BTreeMap::new(),
+        Some(value) => serde_json::from_value(value.clone())
+            .map_err(|_| RpcError::new("INVALID_PARAMS", "env must contain string values"))?,
+    };
+    if env
+        .iter()
+        .any(|(key, value)| key.is_empty() || key.contains(['=', '\0']) || value.contains('\0'))
+    {
+        return Err(RpcError::new(
+            "INVALID_PARAMS",
+            "invalid environment name or value",
+        ));
+    }
+    Ok(env)
+}
+
 #[cfg(test)]
 mod tests {
     use super::readiness_once;
     #[cfg(unix)]
     use super::{ProcessTable, ReadinessState};
+    use serde_json::Value;
     use serde_json::json;
     use std::fs;
     #[cfg(unix)]
@@ -451,6 +564,8 @@ mod tests {
                 Default::default(),
                 log_path,
                 Some(json!({"type": "log", "pattern": "^ready$", "timeoutMs": 2_000})),
+                false,
+                Value::Null,
             )
             .expect("start process");
         assert!(started.elapsed() < Duration::from_millis(150));
@@ -491,12 +606,16 @@ mod tests {
                 Default::default(),
                 root.join("process.log"),
                 None,
+                false,
+                Value::Null,
             )
             .expect("start process");
         drop(table);
         let restored = ProcessTable::open(state_path).expect("restore table");
         let record = restored.get("persistent-process").expect("restored record");
         assert_eq!(record.state, super::ProcessState::Running);
+        assert!(record.identity_verified);
+        assert!(record.metadata.is_null());
         restored.stop("persistent-process").expect("stop process");
         let _ = fs::remove_dir_all(root);
     }
@@ -524,6 +643,8 @@ mod tests {
                 Default::default(),
                 root.join("process.log"),
                 None,
+                false,
+                Value::Null,
             )
             .expect("start process");
         let deadline = std::time::Instant::now() + Duration::from_secs(1);
@@ -550,28 +671,6 @@ mod tests {
         }
         let _ = fs::remove_dir_all(root);
     }
-}
-
-/// Explicit application environment overrides, validated before spawning on either OS.
-#[cfg(any(target_os = "macos", windows, test))]
-pub(crate) fn application_environment(
-    value: Option<&Value>,
-) -> Result<BTreeMap<String, String>, RpcError> {
-    let env: BTreeMap<String, String> = match value {
-        None | Some(Value::Null) => BTreeMap::new(),
-        Some(value) => serde_json::from_value(value.clone())
-            .map_err(|_| RpcError::new("INVALID_PARAMS", "env must contain string values"))?,
-    };
-    if env
-        .iter()
-        .any(|(key, value)| key.is_empty() || key.contains(['=', '\0']) || value.contains('\0'))
-    {
-        return Err(RpcError::new(
-            "INVALID_PARAMS",
-            "invalid environment name or value",
-        ));
-    }
-    Ok(env)
 }
 
 #[cfg(any(windows, test))]

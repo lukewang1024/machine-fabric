@@ -238,17 +238,33 @@ pub struct Task {
     pub executor_id: String,
     pub capability: String,
     pub input: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_ref: Option<TaskPayloadRef>,
     #[serde(default)]
     pub output: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_ref: Option<TaskPayloadRef>,
     #[serde(default)]
     pub error: Option<TaskError>,
     pub idempotency_key: String,
     pub state: TaskState,
     pub attempt: u32,
+    #[serde(default)]
+    pub revision: u64,
     pub created_at: u64,
     pub updated_at: u64,
     #[serde(default)]
     pub events: Vec<TaskEvent>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskPayloadRef {
+    pub digest: String,
+    pub bytes: u64,
+    pub locator: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chunk: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

@@ -55,9 +55,22 @@ pub struct JsonStore {
     path: PathBuf,
 }
 
+#[cfg(test)]
+#[derive(Clone, Copy)]
+enum SaveFailure {
+    Write,
+    Sync,
+    Rename,
+    Enospc,
+}
+
 impl JsonStore {
     pub fn new(path: impl Into<PathBuf>) -> Self {
         Self { path: path.into() }
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
     }
 
     pub fn load(&self) -> Result<FabricState, StoreError> {
@@ -68,19 +81,82 @@ impl JsonStore {
     }
 
     pub fn save(&self, state: &FabricState) -> Result<(), StoreError> {
+        self.save_inner(state, None)
+    }
+
+    #[cfg(test)]
+    fn save_with_failure(
+        &self,
+        state: &FabricState,
+        failure: SaveFailure,
+    ) -> Result<(), StoreError> {
+        self.save_inner(state, Some(failure))
+    }
+
+    fn save_inner(
+        &self,
+        state: &FabricState,
+        #[cfg(test)] failure: Option<SaveFailure>,
+        #[cfg(not(test))] _failure: Option<()>,
+    ) -> Result<(), StoreError> {
         if let Some(parent) = self.path.parent() {
             fs::create_dir_all(parent)?;
         }
         let temporary = temporary_path(&self.path);
-        let mut file = fs::OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(&temporary)?;
-        file.write_all(&serde_json::to_vec_pretty(state)?)?;
-        file.write_all(b"\n")?;
-        file.sync_all()?;
-        atomic_replace(&temporary, &self.path)?;
-        Ok(())
+        let result = (|| -> Result<(), StoreError> {
+            let mut file = fs::OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(&temporary)?;
+            let bytes = serde_json::to_vec_pretty(state)?;
+            file.write_all(&bytes).map_err(|error| {
+                std::io::Error::new(
+                    error.kind(),
+                    format!("write state temp {}: {error}", temporary.display()),
+                )
+            })?;
+            #[cfg(test)]
+            if matches!(failure, Some(SaveFailure::Write | SaveFailure::Enospc)) {
+                return Err(StoreError::Io(std::io::Error::from_raw_os_error(28)));
+            }
+            file.write_all(b"\n").map_err(|error| {
+                std::io::Error::new(
+                    error.kind(),
+                    format!("write state temp {}: {error}", temporary.display()),
+                )
+            })?;
+            file.sync_all().map_err(|error| {
+                std::io::Error::new(
+                    error.kind(),
+                    format!("sync state temp {}: {error}", temporary.display()),
+                )
+            })?;
+            #[cfg(test)]
+            if matches!(failure, Some(SaveFailure::Sync)) {
+                return Err(StoreError::Io(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    "injected sync failure",
+                )));
+            }
+            #[cfg(test)]
+            if matches!(failure, Some(SaveFailure::Rename)) {
+                return Err(StoreError::Io(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    "injected rename failure",
+                )));
+            }
+            atomic_replace(&temporary, &self.path).map_err(|error| {
+                std::io::Error::new(
+                    error.kind(),
+                    format!("rename state temp {}: {error}", temporary.display()),
+                )
+            })?;
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = fs::remove_file(&temporary);
+        }
+        result
     }
 }
 
@@ -127,5 +203,48 @@ mod tests {
         let store = JsonStore::new(directory.path().join("state.json"));
         store.save(&FabricState::default()).unwrap();
         assert!(store.load().unwrap().tasks.is_empty());
+    }
+
+    #[test]
+    fn failed_atomic_replace_cleans_new_temp_and_preserves_old_path() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("state.json");
+        std::fs::create_dir(&path).unwrap();
+        let store = JsonStore::new(&path);
+        assert!(store.save(&FabricState::default()).is_err());
+        assert!(path.is_dir());
+        let leftovers = std::fs::read_dir(directory.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with(".state.json.") && name.ends_with(".tmp"))
+            .collect::<Vec<_>>();
+        assert!(leftovers.is_empty(), "leftover temp files: {leftovers:?}");
+    }
+
+    #[test]
+    fn injected_write_sync_rename_and_enospc_failures_preserve_old_state() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("state.json");
+        let store = JsonStore::new(&path);
+        store.save(&FabricState::default()).unwrap();
+        for failure in [
+            SaveFailure::Write,
+            SaveFailure::Sync,
+            SaveFailure::Rename,
+            SaveFailure::Enospc,
+        ] {
+            assert!(
+                store
+                    .save_with_failure(&FabricState::default(), failure)
+                    .is_err()
+            );
+            assert!(store.load().unwrap().tasks.is_empty());
+            let leftovers = std::fs::read_dir(directory.path())
+                .unwrap()
+                .filter_map(Result::ok)
+                .any(|entry| entry.file_name().to_string_lossy().ends_with(".tmp"));
+            assert!(!leftovers);
+        }
     }
 }
