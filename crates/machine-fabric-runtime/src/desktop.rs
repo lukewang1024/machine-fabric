@@ -303,6 +303,7 @@ impl DesktopQueue {
         }
     }
 
+    #[cfg(any(target_os = "macos", test))]
     pub(crate) fn begin_recovery_inspection(
         &mut self,
         action: &str,
@@ -325,6 +326,7 @@ impl DesktopQueue {
         Ok(())
     }
 
+    #[cfg(any(target_os = "macos", test))]
     pub(crate) fn end_recovery_inspection(&mut self) {
         self.recovery_inspection_active = false;
     }

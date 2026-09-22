@@ -2719,8 +2719,18 @@ fn read_task_payload(store: &JsonStore, reference: &TaskPayloadRef) -> Result<Va
     if !valid_payload_digest(&reference.digest) {
         return Err(payload_error(reference, "invalid digest"));
     }
-    let expected_locator = format!("task-payloads/{}.json", reference.digest);
-    if reference.locator != expected_locator {
+    let expected_locator = format!("task-payloads/{}.json", &reference.digest[7..]);
+    // v0.1.27 macOS/Linux records used a colon-bearing filename. Read that exact
+    // digest-derived legacy path without accepting arbitrary locators. Windows
+    // must never interpret a colon as an NTFS alternate data stream.
+    #[cfg(unix)]
+    let legacy_locator = format!("task-payloads/{}.json", reference.digest);
+    #[cfg(unix)]
+    let locator_valid =
+        reference.locator == expected_locator || reference.locator == legacy_locator;
+    #[cfg(not(unix))]
+    let locator_valid = reference.locator == expected_locator;
+    if !locator_valid {
         return Err(payload_error(
             reference,
             "locator is not the canonical digest path",
@@ -2730,7 +2740,7 @@ fn read_task_payload(store: &JsonStore, reference: &TaskPayloadRef) -> Result<Va
         .path()
         .parent()
         .unwrap_or_else(|| std::path::Path::new("."))
-        .join(expected_locator);
+        .join(&reference.locator);
     let bytes = read_payload_bytes(
         path.parent().expect("payload parent"),
         &path,
@@ -2804,7 +2814,7 @@ fn externalize_task_payloads(
 
 fn write_task_payload(store: &JsonStore, bytes: &[u8]) -> Result<TaskPayloadRef, RpcError> {
     let digest = sha256_bytes(bytes);
-    let locator = format!("task-payloads/{digest}.json");
+    let locator = format!("task-payloads/{}.json", &digest[7..]);
     let path = store
         .path()
         .parent()
@@ -3494,7 +3504,7 @@ mod tests {
                         json!({
                             "executorId": "executor-recovery",
                             "allowedRoots": [allowed_root.clone()],
-                            "capabilities": crate::capability_catalog(),
+                            "capabilities": [crate::executor::recovery_inspection_test_contract()],
                         }),
                     ),
                     "ui.native-inspect" => {
@@ -4429,6 +4439,49 @@ mod tests {
                 .get("output")
                 .is_none()
         );
+    }
+
+    #[test]
+    fn payload_locator_is_portable_and_strict() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = JsonStore::new(directory.path().join("controller.json"));
+        let bytes = br#"{"payload":"exact"}"#;
+        let reference = write_task_payload(&store, bytes).unwrap();
+        assert!(!reference.locator.contains(':'));
+        assert_eq!(
+            read_task_payload(&store, &reference).unwrap(),
+            json!({"payload":"exact"})
+        );
+        for locator in [
+            "../payload.json".to_owned(),
+            "/tmp/payload.json".to_owned(),
+            format!("task-payloads/{}.json:stream", &reference.digest[7..]),
+        ] {
+            let mut bad = reference.clone();
+            bad.locator = locator;
+            assert!(read_task_payload(&store, &bad).is_err());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prior_colon_payload_locator_remains_hash_checked() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = JsonStore::new(directory.path().join("controller.json"));
+        let mut reference = write_task_payload(&store, br#"{"old":true}"#).unwrap();
+        let old = format!("task-payloads/{}.json", reference.digest);
+        fs::rename(
+            directory.path().join(&reference.locator),
+            directory.path().join(&old),
+        )
+        .unwrap();
+        reference.locator = old;
+        assert_eq!(
+            read_task_payload(&store, &reference).unwrap(),
+            json!({"old":true})
+        );
+        fs::write(directory.path().join(&reference.locator), b"corrupt").unwrap();
+        assert!(read_task_payload(&store, &reference).is_err());
     }
 
     #[test]

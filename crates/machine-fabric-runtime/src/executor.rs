@@ -33,10 +33,12 @@ pub struct ExecutorRuntime {
     tunnel_mutation: Mutex<()>,
 }
 
+#[cfg(any(target_os = "macos", test))]
 struct RecoveryInspectionGuard<'a> {
     runtime: &'a ExecutorRuntime,
 }
 
+#[cfg(any(target_os = "macos", test))]
 impl Drop for RecoveryInspectionGuard<'_> {
     fn drop(&mut self) {
         let mut desktop = match self.runtime.desktop.lock() {
@@ -502,10 +504,10 @@ impl ExecutorRuntime {
         crate::desktop::validate_recovery_inspection_params(action, params)?;
         #[cfg(not(target_os = "macos"))]
         {
-            return Err(RpcError::new(
+            Err(RpcError::new(
                 "RECOVERY_INSPECT_UNSUPPORTED_PLATFORM",
                 "recovery inspection is supported only on macOS",
-            ));
+            ))
         }
 
         #[cfg(target_os = "macos")]
@@ -516,6 +518,7 @@ impl ExecutorRuntime {
         )
     }
 
+    #[cfg(any(target_os = "macos", test))]
     fn recovery_inspection_dispatch_using<F>(
         &self,
         action: &str,
@@ -533,6 +536,7 @@ impl ExecutorRuntime {
         result
     }
 
+    #[cfg(any(target_os = "macos", test))]
     fn begin_recovery_inspection<'a>(
         &'a self,
         action: &str,
@@ -1956,6 +1960,11 @@ pub fn capability_catalog() -> Vec<CapabilityDescriptor> {
         .into_iter()
         .map(|(name, effect)| contract(name, effect))
         .collect()
+}
+
+#[cfg(test)]
+pub(crate) fn recovery_inspection_test_contract() -> CapabilityDescriptor {
+    contract("ui.native-inspect", Effect::ReadOnly)
 }
 
 fn contract(name: &str, effect: Effect) -> CapabilityDescriptor {
