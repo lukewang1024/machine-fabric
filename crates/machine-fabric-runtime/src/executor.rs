@@ -3952,12 +3952,12 @@ mod tests {
             fs::write(package.join("package.json"), b"{}\n").unwrap();
             fs::write(host_root.join("host.mjs"), b"// fake transport host\n").unwrap();
             fs::write(
-                &state_root.join("runtime-root"),
+                state_root.join("runtime-root"),
                 runtime_root.to_string_lossy().as_bytes(),
             )
             .unwrap();
             fs::write(
-                &state_root.join("host-root"),
+                state_root.join("host-root"),
                 host_root.to_string_lossy().as_bytes(),
             )
             .unwrap();

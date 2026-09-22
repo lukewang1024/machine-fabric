@@ -94,6 +94,8 @@ impl ProcessTable {
         Ok(table)
     }
 
+    // Keep the established process launch contract; these are independent RPC fields.
+    #[allow(clippy::too_many_arguments)]
     pub fn start(
         &self,
         id: String,

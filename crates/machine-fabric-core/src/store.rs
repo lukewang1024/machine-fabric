@@ -137,15 +137,13 @@ impl JsonStore {
             })?;
             #[cfg(test)]
             if matches!(failure, Some(SaveFailure::Sync)) {
-                return Err(StoreError::Io(std::io::Error::new(
-                    std::io::ErrorKind::Other,
+                return Err(StoreError::Io(std::io::Error::other(
                     "injected sync failure",
                 )));
             }
             #[cfg(test)]
             if matches!(failure, Some(SaveFailure::Rename)) {
-                return Err(StoreError::Io(std::io::Error::new(
-                    std::io::ErrorKind::Other,
+                return Err(StoreError::Io(std::io::Error::other(
                     "injected rename failure",
                 )));
             }

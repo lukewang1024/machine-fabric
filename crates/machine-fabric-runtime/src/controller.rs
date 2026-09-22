@@ -3503,8 +3503,8 @@ mod tests {
                             "ui.native-inspect",
                             &input,
                         );
-                        if result.is_err() {
-                            return Response::failure(request.request_id, result.unwrap_err());
+                        if let Err(error) = result {
+                            return Response::failure(request.request_id, error);
                         }
                         let path_allowed = input["applicationPath"]
                             .as_str()

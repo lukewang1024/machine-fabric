@@ -12,6 +12,7 @@ jobs:
   rust:
     runs-on: ${{ matrix.runner }}
     strategy:
+      fail-fast: false
       matrix:
         runner: [ubuntu-latest, macos-14, windows-latest]
     steps:
