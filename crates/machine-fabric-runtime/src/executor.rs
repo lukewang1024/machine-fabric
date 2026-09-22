@@ -27,6 +27,7 @@ pub struct ExecutorRuntime {
     fences: Option<Mutex<ExecutorFences>>,
     execution: ExecutionCapacity,
     relay_root: PathBuf,
+    clipboard: crate::clipboard::ClipboardService,
     computer_use: crate::computer_use::ComputerUseService,
     desktop: Mutex<crate::desktop::DesktopQueue>,
     desktop_execution: Mutex<()>,
@@ -279,6 +280,7 @@ impl ExecutorRuntime {
             fences: None,
             execution: ExecutionCapacity::from_environment(),
             relay_root,
+            clipboard: crate::clipboard::ClipboardService::default(),
             computer_use: crate::computer_use::ComputerUseService::default(),
             desktop: Mutex::new(crate::desktop::DesktopQueue::default()),
             desktop_execution: Mutex::new(()),
@@ -632,6 +634,24 @@ impl ExecutorRuntime {
                 }))
             }
             "capability.list" => Ok(serde_json::to_value(capability_catalog()).unwrap()),
+            "clipboard.status" => self.clipboard.status(),
+            "clipboard.read" => self.clipboard.read(
+                params
+                    .get("maxBytes")
+                    .and_then(Value::as_u64)
+                    .map(|value| value as usize)
+                    .unwrap_or(crate::clipboard::DEFAULT_MAX_BYTES)
+                    .min(crate::clipboard::DEFAULT_MAX_BYTES),
+            ),
+            "clipboard.write" => self.clipboard.write(
+                &params,
+                params
+                    .get("maxBytes")
+                    .and_then(Value::as_u64)
+                    .map(|value| value as usize)
+                    .unwrap_or(crate::clipboard::DEFAULT_MAX_BYTES)
+                    .min(crate::clipboard::DEFAULT_MAX_BYTES),
+            ),
             "capability.negotiate" => {
                 let name = required_str(&params, "name")?;
                 let requested = required_str(&params, "version")?;
@@ -1897,6 +1917,9 @@ pub fn capability_catalog() -> Vec<CapabilityDescriptor> {
         ("filesystem.restore", Effect::Mutating),
         ("filesystem.mkdir", Effect::Mutating),
         ("command.run", Effect::Mutating),
+        ("clipboard.status", Effect::ReadOnly),
+        ("clipboard.read", Effect::ReadOnly),
+        ("clipboard.write", Effect::Mutating),
         ("artifact.build", Effect::Mutating),
         ("artifact.describe", Effect::ReadOnly),
         ("artifact.pack-chromium-datapack", Effect::Mutating),
@@ -1960,6 +1983,33 @@ pub fn capability_catalog() -> Vec<CapabilityDescriptor> {
 
 fn contract(name: &str, effect: Effect) -> CapabilityDescriptor {
     let (required, properties, locks, key_fields, timeout_ms, rollback, evidence) = match name {
+        "clipboard.status" => (
+            vec!["clipboard"],
+            json!({}),
+            Vec::new(),
+            Vec::new(),
+            5_000,
+            RollbackStrategy::None,
+            vec!["clipboard-status"],
+        ),
+        "clipboard.read" => (
+            vec!["clipboard"],
+            json!({"maxBytes":{"type":"integer","minimum":1,"maximum":16777216}}),
+            Vec::new(),
+            vec!["maxBytes"],
+            5_000,
+            RollbackStrategy::None,
+            vec!["clipboard-digest"],
+        ),
+        "clipboard.write" => (
+            vec!["clipboard"],
+            json!({"semanticDigest":{"type":"string"},"content":{"type":"object"},"expiresAtMs":{"type":"integer","minimum":1},"maxBytes":{"type":"integer","minimum":1,"maximum":16777216}}),
+            vec!["clipboard:${executorId}"],
+            vec!["semanticDigest"],
+            30_000,
+            RollbackStrategy::None,
+            vec!["clipboard-digest"],
+        ),
         "filesystem.resolve" | "filesystem.stat" | "filesystem.read" | "filesystem.list" => (
             vec!["filesystem"],
             json!({"path": {"type": "string"}}),

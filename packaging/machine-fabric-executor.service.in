@@ -1,9 +1,11 @@
 [Unit]
 Description=Machine Fabric Executor
 After=default.target
+@CLIPBOARD_AFTER@
 
 [Service]
 Type=simple
+@CLIPBOARD_ENV@
 ExecStart=@BINARY@ --socket @SOCKET@ executor serve --id @EXECUTOR_ID@@ALLOW_ROOTS@
 Restart=on-failure
 RestartSec=1
