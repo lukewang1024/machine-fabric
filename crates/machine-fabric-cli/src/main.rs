@@ -20,6 +20,7 @@ use std::sync::Arc;
 #[cfg(windows)]
 use std::time::Duration;
 
+mod clipboard_cli;
 mod computer_use_cli;
 
 #[derive(Debug, Parser)]
@@ -89,6 +90,33 @@ enum Command {
     ComputerUse {
         #[command(subcommand)]
         command: computer_use_cli::ComputerUseCommand,
+    },
+    Clipboard {
+        #[command(subcommand)]
+        command: ClipboardCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum ClipboardCommand {
+    /// Launch a program against the managed Linux image clipboard.
+    Exec {
+        #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
+        command: Vec<String>,
+    },
+    /// List connected peer nodes and their image clipboard readiness.
+    Targets {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Send the current local image once. Never watches or forwards text.
+    Push {
+        #[arg(long)]
+        target: String,
+        #[arg(long)]
+        image_only: bool,
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -266,6 +294,16 @@ fn run_cli() -> Result<()> {
         _ => {}
     }
     match cli.command {
+        Command::Clipboard { command } => {
+            let socket = cli.socket.unwrap_or_else(default_controller_socket);
+            match command {
+                ClipboardCommand::Exec { command } => clipboard_cli::exec(&command),
+                ClipboardCommand::Targets { json } => clipboard_cli::targets(&socket, json),
+                ClipboardCommand::Push { target, json, .. } => {
+                    clipboard_cli::push(&socket, &target, json)
+                }
+            }
+        }
         Command::Status => print_response(call_unix(
             cli.socket.unwrap_or_else(default_controller_socket),
             &Request::new("status", Value::Null),

@@ -50,6 +50,30 @@ The runtime uses native platform services in production: launchd on macOS,
 systemd user services on Linux, and Windows Services on Windows. SSH aliases
 and keys remain user-managed through the normal SSH configuration.
 
+## Image clipboard transfer
+
+Send the current Mac clipboard image to one connected machine explicitly:
+
+```sh
+machine-fabric clipboard targets --json
+machine-fabric clipboard push --target devbox --image-only --json
+```
+
+The transfer accepts images only, is limited to 16 MiB of decoded RGBA pixels,
+expires after 30 seconds, and succeeds only after the destination confirms the
+image digest. It does not watch the clipboard, forward text, or retry writes.
+
+On a headless Linux Executor, install with a private authenticated X11 display:
+
+```sh
+MACHINE_FABRIC_CLIPBOARD_DISPLAY=:98 scripts/install-linux-user.sh \
+  target/release/machine-fabric devbox
+```
+
+Launch tools that need the managed clipboard with `machine-fabric clipboard
+exec -- codex`. Existing `distributed-workbench/clipboard-env` files remain a
+supported migration fallback.
+
 ## Local acceptance
 
 The repeatable three-node Docker acceptance is local-only:

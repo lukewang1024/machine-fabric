@@ -1,3 +1,8 @@
+#[cfg(not(target_os = "android"))]
+pub mod clipboard;
+#[cfg(target_os = "android")]
+#[path = "clipboard_unsupported.rs"]
+pub mod clipboard;
 mod computer_use;
 mod controller;
 mod datapack;
