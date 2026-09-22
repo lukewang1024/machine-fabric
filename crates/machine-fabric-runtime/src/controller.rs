@@ -141,13 +141,23 @@ impl Controller {
                 identity_changed = true;
             }
         }
+        // Validate and convert deployed markers before any compaction or state write.
+        // Keep only references resident; at most one sidecar is decoded at a time.
+        let migrated =
+            migrate_deployed_task_payloads(&store, &mut state.tasks).map_err(|error| {
+                machine_fabric_core::StoreError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("{}: {}", error.code, error.message),
+                ))
+            })?;
         let compacted = compact_persisted_evidence(&mut state);
         let mut leases =
             LeaseTable::from_snapshot(state.leases.clone(), state.lease_fences.clone());
         let reaped = leases.reap_expired();
         let mut tasks = TaskTable::from_tasks(std::mem::take(&mut state.tasks));
         let recovered = tasks.recover_orphans();
-        if identity_changed || compacted || !reaped.is_empty() || !recovered.is_empty() {
+        if migrated || identity_changed || compacted || !reaped.is_empty() || !recovered.is_empty()
+        {
             state.leases = leases.snapshot();
             state.lease_fences = leases.fence_snapshot();
             state.tasks = tasks.snapshot();
@@ -1261,10 +1271,17 @@ impl Controller {
                         TaskState::Failed | TaskState::TimedOut | TaskState::OutcomeUnknown
                             if task.attempt < contract.retry.max_attempts =>
                         {
+                            let restored = task_with_payload(&self.store, &task)?;
+                            if restored.input != input {
+                                return Err(RpcError::new(
+                                    "TASK_RETRY_INPUT_MISMATCH",
+                                    "retry input differs from the original task",
+                                ));
+                            }
                             self.tasks
                                 .lock()
                                 .expect("task lock")
-                                .retry(&task.id)
+                                .retry_with_input(&task.id, restored.input)
                                 .map_err(|error| {
                                     RpcError::new("INVALID_TASK_STATE", error.to_string())
                                 })?
@@ -1542,6 +1559,7 @@ impl Controller {
                     request_id,
                 );
                 self.persist()?;
+                let task = task_with_payload(&self.store, &task)?;
                 Ok(json!({"task": task, "reused": reused}))
             }
             "task.get" => {
@@ -2557,7 +2575,144 @@ fn task_with_payload(store: &JsonStore, task: &Task) -> Result<Task, RpcError> {
     if let Some(reference) = hydrated.output_ref.as_ref() {
         hydrated.output = Some(read_task_payload(store, reference)?);
     }
+    // Compatibility for records introduced through handoff or older task writers.
+    hydrate_deployed_payload(store, &mut hydrated.input)?;
+    if let Some(output) = &mut hydrated.output {
+        hydrate_deployed_payload(store, output)?;
+    }
+    if let Some(error) = &mut hydrated.error {
+        hydrate_deployed_payload(store, &mut error.details)?;
+    }
+    for event in &mut hydrated.events {
+        hydrate_deployed_payload(store, &mut event.details)?;
+    }
     Ok(hydrated)
+}
+
+fn deployed_payload(store: &JsonStore, value: &Value) -> Result<Option<Value>, RpcError> {
+    let Some(marker) = value.get("$machineFabricPayload") else {
+        return Ok(None);
+    };
+    let invalid = |reason: &str| RpcError::new("TASK_PAYLOAD_UNAVAILABLE", reason);
+    if value.as_object().is_none_or(|object| object.len() != 1)
+        || marker.as_object().is_none_or(|object| object.len() != 2)
+    {
+        return Err(invalid("invalid deployed payload marker fields"));
+    }
+    let digest = marker
+        .get("sha256")
+        .and_then(Value::as_str)
+        .filter(|digest| {
+            digest.len() == 64
+                && digest
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        })
+        .ok_or_else(|| invalid("invalid deployed payload digest"))?;
+    let size = marker
+        .get("bytes")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| invalid("invalid deployed payload byte count"))?;
+    let name = store
+        .path()
+        .file_name()
+        .ok_or_else(|| invalid("state filename missing"))?;
+    let mut directory_name = name.to_os_string();
+    directory_name.push(".payloads");
+    let directory = store.path().with_file_name(directory_name);
+    let path = directory.join(format!("{digest}.json"));
+    let bytes = read_payload_bytes(&directory, &path, size, &format!("sha256:{digest}"))?;
+    serde_json::from_slice(&bytes)
+        .map(Some)
+        .map_err(|error| invalid(&format!("invalid deployed payload JSON: {error}")))
+}
+
+fn hydrate_deployed_payload(store: &JsonStore, value: &mut Value) -> Result<(), RpcError> {
+    if let Some(restored) = deployed_payload(store, value)? {
+        *value = restored;
+    }
+    Ok(())
+}
+
+fn migrate_deployed_task_payloads(store: &JsonStore, tasks: &mut [Task]) -> Result<bool, RpcError> {
+    let mut changed = false;
+    for task in tasks {
+        let mut fields = vec![(&mut task.input, &mut task.input_ref)];
+        if let Some(output) = task.output.as_mut() {
+            fields.push((output, &mut task.output_ref));
+        }
+        for (value, reference) in fields {
+            if let Some(restored) = deployed_payload(store, value)? {
+                if reference.is_some() {
+                    return Err(RpcError::new(
+                        "TASK_PAYLOAD_UNAVAILABLE",
+                        "conflicting deployed and candidate references",
+                    ));
+                }
+                if task.state.terminal() {
+                    let bytes = serde_json::to_vec(&restored).map_err(|error| {
+                        RpcError::new("STATE_PAYLOAD_ENCODE_FAILED", error.to_string())
+                    })?;
+                    let converted = write_task_payload(store, &bytes)?;
+                    *value = json!({"$taskPayloadRef": converted.digest, "bytes": converted.bytes});
+                    *reference = Some(converted);
+                } else {
+                    // Queued/running input remains executable data, never a marker.
+                    *value = restored;
+                }
+                changed = true;
+            }
+        }
+        // Deployed retain_task also covers these fields; keep compatibility lazy.
+        if let Some(error) = &task.error {
+            deployed_payload(store, &error.details)?;
+        }
+        for event in &task.events {
+            deployed_payload(store, &event.details)?;
+        }
+    }
+    Ok(changed)
+}
+
+fn read_payload_bytes(
+    directory: &std::path::Path,
+    path: &std::path::Path,
+    size: u64,
+    digest: &str,
+) -> Result<Vec<u8>, RpcError> {
+    let invalid = |reason: String| {
+        RpcError::new(
+            "TASK_PAYLOAD_UNAVAILABLE",
+            format!("{}: {reason}", path.display()),
+        )
+    };
+    if fs::symlink_metadata(directory)
+        .map_err(|e| invalid(e.to_string()))?
+        .file_type()
+        .is_symlink()
+        || !fs::symlink_metadata(path)
+            .map_err(|e| invalid(e.to_string()))?
+            .file_type()
+            .is_file()
+    {
+        return Err(invalid(
+            "payload directory/file must not be symlinks".to_owned(),
+        ));
+    }
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NOFOLLOW);
+    let mut file = options.open(path).map_err(|e| invalid(e.to_string()))?;
+    if file.metadata().map_err(|e| invalid(e.to_string()))?.len() != size {
+        return Err(invalid("byte count mismatch".to_owned()));
+    }
+    let mut bytes = Vec::new();
+    std::io::Read::read_to_end(&mut file, &mut bytes).map_err(|e| invalid(e.to_string()))?;
+    if bytes.len() as u64 != size || sha256_bytes(&bytes) != digest {
+        return Err(invalid("SHA-256 or byte count mismatch".to_owned()));
+    }
+    Ok(bytes)
 }
 
 fn read_task_payload(store: &JsonStore, reference: &TaskPayloadRef) -> Result<Value, RpcError> {
@@ -2576,14 +2731,12 @@ fn read_task_payload(store: &JsonStore, reference: &TaskPayloadRef) -> Result<Va
         .parent()
         .unwrap_or_else(|| std::path::Path::new("."))
         .join(expected_locator);
-    let bytes = fs::read(&path)
-        .map_err(|error| payload_error(reference, format!("read {}: {error}", path.display())))?;
-    if bytes.len() as u64 != reference.bytes {
-        return Err(payload_error(reference, "byte count mismatch"));
-    }
-    if sha256_bytes(&bytes) != reference.digest {
-        return Err(payload_error(reference, "SHA-256 mismatch"));
-    }
+    let bytes = read_payload_bytes(
+        path.parent().expect("payload parent"),
+        &path,
+        reference.bytes,
+        &reference.digest,
+    )?;
     serde_json::from_slice(&bytes)
         .map_err(|error| payload_error(reference, format!("invalid JSON: {error}")))
 }
@@ -2658,18 +2811,12 @@ fn write_task_payload(store: &JsonStore, bytes: &[u8]) -> Result<TaskPayloadRef,
         .unwrap_or_else(|| std::path::Path::new("."))
         .join(&locator);
     if path.exists() {
-        let existing = fs::read(&path).map_err(|error| {
-            RpcError::new(
-                "STATE_PAYLOAD_WRITE_FAILED",
-                format!("verify {}: {error}", path.display()),
-            )
-        })?;
-        if existing.len() as u64 != bytes.len() as u64 || sha256_bytes(&existing) != digest {
-            return Err(RpcError::new(
-                "STATE_PAYLOAD_WRITE_FAILED",
-                format!("existing sidecar {} does not match digest", path.display()),
-            ));
-        }
+        read_payload_bytes(
+            path.parent().expect("payload parent"),
+            &path,
+            bytes.len() as u64,
+            &digest,
+        )?;
     } else {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).map_err(|error| {
@@ -2871,7 +3018,11 @@ fn value_matches_type(value: &Value, kind: &str) -> bool {
 }
 
 fn retained_task_output(capability: &str, result: &Value) -> Value {
-    if capability != "ui.native-inspect" {
+    if capability != "ui.native-inspect"
+        || result.get("$machineFabricPayload").is_some()
+        || result.get("$taskPayloadRef").is_some()
+        || result.pointer("/inspection/processCount").is_some()
+    {
         return result.clone();
     }
     json!({
@@ -2891,6 +3042,7 @@ fn compact_task_outputs(tasks: &mut [Task]) -> bool {
     let mut changed = false;
     for task in tasks {
         if task.capability == "ui.native-inspect"
+            && task.output_ref.is_none()
             && let Some(output) = task.output.as_ref()
         {
             let compact = retained_task_output(&task.capability, output);
@@ -4432,6 +4584,286 @@ mod tests {
                 .input,
             original_input
         );
+    }
+
+    fn deployed_marker_fixture(store: &JsonStore, value: &Value) -> (Value, std::path::PathBuf) {
+        let bytes = serde_json::to_vec(value).unwrap();
+        let digest = sha256_bytes(&bytes)
+            .trim_start_matches("sha256:")
+            .to_owned();
+        let directory = store.path().with_file_name(format!(
+            "{}.payloads",
+            store.path().file_name().unwrap().to_string_lossy()
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join(format!("{digest}.json"));
+        fs::write(&path, &bytes).unwrap();
+        (
+            json!({"$machineFabricPayload":{"sha256":digest,"bytes":bytes.len()}}),
+            path,
+        )
+    }
+
+    #[test]
+    fn deployed_marker_migration_get_wait_reused_and_restart_are_complete() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = JsonStore::new(directory.path().join("controller.json"));
+        let seed = Controller::open(store.clone()).unwrap();
+        let original = json!({"data":"雪".repeat(9000),"bytes":27000});
+        let (marker, _) = deployed_marker_fixture(&store, &original);
+        let task = seed
+            .tasks
+            .lock()
+            .unwrap()
+            .submit(
+                "s",
+                "e",
+                "artifact.relay.archive.read",
+                marker.clone(),
+                "legacy",
+            )
+            .0;
+        seed.tasks
+            .lock()
+            .unwrap()
+            .transition(&task.id, TaskState::Running, None, None)
+            .unwrap();
+        seed.tasks
+            .lock()
+            .unwrap()
+            .transition(&task.id, TaskState::Succeeded, Some(marker), None)
+            .unwrap();
+        seed.persist().unwrap();
+        drop(seed);
+        let controller = Controller::open(store.clone()).unwrap();
+        for action in ["task.get", "task.wait"] {
+            let r = controller.handle(Request::new(
+                action,
+                json!({"taskId":task.id,"timeoutMs":0}),
+            ));
+            assert!(r.ok, "{:?}", r.error);
+            let v = r.result.unwrap();
+            assert_eq!(v["input"], original);
+            assert_eq!(v["output"], original);
+            assert!(v.get("Ok").is_none());
+        }
+        let reused=controller.handle(Request::new("task.submit",json!({"workspaceSessionId":"s","executorId":"e","capability":"artifact.relay.archive.read","input":original,"idempotencyKey":"legacy"})));
+        assert!(reused.ok, "{:?}", reused.error);
+        let reused = reused.result.unwrap();
+        assert_eq!(reused["reused"], true);
+        assert_eq!(reused["task"]["output"], original);
+        let state = store.load().unwrap();
+        let reference = state.tasks[0].output_ref.as_ref().unwrap();
+        let sidecar = directory.path().join(&reference.locator);
+        assert_eq!(state.tasks[0].state, TaskState::Succeeded);
+        let size = fs::metadata(store.path()).unwrap().len();
+        controller.persist().unwrap();
+        drop(controller);
+        let controller = Controller::open(store.clone()).unwrap();
+        controller.persist().unwrap();
+        assert_eq!(fs::metadata(store.path()).unwrap().len(), size);
+        fs::write(&sidecar, b"corrupt").unwrap();
+        for action in ["task.get", "task.wait"] {
+            let r = controller.handle(Request::new(
+                action,
+                json!({"taskId":task.id,"timeoutMs":0}),
+            ));
+            assert_eq!(r.error.unwrap().code, "TASK_PAYLOAD_UNAVAILABLE");
+        }
+    }
+
+    #[test]
+    fn deployed_marker_missing_corrupt_digest_paths_and_active_input_fail_closed() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = JsonStore::new(directory.path().join("controller.json"));
+        let original = json!({"data":"x".repeat(20000)});
+        let (marker, path) = deployed_marker_fixture(&store, &original);
+        let mut table = TaskTable::default();
+        table.submit("s", "e", "relay", marker.clone(), "k");
+        store
+            .save(&FabricState {
+                tasks: table.snapshot(),
+                ..Default::default()
+            })
+            .unwrap();
+        let pristine = fs::read(store.path()).unwrap();
+        let saved = fs::read(&path).unwrap();
+        fs::write(&path, vec![b'x'; saved.len()]).unwrap();
+        assert!(Controller::open(store.clone()).is_err());
+        assert_eq!(fs::read(store.path()).unwrap(), pristine);
+        fs::remove_file(&path).unwrap();
+        assert!(Controller::open(store.clone()).is_err());
+        assert_eq!(fs::read(store.path()).unwrap(), pristine);
+        fs::write(&path, &saved).unwrap();
+        let mut bad = marker.clone();
+        bad["$machineFabricPayload"]["sha256"] = json!("../escape");
+        assert!(deployed_payload(&store, &bad).is_err());
+        bad = marker.clone();
+        bad["$machineFabricPayload"]["bytes"] = json!(1);
+        assert!(deployed_payload(&store, &bad).is_err());
+        #[cfg(unix)]
+        {
+            fs::remove_file(&path).unwrap();
+            let target = directory.path().join("outside.json");
+            fs::write(&target, &saved).unwrap();
+            std::os::unix::fs::symlink(&target, &path).unwrap();
+            assert!(deployed_payload(&store, &marker).is_err());
+            fs::remove_file(&path).unwrap();
+            fs::write(&path, &saved).unwrap();
+        }
+        let mut tasks = table.snapshot();
+        migrate_deployed_task_payloads(&store, &mut tasks).unwrap();
+        assert_eq!(tasks[0].state, TaskState::Queued);
+        assert_eq!(tasks[0].input, original);
+        assert!(tasks[0].input_ref.is_none());
+    }
+
+    #[test]
+    fn native_compaction_keeps_existing_summary_and_payload_markers() {
+        let summary =
+            json!({"inspection":{"accessibilityTrusted":true,"processCount":1},"pids":[42]});
+        assert_eq!(retained_task_output("ui.native-inspect", &summary), summary);
+        let marker = json!({"$machineFabricPayload":{"sha256":"a".repeat(64),"bytes":3}});
+        assert_eq!(retained_task_output("ui.native-inspect", &marker), marker);
+    }
+
+    #[test]
+    fn deployed_failed_retry_and_capability_reused_invoke_actual_fake_executor() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = JsonStore::new(directory.path().join("controller.json"));
+        let socket = directory.path().join("executor.sock");
+        let server_socket = socket.clone();
+        let (sent, received) = mpsc::channel();
+        thread::spawn(move || {
+            RpcServer::new(server_socket)
+                .serve(move |request| {
+                    sent.send(request.params.clone()).unwrap();
+                    Response::success(request.request_id, json!({"path":"/fixture","content":"ok","size":2,"digest":"sha256:fixture"}))
+                })
+                .unwrap()
+        });
+        for _ in 0..100 {
+            if socket.exists() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        let seed = Controller::open_with_id(store.clone(), Some("c".to_owned())).unwrap();
+        let session=seed.handle(Request::new("session.put",json!({"apiVersion":"machine-fabric.dev/v1","metadata":{"id":"s","labels":{},"createdAt":1,"updatedAt":1},"objective":"fixture","state":"active"})));
+        assert!(session.ok, "{:?}", session.error);
+        seed.state.lock().unwrap().executors.push(Executor {
+            api_version: "machine-fabric.dev/v1".to_owned(),
+            metadata: Metadata {
+                id: "e".to_owned(),
+                labels: Default::default(),
+                created_at: 1,
+                updated_at: 1,
+            },
+            endpoint: ExecutorEndpoint::Local {
+                socket: socket.to_string_lossy().into_owned(),
+            },
+            capabilities: crate::capability_catalog(),
+            allowed_roots: vec![],
+            health: HealthStatus::Ready,
+        });
+        let input = json!({"path":format!("/fixture/{}","x".repeat(20000))});
+        let output = json!({"content":"原始数据".repeat(5000)});
+        let (input_marker, _) = deployed_marker_fixture(&store, &input);
+        let (output_marker, _) = deployed_marker_fixture(&store, &output);
+        let failed = seed
+            .tasks
+            .lock()
+            .unwrap()
+            .submit("s", "e", "filesystem.read", input_marker.clone(), "failed")
+            .0;
+        let done = seed
+            .tasks
+            .lock()
+            .unwrap()
+            .submit("s", "e", "filesystem.read", input_marker, "done")
+            .0;
+        for task in [&failed, &done] {
+            seed.tasks
+                .lock()
+                .unwrap()
+                .transition(&task.id, TaskState::Running, None, None)
+                .unwrap();
+        }
+        seed.tasks
+            .lock()
+            .unwrap()
+            .transition(&failed.id, TaskState::Failed, None, None)
+            .unwrap();
+        seed.tasks
+            .lock()
+            .unwrap()
+            .transition(&done.id, TaskState::Succeeded, Some(output_marker), None)
+            .unwrap();
+        seed.persist().unwrap();
+        drop(seed);
+        let controller = Controller::open(store.clone()).unwrap();
+        let invoke = |key: &str, input: Value| {
+            controller.handle(Request::new("capability.invoke",json!({"workspaceSessionId":"s","executorId":"e","capability":"filesystem.read","owner":"agent","idempotencyKey":key,"input":input})))
+        };
+        let reused = invoke("done", input.clone());
+        assert!(reused.ok, "{:?}", reused.error);
+        assert_eq!(reused.result.unwrap()["result"], output);
+        assert!(received.try_recv().is_err());
+        let mismatch = invoke("failed", json!({"path":"/other"}));
+        assert_eq!(mismatch.error.unwrap().code, "TASK_RETRY_INPUT_MISMATCH");
+        assert!(received.try_recv().is_err());
+        let original_ref = controller
+            .tasks
+            .lock()
+            .unwrap()
+            .get(&failed.id)
+            .unwrap()
+            .input_ref
+            .clone()
+            .unwrap();
+        let original_path = directory.path().join(original_ref.locator);
+        let original_bytes = fs::read(&original_path).unwrap();
+        fs::write(&original_path, b"corrupt input").unwrap();
+        let corrupt_retry = invoke("failed", input.clone());
+        assert_eq!(
+            corrupt_retry.error.unwrap().code,
+            "TASK_PAYLOAD_UNAVAILABLE"
+        );
+        assert_eq!(
+            controller
+                .tasks
+                .lock()
+                .unwrap()
+                .get(&failed.id)
+                .unwrap()
+                .state,
+            TaskState::Failed
+        );
+        assert!(received.try_recv().is_err());
+        fs::write(&original_path, original_bytes).unwrap();
+        let retried = invoke("failed", input.clone());
+        assert!(retried.ok, "{:?}", retried.error);
+        assert_eq!(
+            received.recv_timeout(Duration::from_secs(2)).unwrap(),
+            input
+        );
+        assert_eq!(retried.result.unwrap()["task"]["input"], input);
+        // Corruption prevents an otherwise allowed retry before dispatch/state transition.
+        let ref_path = controller
+            .tasks
+            .lock()
+            .unwrap()
+            .get(&done.id)
+            .unwrap()
+            .output_ref
+            .as_ref()
+            .unwrap()
+            .locator
+            .clone();
+        fs::write(directory.path().join(ref_path), b"bad").unwrap();
+        let failed_reuse = invoke("done", input);
+        assert_eq!(failed_reuse.error.unwrap().code, "TASK_PAYLOAD_UNAVAILABLE");
+        assert!(received.try_recv().is_err());
     }
 
     #[test]

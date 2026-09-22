@@ -173,6 +173,15 @@ impl TaskTable {
         Ok(task.clone())
     }
 
+    /// Restore validated persisted input before a failed task becomes executable again.
+    pub fn retry_with_input(&mut self, id: &str, input: Value) -> Result<Task, TaskError> {
+        self.retry(id)?;
+        let task = self.tasks.get_mut(id).ok_or(TaskError::NotFound)?;
+        task.input = input;
+        task.input_ref = None;
+        Ok(task.clone())
+    }
+
     pub fn snapshot(&self) -> Vec<Task> {
         self.tasks.values().cloned().collect()
     }

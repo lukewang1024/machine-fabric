@@ -104,10 +104,14 @@ impl JsonStore {
         }
         let temporary = temporary_path(&self.path);
         let result = (|| -> Result<(), StoreError> {
-            let mut file = fs::OpenOptions::new()
-                .create_new(true)
-                .write(true)
-                .open(&temporary)?;
+            let mut options = fs::OpenOptions::new();
+            options.create_new(true).write(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            let mut file = options.open(&temporary)?;
             let bytes = serde_json::to_vec_pretty(state)?;
             file.write_all(&bytes).map_err(|error| {
                 std::io::Error::new(
