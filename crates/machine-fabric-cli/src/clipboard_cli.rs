@@ -281,7 +281,7 @@ fn transfer(
             .executor_id
             .as_deref()
             .ok_or_else(|| anyhow!("EXECUTOR_UNAVAILABLE"))?,
-        json!({"content":image["content"],"semanticDigest":image["semanticDigest"],"maxBytes":DEFAULT_MAX_BYTES,"expiresAtMs":expires}),
+        json!({"executorId":target.executor_id,"content":image["content"],"semanticDigest":image["semanticDigest"],"maxBytes":DEFAULT_MAX_BYTES,"expiresAtMs":expires}),
     )?;
     if response["applied"] != true || response["semanticDigest"] != image["semanticDigest"] {
         bail!("CLIPBOARD_UNCONFIRMED: destination did not confirm the image write");
@@ -436,6 +436,7 @@ mod tests {
         );
         let result = transfer(&target(), image, |_, request| {
             assert!(request["expiresAtMs"].is_u64());
+            assert_eq!(request["executorId"], "arbitrary-executor-name");
             Ok(json!({"applied":true,"semanticDigest":"abc"}))
         })
         .unwrap();
