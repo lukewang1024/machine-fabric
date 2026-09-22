@@ -467,16 +467,19 @@ impl ExecutorRuntime {
             .lock()
             .map_err(|error| RpcError::new("DESKTOP_STATE_FAILED", error.to_string()))?
             .begin(action, &mut params)?;
+        let read_only_observe = action == "computer-use.call"
+            && params.get("tool").and_then(Value::as_str) == Some("observe_ui");
         let result = self.dispatch(action, params);
         let uncertain = match &result {
             Err(error) => {
                 let message = error.message.to_ascii_lowercase();
-                error.code == "COMPUTER_USE_UNAVAILABLE"
-                    || error.code.contains("TIMEOUT")
-                    || (error.code == "COMPUTER_USE_TOOL_FAILED"
-                        && (message.contains("timeout")
-                            || message.contains("timed out")
-                            || message.contains("abort")))
+                !read_only_observe
+                    && (error.code == "COMPUTER_USE_UNAVAILABLE"
+                        || error.code.contains("TIMEOUT")
+                        || (error.code == "COMPUTER_USE_TOOL_FAILED"
+                            && (message.contains("timeout")
+                                || message.contains("timed out")
+                                || message.contains("abort"))))
             }
             Ok(value) => {
                 action == "computer-use.call" && has_structured_computer_use_unknown(value)
@@ -3927,7 +3930,13 @@ mod tests {
     fn host_tool_result_unknown_blocks_executor_desktop_before_next_dispatch() {
         use std::os::unix::fs::PermissionsExt;
 
-        for mode in ["transport", "partial_hid"] {
+        for mode in [
+            "transport",
+            "partial_hid",
+            "capture_read_error",
+            "capture_read_result",
+            "effect_unverified",
+        ] {
             let directory = tempfile::tempdir().unwrap();
             let root = directory.path();
             let runtime_root = root.join("runtime");
@@ -3972,7 +3981,17 @@ while True:
         calls.write(request.get('method', '') + '\n')
     # OMW host.mjs returns a resolved tool result verbatim under result in an
     # ok:true JSON-lines response, even when details say unknown.
-    if mode == 'partial_hid':
+    if mode == 'capture_read_error' and request.get('method') == 'observe_ui':
+        stream.write((json.dumps({'id': request['id'], 'ok': False,
+            'error': {'code': 'COMPUTER_USE_TOOL_FAILED', 'message': 'Capture timed out'}}) + '\n').encode())
+        continue
+    if mode in ('capture_read_result', 'capture_read_error'):
+        result = {'details': {'tool': 'observe_ui', 'observation': {'status': 'semantic_only',
+            'readOnly': True, 'nativeCompletion': 'unconfirmed', 'imageError': 'Capture timed out'}}}
+    elif mode == 'effect_unverified':
+        result = {'details': {'tool': 'act_ui', 'execution': {'outcome': 'unknown',
+            'dispatchCompletion': 'returned', 'effectVerification': 'unverified'}}}
+    elif mode == 'partial_hid':
         result = {'content': [{'type': 'text', 'text': 'partial HID input; do not retry'}],
             'details': {'tool': 'act_ui', 'status': 'dispatch_outcome_unknown',
                 'execution': {'inputDispatch': {'outcome': 'unknown', 'kind': 'partial_hid',
@@ -4024,13 +4043,33 @@ sock.close()
             let call_params = || {
                 json!({
                     "sessionId": "discovery",
-                    "tool": "act_ui",
+                    "tool": if mode.starts_with("capture_read") { "observe_ui" } else { "act_ui" },
                     "arguments": {"stateId": "cu-state", "actions": [{"action": "click", "ref": "@e1"}]},
                     "_desktop": {"owner": "fake-host-test", "token": job["token"]}
                 })
             };
 
             let first = runtime.handle(Request::new("computer-use.call", call_params()));
+            if mode.starts_with("capture_read") || mode == "effect_unverified" {
+                assert_eq!(first.ok, mode != "capture_read_error", "{first:?}");
+                let desktop = runtime.handle(Request::new("desktop.list", json!({})));
+                assert_eq!(desktop.result.unwrap()["blocked"], false);
+                let mut next_input = call_params();
+                next_input["tool"] = json!("act_ui");
+                let second = runtime.handle(Request::new("computer-use.call", next_input));
+                assert!(second.ok, "{second:?}");
+                assert_ne!(
+                    second.error.as_ref().map(|e| e.code.as_str()),
+                    Some("DESKTOP_RECOVERY_REQUIRED")
+                );
+                let calls = fs::read_to_string(&calls_path).unwrap();
+                assert_eq!(
+                    calls.lines().count(),
+                    2,
+                    "second request reaches actual fake host"
+                );
+                continue;
+            }
             assert!(
                 first.ok,
                 "the CU bridge result is a normal successful tool result: {first:?}; fake host log: {}",
