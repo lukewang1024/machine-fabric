@@ -105,7 +105,7 @@ class Installer:
                 raise RuntimeError('graceful stop deadline: ' + label)
             time.sleep(.1)
 
-    def rpc(self, endpoint, action, params=None):
+    def rpc(self, endpoint, action, params=None, max_bytes=2 * 1024 * 1024):
         with socket.socket(socket.AF_UNIX) as connection:
             connection.settimeout(1)
             connection.connect(str(endpoint))
@@ -113,8 +113,8 @@ class Installer:
                        'action': action, 'params': params or {}}
             connection.sendall(json.dumps(request).encode() + b'\n')
             with connection.makefile('rb') as stream:
-                raw = stream.readline(2 * 1024 * 1024 + 1)
-            if len(raw) > 2 * 1024 * 1024:
+                raw = stream.readline(max_bytes + 1)
+            if len(raw) > max_bytes:
                 raise RuntimeError('installer RPC response exceeds bound')
             value = json.loads(raw)
             if not value.get('ok'):
@@ -313,6 +313,97 @@ class Installer:
                     raise RuntimeError('previous process has not exited: ' + label)
                 self.launch('bootstrap', self.domain, path)
 
+    def rollback_payload_probe(self):
+        """Test the actual old binary on an isolated CURRENT state copy.
+
+        Controller serve has no automatic remote dispatch; the private socket is
+        never registered. Only status/task.get requests are sent. No live state,
+        lease/fence or sidecar is changed by this compatibility probe.
+        """
+        index = self.state / 'controller.json'
+        if not index.exists(): return
+        document = json.loads(index.read_bytes())
+        checks = []
+        seen = set()
+        for task in document.get('tasks', []):
+            for field in ('input', 'output'):
+                ref = task.get(field + 'Ref')
+                marker = (task.get(field) or {})
+                if ref:
+                    digest_value = ref.get('digest', '')
+                    if not re.fullmatch(r'sha256:[0-9a-f]{64}', digest_value):
+                        raise RuntimeError('rollback probe invalid reference digest')
+                    digest_hex = digest_value[7:]
+                    locator = ref.get('locator')
+                    if locator not in ('task-payloads/' + digest_hex + '.json',
+                                       'task-payloads/' + digest_value + '.json'):
+                        raise RuntimeError('rollback probe invalid reference locator')
+                    size = ref.get('bytes')
+                elif isinstance(marker, dict) and '$machineFabricPayload' in marker:
+                    ref = marker['$machineFabricPayload']
+                    digest_hex = ref.get('sha256', '')
+                    if not re.fullmatch(r'[0-9a-f]{64}', digest_hex):
+                        raise RuntimeError('rollback probe invalid legacy digest')
+                    locator = 'controller.json.payloads/' + digest_hex + '.json'
+                    size = ref.get('bytes')
+                else: continue
+                if locator in seen: continue
+                seen.add(locator)
+                payload = self.state / locator
+                if payload.is_symlink() or payload.parent.is_symlink():
+                    raise RuntimeError('rollback probe payload symlink refused')
+                if payload.stat().st_size != size or digest(payload) != digest_hex:
+                    raise RuntimeError('rollback probe payload integrity failed')
+                checks.append((task['id'], field, locator, size))
+        if not checks: return
+        probe = self.backup / 'current-state-probe'
+        probe.mkdir(mode=0o700)
+        shutil.copy2(index, probe / 'controller.json')
+        for name in ('controller.json.payloads', 'task-payloads'):
+            source = self.state / name
+            if source.exists(): shutil.copytree(source, probe / name)
+        for p in probe.rglob('*'):
+            p.chmod(0o700 if p.is_dir() else 0o600)
+        log_path = self.backup / 'payload-probe.log'
+        # A short private path respects macOS sockaddr_un's path limit.
+        with tempfile.TemporaryDirectory(prefix='mf-probe-') as socket_dir, log_path.open('wb') as log:
+            endpoint = Path(socket_dir) / 'c.sock'
+            process = subprocess.Popen([str(self.controller), '--socket', str(endpoint), 'controller',
+                                        'serve', '--state', str(probe / 'controller.json'), '--id', self.node],
+                                       stdout=log, stderr=log)
+            try:
+                deadline = time.monotonic() + self.timeout
+                while True:
+                    if process.poll() is not None:
+                        raise RuntimeError('old binary payload probe exited before RPC readiness')
+                    try:
+                        status = self.rpc(endpoint, 'status')
+                        if status.get('controller', {}).get('id') != self.node:
+                            raise RuntimeError('old binary payload probe identity mismatch')
+                        break
+                    except (OSError, ValueError):
+                        if time.monotonic() >= deadline: raise RuntimeError('old binary payload probe readiness deadline')
+                        time.sleep(.1)
+                for task_id, field, locator, size in checks:
+                    # Full refs, not only status or one happy-path format. Bound
+                    # each response independently; unusually large records fail closed.
+                    limit = min(128 * 1024 * 1024, 6 * sum(
+                        (t.get(k + 'Ref') or {}).get('bytes', 0) for t in document['tasks']
+                        if t['id'] == task_id for k in ('input', 'output')) + 2 * size + 2 * 1024 * 1024)
+                    task = self.rpc(endpoint, 'task.get', {'taskId': task_id}, max_bytes=limit)
+                    expected = json.loads((probe / locator).read_bytes())
+                    if task.get(field) != expected:
+                        raise RuntimeError('old binary returned unresolved/different payload for ' + task_id)
+                (self.backup / 'payload-probe.json').write_text(json.dumps(
+                    {'ok': True, 'referencesChecked': len(checks), 'binarySha256': digest(self.controller)}))
+            finally:
+                if process.poll() is None:
+                    process.terminate()
+                    try: process.wait(timeout=self.timeout)
+                    except subprocess.TimeoutExpired:
+                        raise RuntimeError('isolated payload probe did not exit; PID=' + str(process.pid))
+        shutil.rmtree(probe)
+
     def transaction(self, staged):
         was_loaded = [label for label in LABELS if self.job(label) is not None]
         self.quiescent()
@@ -340,6 +431,7 @@ class Installer:
                     self.stop(LABELS[1], self.agent)
                     self.stop(LABELS[0], self.controller)
                     self.restore(records)
+                    self.rollback_payload_probe()
                 # Partial stop failure: never replace live files; start only missing old jobs.
                 if stopping:
                     self.start([label for label in was_loaded if self.job(label) is None])

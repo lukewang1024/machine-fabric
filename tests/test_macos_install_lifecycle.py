@@ -11,6 +11,8 @@ import threading
 import tarfile
 import shutil
 import time
+import hashlib
+import sys
 import unittest
 from unittest.mock import patch
 
@@ -94,7 +96,9 @@ class Fake(m.Installer):
     def terminate(self, pid):
         if not self.stubborn: self.live.discard(pid)
 
-    def rpc(self, endpoint, action, params=None):
+    def rpc(self, endpoint, action, params=None, max_bytes=2 * 1024 * 1024):
+        if endpoint not in self.sockets:
+            return m.Installer.rpc(self, endpoint, action, params, max_bytes=max_bytes)
         if action == 'executor.register': return {'ok': True}
         if self.controller.read_text() == 'new':
             if self.new_state:
@@ -259,6 +263,44 @@ class LifecycleTests(unittest.TestCase):
         self.assertEqual(result.returncode, 2)
         self.assertIn('Python 3 is required before', result.stderr)
         self.assertEqual(len(self.x.jobs), 2)
+
+    def test_rollback_status_ready_but_portable_payload_rejected_never_admits_old_service(self):
+        # Executed private old-binary fixture: status is ready but lazy task.get fails.
+        stub = "#!" + sys.executable + "\n" + """
+import json,socket,sys
+endpoint=sys.argv[sys.argv.index('--socket')+1]
+server=socket.socket(socket.AF_UNIX);server.bind(endpoint);server.listen(4)
+while True:
+ c,_=server.accept()
+ with c:
+  q=json.loads(c.makefile('rb').readline());print(q['action'],flush=True)
+  if q['action']=='status': v={'ok':True,'result':{'controller':{'id':'test','status':'ready'}}}
+  else: v={'ok':False,'error':{'code':'TASK_PAYLOAD_UNAVAILABLE','message':'old locator contract'}}
+  c.sendall(json.dumps(v).encode()+b'\\n')
+"""
+        self.x.controller.write_text(stub); self.x.controller.chmod(0o755)
+        self.x.timeout = .5
+        # Candidate writes a valid new ref, then fails its live readiness.
+        original = self.x.rpc
+        raw = b'{"new":"payload"}'
+        sha = hashlib.sha256(raw).hexdigest()
+        locator = 'task-payloads/' + sha + '.json'
+        def rpc(endpoint, action, params=None, **kwargs):
+            if endpoint in self.x.sockets and self.x.controller.read_text() == 'new':
+                (self.x.state / locator).write_bytes(raw)
+                (self.x.state / 'controller.json').write_text(json.dumps({'tasks': [
+                    {'id':'new-task','state':'succeeded','output':{'$taskPayloadRef':'sha256:'+sha},
+                     'outputRef':{'digest':'sha256:'+sha,'bytes':len(raw),'locator':locator}}], 'leases':[]}))
+                raise OSError('candidate readiness failure')
+            return original(endpoint, action, params, **kwargs)
+        self.x.rpc = rpc
+        with self.assertRaisesRegex(RuntimeError, 'recovery failed against CURRENT state'):
+            self.x.install()
+        self.assertEqual(self.x.jobs, {})
+        self.assertTrue((self.x.backup / 'current-state-probe/controller.json').exists())
+        self.assertEqual((self.x.state / locator).read_bytes(), raw)
+        self.assertFalse((self.x.backup / 'payload-probe.json').exists())
+        self.assertIn('task.get', (self.x.backup / 'payload-probe.log').read_text())
 
     def test_real_rpc_rejects_stale_file_and_reads_actual_response(self):
         endpoint = self.x.state / 'test.sock'
