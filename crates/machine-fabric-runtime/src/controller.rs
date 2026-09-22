@@ -2956,7 +2956,7 @@ fn optional_array<T: serde::de::DeserializeOwned>(
         .map(Option::unwrap_or_default)
 }
 
-fn validate_schema(schema: &Value, value: &Value, path: &str) -> Result<(), RpcError> {
+pub(crate) fn validate_schema(schema: &Value, value: &Value, path: &str) -> Result<(), RpcError> {
     if schema.as_object().is_none_or(|object| object.is_empty()) {
         return Ok(());
     }
