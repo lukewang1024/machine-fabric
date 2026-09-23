@@ -3,9 +3,14 @@ set -eu
 
 version=${1:?exact version is required; private releases do not use a mutable latest channel}
 shift
-case $(uname -s):$(uname -m) in
-  Linux:x86_64) target=x86_64-unknown-linux-musl ;;
-  Darwin:arm64) target=aarch64-apple-darwin ;;
+termux_marker=${TERMUX_VERSION:-}
+if [ "${PREFIX:-}" = /data/data/com.termux/files/usr ]; then
+  termux_marker=termux
+fi
+case "$termux_marker:$(uname -s):$(uname -m)" in
+  ?*:Linux:aarch64|?*:Linux:arm64) target=aarch64-linux-android ;;
+  :Linux:x86_64) target=x86_64-unknown-linux-musl ;;
+  :Darwin:arm64) target=aarch64-apple-darwin ;;
   *) echo "install-from-release: unsupported platform: $(uname -s) $(uname -m)" >&2; exit 2 ;;
 esac
 
@@ -47,5 +52,9 @@ case $target in
     ;;
   *-apple-darwin)
     (cd "$root" && scripts/install-macos-app.sh bin/machine-fabric-macos-agent)
+    ;;
+  *-linux-android)
+    executor_id=${MACHINE_FABRIC_EXECUTOR_ID:-$(hostname -s)-termux}
+    (cd "$root" && scripts/install-termux-user.sh "$root/bin/machine-fabric" "$executor_id" "$@")
     ;;
 esac

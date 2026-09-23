@@ -47,8 +47,9 @@ checks on Windows. All three are ordinary peers; the manifest does not assign
 product workflows or Agent skills to a particular machine.
 
 The runtime uses native platform services in production: launchd on macOS,
-systemd user services on Linux, and Windows Services on Windows. SSH aliases
-and keys remain user-managed through the normal SSH configuration.
+systemd user services on Linux, Windows Services on Windows, and
+`termux-services` on Android aarch64. SSH aliases and keys remain user-managed
+through the normal SSH configuration.
 
 ## Image clipboard transfer
 
@@ -115,6 +116,22 @@ the archive against the release's `SHA256SUMS` before extraction.
 ```sh
 MACHINE_FABRIC_RELEASE_BASE_URL=https://<internal-cdn-root> \
   scripts/install-from-release.sh 0.1.12
+```
+
+Termux on Android aarch64 uses the `aarch64-linux-android` release archive and
+requires `termux-services` before installation:
+
+```sh
+pkg install termux-services openssh
+MACHINE_FABRIC_RELEASE_BASE_URL=https://<internal-cdn-root> \
+  scripts/install-from-release.sh 0.1.12
+```
+
+After the local Controller and Executor are ready, connect the phone to a
+configured SSH peer with:
+
+```sh
+scripts/connect-termux-peer.sh cndevbox
 ```
 
 The package is also published to its private GitHub repository for source and
