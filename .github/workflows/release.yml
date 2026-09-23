@@ -44,6 +44,9 @@ jobs:
         include:
           - runner: ubuntu-latest
             target: x86_64-unknown-linux-musl
+          - runner: ubuntu-latest
+            target: aarch64-linux-android
+            android_linker: aarch64-linux-android24-clang
           - runner: macos-14
             target: aarch64-apple-darwin
           - runner: windows-latest
@@ -58,6 +61,18 @@ jobs:
       - uses: Swatinem/rust-cache@v2.9.2
         with:
           key: ${{ matrix.target }}
+      - name: Configure Android linker
+        if: endsWith(matrix.target, '-linux-android')
+        shell: bash
+        run: |
+          toolchain="$ANDROID_NDK_LATEST_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          linker="$toolchain/${{ matrix.android_linker }}"
+          test -x "$linker"
+          cargo_key=$(printf '%s' '${{ matrix.target }}' | tr '[:lower:]-' '[:upper:]_')
+          cc_key=$(printf '%s' '${{ matrix.target }}' | tr '-' '_')
+          echo "CARGO_TARGET_${cargo_key}_LINKER=$linker" >> "$GITHUB_ENV"
+          echo "CC_${cc_key}=$linker" >> "$GITHUB_ENV"
+          echo "AR_${cc_key}=$toolchain/llvm-ar" >> "$GITHUB_ENV"
       - name: Resolve version
         id: version
         shell: bash
@@ -72,7 +87,13 @@ jobs:
             exit 2
           }
       - name: Build release binaries
-        run: cargo build --release --locked --target '${{ matrix.target }}' --bins
+        shell: bash
+        run: |
+          if [[ '${{ matrix.target }}' == *-linux-android ]]; then
+            cargo build --release --locked --target '${{ matrix.target }}' --bin machine-fabric
+          else
+            cargo build --release --locked --target '${{ matrix.target }}' --bins
+          fi
       - name: Package release archive
         shell: bash
         run: >-
@@ -109,7 +130,7 @@ jobs:
         run: |
           version=${TAG#v}
           : > SHA256SUMS
-          for suffix in aarch64-apple-darwin.tar.gz x86_64-unknown-linux-musl.tar.gz x86_64-pc-windows-msvc.zip; do
+          for suffix in aarch64-apple-darwin.tar.gz aarch64-linux-android.tar.gz x86_64-unknown-linux-musl.tar.gz x86_64-pc-windows-msvc.zip; do
             archive=machine-fabric-$version-$suffix
             test -s "$archive"
             test -s "$archive.sha256"
