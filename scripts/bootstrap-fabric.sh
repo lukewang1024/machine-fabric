@@ -247,7 +247,7 @@ install_linux_release() {
   remote_archive=/tmp/$archive.$$
   scp -q "$release_cache/$archive" "$install_host:$remote_archive"
   ssh -o BatchMode=yes -o ClearAllForwardings=yes "$install_host" \
-    "set -eu; temporary=\$(mktemp -d /tmp/machine-fabric-install.XXXXXX); trap 'rm -rf \"\$temporary\" \"$remote_archive\"' EXIT HUP INT TERM; tar -C \"\$temporary\" -xzf \"$remote_archive\"; root=\"\$temporary/machine-fabric-$version-$target\"; cd \"\$root\"; MACHINE_FABRIC_CONTROLLER_ID='$install_node_id' scripts/install-linux-user.sh bin/machine-fabric '$install_executor_id' \"\$HOME/Code\" \"\$HOME/Workspace\" \"\${XDG_STATE_HOME:-\$HOME/.local/state}\"" \
+    "set -eu; temporary=\$(mktemp -d /tmp/machine-fabric-install.XXXXXX); trap 'rm -rf \"\$temporary\" \"$remote_archive\"' EXIT HUP INT TERM; tar -C \"\$temporary\" -xzf \"$remote_archive\"; root=\"\$temporary/machine-fabric-$version-$target\"; cd \"\$root\"; MACHINE_FABRIC_CONTROLLER_ID='$install_node_id' scripts/install-linux-user.sh bin/machine-fabric '$install_executor_id'" \
     >/dev/null
 }
 

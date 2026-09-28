@@ -28,6 +28,7 @@ jobs:
         run: |
           sh -n scripts/*.sh
           python3 -m unittest discover -s tests -p 'test_macos*.py'
+          python3 -m unittest discover -s tests -p 'test_linux*.py'
       - if: runner.os == 'Windows'
         shell: pwsh
         run: |
