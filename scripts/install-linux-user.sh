@@ -60,6 +60,7 @@ mv "$temporary" "$installed_binary"
 
 allow_args=
 if [ "$#" -eq 0 ]; then
+  mkdir -p "$HOME/Code" "$HOME/Workspace"
   set -- "$HOME/Code" "$HOME/Workspace" "$state_home"
 fi
 for root in "$@"; do
@@ -67,6 +68,10 @@ for root in "$@"; do
     /*) ;;
     *) echo "install-linux-user: allow-root must be absolute: $root" >&2; exit 2 ;;
   esac
+  if [ ! -d "$root" ]; then
+    echo "install-linux-user: allow-root does not exist: $root" >&2
+    exit 2
+  fi
   allow_args="$allow_args --allow-root $root"
 done
 
