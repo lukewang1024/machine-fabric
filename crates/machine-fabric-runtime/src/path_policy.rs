@@ -1,6 +1,6 @@
 use machine_fabric_protocol::RpcError;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum PathAccess {
@@ -186,6 +186,15 @@ pub(crate) fn resolve_path(path: &Path) -> Result<PathBuf, RpcError> {
     if !path.is_absolute() {
         return Err(RpcError::new("PATH_INVALID", "path must be absolute"));
     }
+    if path
+        .components()
+        .any(|component| component == Component::ParentDir)
+    {
+        return Err(RpcError::new(
+            "PATH_INVALID",
+            "path contains parent traversal",
+        ));
+    }
     if path.exists() {
         return path.canonicalize().map_err(|error| {
             RpcError::new("PATH_INVALID", format!("{}: {error}", path.display()))
@@ -247,8 +256,8 @@ mod tests {
     #[test]
     fn desktop_reads_are_open_except_credentials_and_writes_are_allowlisted() {
         let temp = tempfile::tempdir().unwrap();
-        let home = temp.path();
-        let policy = DesktopPathPolicy::new(home).unwrap();
+        let home = temp.path().canonicalize().unwrap();
+        let policy = DesktopPathPolicy::new(&home).unwrap();
         assert!(
             policy
                 .check(&home.join("Other/readme.txt"), PathAccess::Read)
