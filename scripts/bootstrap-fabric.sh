@@ -604,8 +604,16 @@ for host in "$@"; do
         scp -q "$policy_file" "$host:bootstrap-machine-fabric-allow-roots.txt"
         windows_policy_args="-AllowRootFile 'bootstrap-machine-fabric-allow-roots.txt'"
       fi
+      if [ -n "${MACHINE_FABRIC_WINDOWS_POLICY_USERS_DIR:-}" ]; then
+        user_file=$MACHINE_FABRIC_WINDOWS_POLICY_USERS_DIR/$host.txt
+        if [ -f "$user_file" ]; then
+          test -s "$user_file" || { printf 'empty desktop policy user: %s\n' "$host" >&2; exit 2; }
+          scp -q "$user_file" "$host:bootstrap-machine-fabric-policy-user.txt"
+          windows_policy_args="$windows_policy_args -PolicyUserFile 'bootstrap-machine-fabric-policy-user.txt'"
+        fi
+      fi
       ssh -o BatchMode=yes -o ClearAllForwardings=yes "$host" \
-        "powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command \"\$env:MACHINE_FABRIC_RELEASE_BASE_URL='$release_base_url'; & './install-machine-fabric.ps1' -Version '$version' -NodeId '$host' $windows_policy_args; Remove-Item './install-machine-fabric.ps1'; Remove-Item 'bootstrap-machine-fabric-allow-roots.txt' -ErrorAction SilentlyContinue\"" \
+        "powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command \"\$env:MACHINE_FABRIC_RELEASE_BASE_URL='$release_base_url'; & './install-machine-fabric.ps1' -Version '$version' -NodeId '$host' $windows_policy_args; Remove-Item './install-machine-fabric.ps1'; Remove-Item 'bootstrap-machine-fabric-allow-roots.txt' -ErrorAction SilentlyContinue; Remove-Item 'bootstrap-machine-fabric-policy-user.txt' -ErrorAction SilentlyContinue\"" \
         >/dev/null
       resume_paused_peer_connection local "$local_id" "$host"
     else

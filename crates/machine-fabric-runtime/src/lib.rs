@@ -11,6 +11,7 @@ mod executor;
 mod generation;
 #[cfg(target_os = "macos")]
 mod macos;
+mod path_policy;
 mod peer;
 mod process;
 mod rpc;

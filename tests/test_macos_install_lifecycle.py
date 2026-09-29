@@ -122,6 +122,9 @@ class LifecycleTests(unittest.TestCase):
         self.x.install()
         boot = [a for a in self.x.calls if a[:2] == ['/bin/launchctl', 'bootstrap']]
         self.assertEqual(len(boot), 2)
+        executor_argv = plistlib.loads(self.x.plists[1].read_bytes())['ProgramArguments']
+        self.assertEqual(executor_argv[executor_argv.index('--path-policy') + 1], 'desktop')
+        self.assertEqual(executor_argv[executor_argv.index('--policy-home') + 1], str(self.x.home))
         self.assertFalse(any('kickstart' in a for a in self.x.calls))
         self.assertEqual(self.x.controller.read_text(), 'new')
         for name in ('controller.json.payloads', 'task-payloads'):

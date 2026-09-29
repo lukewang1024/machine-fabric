@@ -2,7 +2,10 @@ param(
   [Parameter(Mandatory = $true)][string]$Version,
   [string]$NodeId = $env:COMPUTERNAME,
   [string]$AllowRootFile,
-  [string[]]$AllowRoot = @("C:\Users", "C:\ProgramData\machine-fabric")
+  [string[]]$AllowRoot = @("C:\Users", "C:\ProgramData\machine-fabric"),
+  [string]$PolicyUserFile,
+  [string]$PolicyUser,
+  [string]$PolicyHome = $env:USERPROFILE
 )
 
 $ErrorActionPreference = "Stop"
@@ -13,6 +16,12 @@ if ($AllowRootFile) {
     if ($root -notmatch '^(?:[A-Za-z]:[\\/]|\\\\[^\\]+\\[^\\]+(?:[\\/]|$))') {
       throw "allow-root must be absolute: $root"
     }
+  }
+}
+if ($PolicyUserFile) {
+  $PolicyUser = (Get-Content -Raw -LiteralPath $PolicyUserFile -Encoding UTF8).Trim()
+  if (-not $PolicyUser -or $PolicyUser -match '[\r\n]') {
+    throw "desktop policy user file must contain one account name"
   }
 }
 
@@ -39,7 +48,7 @@ try {
   if ($actual -ne $expected) { throw "checksum mismatch" }
   Expand-Archive -Path (Join-Path $temporary $archive) -DestinationPath $temporary
   $root = Join-Path $temporary "machine-fabric-$Version-$target"
-  & (Join-Path $root "scripts\install-windows.ps1") -Binary (Join-Path $root "bin\machine-fabric.exe") -NodeId $NodeId -AllowRoot $AllowRoot
+  & (Join-Path $root "scripts\install-windows.ps1") -Binary (Join-Path $root "bin\machine-fabric.exe") -NodeId $NodeId -AllowRoot $AllowRoot -PolicyUser $PolicyUser -PolicyHome $PolicyHome
 } finally {
   Remove-Item -Recurse -Force $temporary -ErrorAction SilentlyContinue
 }

@@ -1,10 +1,29 @@
 param(
   [Parameter(Mandatory = $true)][string]$Binary,
   [string]$NodeId = $env:COMPUTERNAME,
-  [string[]]$AllowRoot = @("C:\Users", "C:\ProgramData\machine-fabric")
+  [string[]]$AllowRoot = @("C:\Users", "C:\ProgramData\machine-fabric"),
+  [string]$PolicyUser,
+  [string]$PolicyHome = $env:USERPROFILE
 )
 
 $ErrorActionPreference = "Stop"
+if ($PolicyUser) {
+  try {
+    $account = New-Object System.Security.Principal.NTAccount($PolicyUser)
+    $sid = $account.Translate([System.Security.Principal.SecurityIdentifier]).Value
+  } catch {
+    throw "desktop policy user could not be resolved: $PolicyUser"
+  }
+  $profile = Get-CimInstance -ClassName Win32_UserProfile -Filter "SID = '$sid'"
+  if (-not $profile -or -not $profile.LocalPath) {
+    throw "desktop policy user has no local profile: $PolicyUser"
+  }
+  $PolicyHome = $profile.LocalPath
+}
+if (-not $PolicyHome -or $PolicyHome -notmatch '^(?:[A-Za-z]:[\\/]|\\\\[^\\]+\\[^\\]+(?:[\\/]|$))' -or
+    -not (Test-Path -LiteralPath $PolicyHome -PathType Container)) {
+  throw "desktop policy home must be an existing absolute directory: $PolicyHome"
+}
 $installRoot = Join-Path $env:ProgramFiles "machine-fabric"
 $stateRoot = Join-Path $env:ProgramData "machine-fabric"
 $installedBinary = Join-Path $installRoot "machine-fabric.exe"
@@ -90,6 +109,7 @@ $executorParts = @(
   "--socket", (Quote-Arg $executorSocket)
   "executor", "serve", "--id", (Quote-Arg ($NodeId + "-native"))
   "--state", (Quote-Arg $executorState)
+  "--path-policy", "desktop", "--policy-home", (Quote-Arg $PolicyHome)
 )
 foreach ($root in $AllowRoot) {
   # IsPathFullyQualified is unavailable in Windows PowerShell 5.1's .NET Framework.
