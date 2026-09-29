@@ -213,6 +213,7 @@ class Installer:
                      [str(self.agent), '--socket', str(self.sockets[1]), 'executor', 'serve', '--id', self.node + '-rust']]
         for root in roots:
             arguments[1] += ['--allow-root', root]
+        arguments[1] += ['--path-policy', 'desktop', '--policy-home', str(self.home)]
         for i, label in enumerate(LABELS):
             document = {'Label': label, 'ProgramArguments': arguments[i], 'RunAtLoad': True, 'KeepAlive': True,
                         'ProcessType': 'Background' if i == 0 else 'Interactive',

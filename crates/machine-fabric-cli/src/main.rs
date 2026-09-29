@@ -137,6 +137,10 @@ enum ExecutorCommand {
         id: String,
         #[arg(long = "allow-root", required = true)]
         allow_roots: Vec<PathBuf>,
+        #[arg(long = "path-policy", default_value = "legacy", value_parser = ["legacy", "desktop"])]
+        path_policy: String,
+        #[arg(long = "policy-home")]
+        policy_home: Option<PathBuf>,
         #[arg(long)]
         state: Option<PathBuf>,
     },
@@ -370,15 +374,29 @@ fn run_cli() -> Result<()> {
                 ExecutorCommand::Serve {
                     id,
                     allow_roots,
+                    path_policy,
+                    policy_home,
                     state,
                 },
         } => {
+            let state = state.unwrap_or_else(default_executor_state);
             let executor = Arc::new(
-                ExecutorRuntime::open(
-                    id,
-                    allow_roots,
-                    state.unwrap_or_else(default_executor_state),
-                )
+                if path_policy == "desktop" {
+                    anyhow::ensure!(
+                        cfg!(any(target_os = "macos", windows)),
+                        "desktop path policy is supported only on macOS and Windows"
+                    );
+                    let home = policy_home.ok_or_else(|| {
+                        anyhow::anyhow!("--policy-home is required for desktop path policy")
+                    })?;
+                    ExecutorRuntime::open_with_desktop_policy(id, allow_roots, state, &home)
+                } else {
+                    anyhow::ensure!(
+                        policy_home.is_none(),
+                        "--policy-home requires desktop path policy"
+                    );
+                    ExecutorRuntime::open(id, allow_roots, state)
+                }
                 .map_err(|error| anyhow::anyhow!("{}: {}", error.code, error.message))?,
             );
             let handler = Arc::clone(&executor);

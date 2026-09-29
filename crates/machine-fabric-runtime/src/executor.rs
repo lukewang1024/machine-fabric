@@ -17,12 +17,14 @@ use std::time::{Duration, Instant};
 
 use crate::datapack::{DataPackResourceTree, pack_chromium_datapack};
 use crate::generation::{Overlay, activate, apply_overlays, materialize, record_state};
+use crate::path_policy::{DesktopPathPolicy, PathAccess, resolve_path};
 use crate::process::ProcessTable;
 use crate::telemetry::{event_fields, request_event};
 
 pub struct ExecutorRuntime {
     id: String,
     allowed_roots: Vec<PathBuf>,
+    desktop_policy: Option<DesktopPathPolicy>,
     processes: ProcessTable,
     fences: Option<Mutex<ExecutorFences>>,
     execution: ExecutionCapacity,
@@ -263,7 +265,11 @@ struct FenceRecord {
 }
 
 impl ExecutorRuntime {
-    fn base(id: impl Into<String>, allowed_roots: Vec<PathBuf>) -> Result<Self, RpcError> {
+    fn base(
+        id: impl Into<String>,
+        allowed_roots: Vec<PathBuf>,
+        policy_home: Option<&Path>,
+    ) -> Result<Self, RpcError> {
         let mut roots = Vec::with_capacity(allowed_roots.len());
         for root in allowed_roots {
             roots.push(root.canonicalize().map_err(|error| {
@@ -278,6 +284,7 @@ impl ExecutorRuntime {
         Ok(Self {
             id: id.into(),
             allowed_roots: roots,
+            desktop_policy: policy_home.map(DesktopPathPolicy::new).transpose()?,
             processes: ProcessTable::default(),
             fences: None,
             execution: ExecutionCapacity::from_environment(),
@@ -295,7 +302,7 @@ impl ExecutorRuntime {
         id: impl Into<String>,
         allowed_roots: Vec<PathBuf>,
     ) -> Result<Self, RpcError> {
-        Self::base(id, allowed_roots)
+        Self::base(id, allowed_roots, None)
     }
 
     pub fn open(
@@ -303,7 +310,25 @@ impl ExecutorRuntime {
         allowed_roots: Vec<PathBuf>,
         state_path: PathBuf,
     ) -> Result<Self, RpcError> {
-        let mut runtime = Self::base(id, allowed_roots)?;
+        Self::open_with_policy(id, allowed_roots, state_path, None)
+    }
+
+    pub fn open_with_desktop_policy(
+        id: impl Into<String>,
+        allowed_roots: Vec<PathBuf>,
+        state_path: PathBuf,
+        home: &Path,
+    ) -> Result<Self, RpcError> {
+        Self::open_with_policy(id, allowed_roots, state_path, Some(home))
+    }
+
+    fn open_with_policy(
+        id: impl Into<String>,
+        allowed_roots: Vec<PathBuf>,
+        state_path: PathBuf,
+        policy_home: Option<&Path>,
+    ) -> Result<Self, RpcError> {
+        let mut runtime = Self::base(id, allowed_roots, policy_home)?;
         let mut fences: ExecutorFences = if state_path.exists() {
             serde_json::from_slice(&fs::read(&state_path).map_err(|error| {
                 RpcError::new(
@@ -599,6 +624,11 @@ impl ExecutorRuntime {
                 "executorId": self.id,
                 "status": "ready",
                 "allowedRoots": self.allowed_roots,
+                "pathPolicy": self.desktop_policy.as_ref().map(|policy| json!({
+                    "mode": "desktop",
+                    "readDenyRoots": policy.read_denied(),
+                    "writeAllowRoots": policy.write_allowed(),
+                })).unwrap_or_else(|| json!({"mode": "legacy"})),
                 "capabilities": capability_catalog(),
                 "execution": self.execution_summary(),
                 "computerUse": self.computer_use.status(&self.relay_root.with_file_name("computer-use")),
@@ -754,6 +784,9 @@ impl ExecutorRuntime {
                     fs::read_dir(&path).map_err(|error| io_error("FS_LIST_FAILED", &path, error))?
                 {
                     let entry = entry.map_err(|error| io_error("FS_LIST_FAILED", &path, error))?;
+                    if self.read_path_denied(&entry.path())? {
+                        continue;
+                    }
                     let metadata = entry
                         .metadata()
                         .map_err(|error| io_error("FS_LIST_FAILED", &entry.path(), error))?;
@@ -775,13 +808,15 @@ impl ExecutorRuntime {
                     .and_then(Value::as_u64)
                     .unwrap_or(200) as usize;
                 let mut matches = Vec::new();
-                search_tree(&path, query, max_results, &mut matches)?;
+                search_tree(&path, query, max_results, &mut matches, &|child| {
+                    self.read_path_denied(child)
+                })?;
                 Ok(
                     json!({"path": path, "query": query, "matches": matches, "truncated": matches.len() >= max_results}),
                 )
             }
             "fs.write" | "filesystem.write" => {
-                let path = self.path(&params, "path", false)?;
+                let path = self.write_path(&params, "path", false)?;
                 let content = params
                     .get("content")
                     .and_then(Value::as_str)
@@ -806,7 +841,11 @@ impl ExecutorRuntime {
                     fs::create_dir_all(parent)
                         .map_err(|error| io_error("FS_WRITE_FAILED", parent, error))?;
                 }
-                let temporary = path.with_extension(format!("fabric.{}.tmp", std::process::id()));
+                let temporary = self.write_path(
+                    &json!({"path": path.with_extension(format!("fabric.{}.tmp", std::process::id()))}),
+                    "path",
+                    false,
+                )?;
                 fs::write(&temporary, content)
                     .map_err(|error| io_error("FS_WRITE_FAILED", &temporary, error))?;
                 atomic_replace(&temporary, &path)
@@ -814,7 +853,7 @@ impl ExecutorRuntime {
                 Ok(json!({"path": path, "digest": digest_file(&path)?}))
             }
             "fs.patch" | "filesystem.patch" => {
-                let path = self.path(&params, "path", true)?;
+                let path = self.write_path(&params, "path", true)?;
                 let expected_digest = required_str(&params, "expectedDigest")?;
                 let actual_digest = digest_file(&path)?;
                 if actual_digest != expected_digest {
@@ -835,7 +874,11 @@ impl ExecutorRuntime {
                     ));
                 }
                 let patched = content.replacen(before, after, 1);
-                let temporary = path.with_extension(format!("fabric.{}.tmp", std::process::id()));
+                let temporary = self.write_path(
+                    &json!({"path": path.with_extension(format!("fabric.{}.tmp", std::process::id()))}),
+                    "path",
+                    false,
+                )?;
                 fs::write(&temporary, patched)
                     .map_err(|error| io_error("FS_PATCH_FAILED", &temporary, error))?;
                 atomic_replace(&temporary, &path)
@@ -843,10 +886,10 @@ impl ExecutorRuntime {
                 Ok(json!({"path": path, "digest": digest_file(&path)?}))
             }
             "fs.remove" | "filesystem.remove" => {
-                let path = self.path(&params, "path", true)?;
+                let path = self.write_path(&params, "path", true)?;
                 let expected = required_str(&params, "expectedDigest")?;
                 let actual = if path.is_dir() {
-                    digest_tree(&path)?.0
+                    self.digest_tree(&path)?.0
                 } else {
                     digest_file(&path)?
                 };
@@ -869,8 +912,8 @@ impl ExecutorRuntime {
                 Ok(json!({"path": path, "removed": true, "restoreToken": destination}))
             }
             "fs.restore" | "filesystem.restore" => {
-                let destination = self.path(&params, "path", false)?;
-                let token = self.path(&params, "restoreToken", true)?;
+                let destination = self.write_path(&params, "path", false)?;
+                let token = self.write_path(&params, "restoreToken", true)?;
                 if token
                     .parent()
                     .and_then(Path::file_name)
@@ -893,7 +936,7 @@ impl ExecutorRuntime {
                 Ok(json!({"path": destination, "restored": true}))
             }
             "filesystem.mkdir" => {
-                let path = self.path(&params, "path", false)?;
+                let path = self.write_path(&params, "path", false)?;
                 fs::create_dir_all(&path)
                     .map_err(|error| io_error("FS_MKDIR_FAILED", &path, error))?;
                 Ok(json!({"path": path, "created": true}))
@@ -905,7 +948,7 @@ impl ExecutorRuntime {
                 let metadata = fs::metadata(&artifact_path)
                     .map_err(|error| io_error("ARTIFACT_READ_FAILED", &artifact_path, error))?;
                 let (digest, size, files, kind) = if metadata.is_dir() {
-                    let (digest, size, files) = digest_tree(&artifact_path)?;
+                    let (digest, size, files) = self.digest_tree(&artifact_path)?;
                     (digest, size, files, "directory")
                 } else {
                     (digest_file(&artifact_path)?, metadata.len(), 1, "file")
@@ -925,7 +968,7 @@ impl ExecutorRuntime {
                 let (digest, size, files, kind) = if metadata.is_file() {
                     (digest_file(&path)?, metadata.len(), 1, "file")
                 } else if metadata.is_dir() {
-                    let (digest, size, files) = digest_tree(&path)?;
+                    let (digest, size, files) = self.digest_tree(&path)?;
                     (digest, size, files, "directory")
                 } else {
                     return Err(RpcError::new(
@@ -956,8 +999,8 @@ impl ExecutorRuntime {
                     ));
                 }
                 let mut entries = Vec::new();
+                let (digest, size, files) = self.digest_tree(&source)?;
                 relay_manifest(&source, &source, &mut entries)?;
-                let (digest, size, files) = digest_tree(&source)?;
                 fs::create_dir_all(&self.relay_root).map_err(|error| {
                     io_error("ARTIFACT_TRANSFER_FAILED", &self.relay_root, error)
                 })?;
@@ -1027,7 +1070,7 @@ impl ExecutorRuntime {
                 }
             }
             "artifact.relay.archive.prepare" => {
-                let staging = self.path(&params, "staging", false)?;
+                let staging = self.write_path(&params, "staging", false)?;
                 if staging.exists() {
                     fs::remove_dir_all(&staging)
                         .map_err(|error| io_error("ARTIFACT_TRANSFER_FAILED", &staging, error))?;
@@ -1040,8 +1083,18 @@ impl ExecutorRuntime {
                 Ok(json!({"staging": staging}))
             }
             "artifact.relay.archive.write" => {
-                let staging = self.path(&params, "staging", true)?;
-                let archive_path = staging.join("payload.tar.gz");
+                let staging = self.write_path(&params, "staging", true)?;
+                let archive_path = self.write_path(
+                    &json!({"path": staging.join("payload.tar.gz")}),
+                    "path",
+                    true,
+                )?;
+                if !archive_path.starts_with(&staging) {
+                    return Err(RpcError::new(
+                        "INVALID_ARTIFACT_PATH",
+                        "archive escapes staging",
+                    ));
+                }
                 let offset = params
                     .get("offset")
                     .and_then(Value::as_u64)
@@ -1060,8 +1113,8 @@ impl ExecutorRuntime {
                 Ok(json!({"offset": offset, "bytes": bytes.len()}))
             }
             "artifact.relay.archive.commit" => {
-                let destination = self.path(&params, "destination", false)?;
-                let staging = self.path(&params, "staging", true)?;
+                let destination = self.write_path(&params, "destination", false)?;
+                let staging = self.write_path(&params, "staging", true)?;
                 let expected = required_str(&params, "expectedDigest")?;
                 let expected_archive_size = params
                     .get("archiveSize")
@@ -1075,7 +1128,17 @@ impl ExecutorRuntime {
                     .get("files")
                     .and_then(Value::as_u64)
                     .ok_or_else(|| RpcError::new("INVALID_PARAMS", "files is required"))?;
-                let archive_path = staging.join("payload.tar.gz");
+                let archive_path = self.path(
+                    &json!({"path": staging.join("payload.tar.gz")}),
+                    "path",
+                    true,
+                )?;
+                if !archive_path.starts_with(&staging) {
+                    return Err(RpcError::new(
+                        "INVALID_ARTIFACT_PATH",
+                        "archive escapes staging",
+                    ));
+                }
                 let actual_archive_size = fs::metadata(&archive_path)
                     .map_err(|error| io_error("ARTIFACT_TRANSFER_FAILED", &archive_path, error))?
                     .len();
@@ -1091,7 +1154,7 @@ impl ExecutorRuntime {
                 fs::create_dir(&extracted)
                     .map_err(|error| io_error("ARTIFACT_TRANSFER_FAILED", &extracted, error))?;
                 extract_relay_archive(&archive_path, &extracted, expected_size, expected_files)?;
-                let (digest, size, files) = digest_tree(&extracted)?;
+                let (digest, size, files) = self.digest_tree(&extracted)?;
                 if digest != expected {
                     return Err(RpcError::new(
                         "ARTIFACT_DIGEST_MISMATCH",
@@ -1108,8 +1171,8 @@ impl ExecutorRuntime {
             "artifact.relay.manifest" => {
                 let source = self.path(&params, "path", true)?;
                 let mut entries = Vec::new();
+                let (digest, size, files) = self.digest_tree(&source)?;
                 relay_manifest(&source, &source, &mut entries)?;
-                let (digest, size, files) = digest_tree(&source)?;
                 Ok(
                     json!({"path": source, "entries": entries, "digest": digest, "size": size, "files": files}),
                 )
@@ -1117,7 +1180,13 @@ impl ExecutorRuntime {
             "artifact.relay.read" => {
                 let source = self.path(&params, "path", true)?;
                 let relative = safe_relative(required_str(&params, "relativePath")?)?;
-                let path = source.join(relative);
+                let path = self.path(&json!({"path": source.join(relative)}), "path", true)?;
+                if !path.starts_with(&source) {
+                    return Err(RpcError::new(
+                        "INVALID_ARTIFACT_PATH",
+                        "relative path escapes artifact",
+                    ));
+                }
                 let offset = params.get("offset").and_then(Value::as_u64).unwrap_or(0);
                 let limit = params
                     .get("limit")
@@ -1138,8 +1207,8 @@ impl ExecutorRuntime {
                 )
             }
             "artifact.relay.prepare" => {
-                let destination = self.path(&params, "destination", false)?;
-                let staging = self.path(&params, "staging", false)?;
+                let destination = self.write_path(&params, "destination", false)?;
+                let staging = self.write_path(&params, "staging", false)?;
                 if staging.exists() {
                     fs::remove_dir_all(&staging)
                         .map_err(|error| io_error("ARTIFACT_TRANSFER_FAILED", &staging, error))?;
@@ -1175,9 +1244,16 @@ impl ExecutorRuntime {
                 Ok(json!({"destination": destination, "staging": staging}))
             }
             "artifact.relay.write" => {
-                let staging = self.path(&params, "staging", true)?;
+                let staging = self.write_path(&params, "staging", true)?;
                 let relative = safe_relative(required_str(&params, "relativePath")?)?;
-                let path = staging.join(relative);
+                let path =
+                    self.write_path(&json!({"path": staging.join(relative)}), "path", true)?;
+                if !path.starts_with(&staging) {
+                    return Err(RpcError::new(
+                        "INVALID_ARTIFACT_PATH",
+                        "relative path escapes staging",
+                    ));
+                }
                 let offset = params
                     .get("offset")
                     .and_then(Value::as_u64)
@@ -1198,10 +1274,10 @@ impl ExecutorRuntime {
                 )
             }
             "artifact.relay.commit" => {
-                let destination = self.path(&params, "destination", false)?;
-                let staging = self.path(&params, "staging", true)?;
+                let destination = self.write_path(&params, "destination", false)?;
+                let staging = self.write_path(&params, "staging", true)?;
                 let expected = required_str(&params, "expectedDigest")?;
-                let (digest, size, files) = digest_tree(&staging)?;
+                let (digest, size, files) = self.digest_tree(&staging)?;
                 if digest != expected {
                     return Err(RpcError::new(
                         "ARTIFACT_DIGEST_MISMATCH",
@@ -1233,7 +1309,7 @@ impl ExecutorRuntime {
             }
             "process.start" | "agent.start" => {
                 let cwd_input = required_str(&params, "cwd")?;
-                let cwd = self.path(&params, "cwd", true)?;
+                let cwd = self.write_path(&params, "cwd", true)?;
                 let argv = string_array(&params, "argv")?;
                 validate_command(
                     &argv,
@@ -1246,7 +1322,7 @@ impl ExecutorRuntime {
                     required_str(&params, "processId")?.to_owned()
                 };
                 let log_path = if let Some(path) = params.get("logPath").and_then(Value::as_str) {
-                    self.path(&json!({"path": path}), "path", false)?
+                    self.write_path(&json!({"path": path}), "path", false)?
                 } else {
                     cwd.join(format!(".fabric-{process_id}.log"))
                 };
@@ -1305,7 +1381,7 @@ impl ExecutorRuntime {
                 Ok(json!({"port": port, "available": available}))
             }
             "application.materialize" => {
-                let generation_root = self.path(&params, "generationRoot", false)?;
+                let generation_root = self.write_path(&params, "generationRoot", false)?;
                 let baseline = self.application_path(&params, "baselinePath")?;
                 Ok(serde_json::to_value(materialize(
                     &generation_root,
@@ -1315,7 +1391,7 @@ impl ExecutorRuntime {
                 .expect("generation serializes"))
             }
             "application.apply-artifacts" => {
-                let application_path = self.path(&params, "applicationPath", true)?;
+                let application_path = self.write_path(&params, "applicationPath", true)?;
                 let mut overlays: Vec<Overlay> = serde_json::from_value(
                     params
                         .get("overlays")
@@ -1340,7 +1416,7 @@ impl ExecutorRuntime {
                     .and_then(Value::as_str)
                     .map(|path| self.path(&json!({"path": path}), "path", true))
                     .transpose()?;
-                self.path(
+                self.write_path(
                     &json!({"path": root_path.join(required_str(&params, "outputRelative")?)}),
                     "path",
                     false,
@@ -1381,7 +1457,7 @@ impl ExecutorRuntime {
                 )
             }
             "application.generation.record" | "application.runtime.record" => {
-                let generation_root = self.path(&params, "generationRoot", true)?;
+                let generation_root = self.write_path(&params, "generationRoot", true)?;
                 let mut evidence = params.get("evidence").cloned().unwrap_or_else(|| json!({}));
                 if let Some(marker) = params.get("runtimeMarker") {
                     if !evidence.is_object() {
@@ -1400,7 +1476,7 @@ impl ExecutorRuntime {
                 )
             }
             "application.activate" => {
-                let generation_root = self.path(&params, "generationRoot", true)?;
+                let generation_root = self.write_path(&params, "generationRoot", true)?;
                 activate(&generation_root, required_str(&params, "generationId")?)
             }
             #[cfg(target_os = "macos")]
@@ -1410,7 +1486,7 @@ impl ExecutorRuntime {
             }
             #[cfg(target_os = "macos")]
             "application.finalize" => {
-                let application_path = self.path(&params, "applicationPath", true)?;
+                let application_path = self.write_path(&params, "applicationPath", true)?;
                 let signing_keychain = params
                     .get("signingKeychain")
                     .and_then(Value::as_str)
@@ -1429,7 +1505,7 @@ impl ExecutorRuntime {
                 )
                 .map_err(|error| RpcError::new("INVALID_PARAMS", error.to_string()))?;
                 for unit in &mut units {
-                    unit.path = self.path(&json!({"path": unit.path}), "path", true)?;
+                    unit.path = self.write_path(&json!({"path": unit.path}), "path", true)?;
                     if let Some(entitlements) = unit.entitlements.take() {
                         unit.entitlements =
                             Some(self.path(&json!({"path": entitlements}), "path", true)?);
@@ -1448,11 +1524,11 @@ impl ExecutorRuntime {
             }
             #[cfg(target_os = "macos")]
             "application.launch" => {
-                let application_path = self.path(&params, "applicationPath", true)?;
+                let application_path = self.application_path(&params, "applicationPath")?;
                 let user_data_dir = params
                     .get("userDataDir")
                     .and_then(Value::as_str)
-                    .map(|_| self.path(&params, "userDataDir", false))
+                    .map(|_| self.write_path(&params, "userDataDir", false))
                     .transpose()?;
                 crate::macos::launch(
                     &application_path,
@@ -1522,7 +1598,7 @@ impl ExecutorRuntime {
             ),
             #[cfg(target_os = "macos")]
             "ui.capture" => {
-                let output = self.path(&params, "output", false)?;
+                let output = self.write_path(&params, "output", false)?;
                 crate::macos::cdp_capture(
                     params
                         .get("remoteDebuggingPort")
@@ -1550,21 +1626,21 @@ impl ExecutorRuntime {
             }
             #[cfg(windows)]
             "application.launch" => {
-                let application_path = self.path(&params, "applicationPath", true)?;
+                let application_path = self.application_path(&params, "applicationPath")?;
                 let user_data_dir = params
                     .get("userDataDir")
                     .and_then(Value::as_str)
-                    .map(|_| self.path(&params, "userDataDir", false))
+                    .map(|_| self.write_path(&params, "userDataDir", false))
                     .transpose()?;
                 let runtime_shadow_dir = params
                     .get("runtimeShadowDir")
                     .and_then(Value::as_str)
-                    .map(|_| self.path(&params, "runtimeShadowDir", false))
+                    .map(|_| self.write_path(&params, "runtimeShadowDir", false))
                     .transpose()?;
                 let chromium_local_state_path = params
                     .get("chromiumLocalStatePath")
                     .and_then(Value::as_str)
-                    .map(|_| self.path(&params, "chromiumLocalStatePath", false))
+                    .map(|_| self.write_path(&params, "chromiumLocalStatePath", false))
                     .transpose()?;
                 let file = params
                     .get("file")
@@ -1632,7 +1708,7 @@ impl ExecutorRuntime {
             #[cfg(windows)]
             "ui.capture" => {
                 let application_path = self.path(&params, "applicationPath", true)?;
-                let output = self.path(&params, "output", false)?;
+                let output = self.write_path(&params, "output", false)?;
                 crate::windows::capture_window(
                     &application_path,
                     params.get("expectedWindowTitle").and_then(Value::as_str),
@@ -1723,9 +1799,9 @@ impl ExecutorRuntime {
             }
             return Ok(tunnel_view(&existing, true));
         }
-        let cwd = self.path(params, "cwd", true)?;
+        let cwd = self.write_path(params, "cwd", true)?;
         let log_path = if params.get("logPath").and_then(Value::as_str).is_some() {
-            self.path(params, "logPath", false)?
+            self.write_path(params, "logPath", false)?
         } else {
             cwd.join(format!(".workbench-{process_id}.log"))
         };
@@ -1745,7 +1821,7 @@ impl ExecutorRuntime {
             .and_then(Value::as_str)
             .is_some()
         {
-            let known_hosts = self.path(params, "knownHostsFile", false)?;
+            let known_hosts = self.write_path(params, "knownHostsFile", false)?;
             argv.splice(
                 argv.len() - 1..argv.len() - 1,
                 [
@@ -1809,34 +1885,40 @@ impl ExecutorRuntime {
     }
 
     fn path(&self, params: &Value, key: &str, must_exist: bool) -> Result<PathBuf, RpcError> {
+        self.checked_path(params, key, must_exist, PathAccess::Read)
+    }
+
+    fn write_path(&self, params: &Value, key: &str, must_exist: bool) -> Result<PathBuf, RpcError> {
+        self.checked_path(params, key, must_exist, PathAccess::Write)
+    }
+
+    fn checked_path(
+        &self,
+        params: &Value,
+        key: &str,
+        must_exist: bool,
+        access: PathAccess,
+    ) -> Result<PathBuf, RpcError> {
         let raw = params
             .get(key)
             .and_then(Value::as_str)
             .ok_or_else(|| RpcError::new("INVALID_PARAMS", format!("{key} is required")))?;
         let path = PathBuf::from(raw);
-        let checked = if must_exist || path.exists() {
-            path.canonicalize()
-                .map_err(|error| io_error("PATH_INVALID", &path, error))?
-        } else {
-            let mut ancestor = path.as_path();
-            let mut missing = Vec::new();
-            while !ancestor.exists() {
-                let name = ancestor.file_name().ok_or_else(|| {
-                    RpcError::new("PATH_INVALID", "path has no existing ancestor")
-                })?;
-                missing.push(name.to_owned());
-                ancestor = ancestor
-                    .parent()
-                    .ok_or_else(|| RpcError::new("PATH_INVALID", "path has no parent"))?;
-            }
-            let mut resolved = ancestor
-                .canonicalize()
-                .map_err(|error| io_error("PATH_INVALID", &path, error))?;
-            for name in missing.into_iter().rev() {
-                resolved.push(name);
-            }
-            resolved
-        };
+        if let Some(policy) = &self.desktop_policy {
+            policy.check(&path, PathAccess::Read)?;
+        }
+        if must_exist && !path.exists() {
+            return Err(io_error(
+                "PATH_INVALID",
+                &path,
+                std::io::Error::from(std::io::ErrorKind::NotFound),
+            ));
+        }
+        let checked = resolve_path(&path)?;
+        if let Some(policy) = &self.desktop_policy {
+            policy.check(&checked, access)?;
+            return Ok(checked);
+        }
         if !self
             .allowed_roots
             .iter()
@@ -1850,11 +1932,62 @@ impl ExecutorRuntime {
         Ok(checked)
     }
 
+    fn read_path_denied(&self, path: &Path) -> Result<bool, RpcError> {
+        let Some(policy) = &self.desktop_policy else {
+            return Ok(false);
+        };
+        if policy.check(path, PathAccess::Read).is_err() {
+            return Ok(true);
+        }
+        let checked = resolve_path(path)?;
+        Ok(policy.check(&checked, PathAccess::Read).is_err())
+    }
+
+    fn digest_tree(&self, root: &Path) -> Result<(String, u64, u64), RpcError> {
+        if self.desktop_policy.is_some() {
+            self.ensure_tree_readable(root)?;
+        }
+        digest_tree(root)
+    }
+
+    fn ensure_tree_readable(&self, directory: &Path) -> Result<(), RpcError> {
+        for entry in fs::read_dir(directory)
+            .map_err(|error| io_error("ARTIFACT_READ_FAILED", directory, error))?
+        {
+            let entry =
+                entry.map_err(|error| io_error("ARTIFACT_READ_FAILED", directory, error))?;
+            let path = entry.path();
+            if self.read_path_denied(&path)? {
+                return Err(RpcError::new(
+                    "PATH_READ_DENIED",
+                    format!(
+                        "{} contains a protected system or credential path",
+                        directory.display()
+                    ),
+                ));
+            }
+            if fs::symlink_metadata(&path)
+                .map_err(|error| io_error("ARTIFACT_READ_FAILED", &path, error))?
+                .is_dir()
+            {
+                self.ensure_tree_readable(&path)?;
+            }
+        }
+        Ok(())
+    }
+
     fn application_path(&self, params: &Value, key: &str) -> Result<PathBuf, RpcError> {
         let raw = required_str(params, key)?;
+        if let Some(policy) = &self.desktop_policy {
+            policy.check(Path::new(raw), PathAccess::Read)?;
+        }
         let checked = PathBuf::from(raw)
             .canonicalize()
             .map_err(|error| io_error("PATH_INVALID", Path::new(raw), error))?;
+        if let Some(policy) = &self.desktop_policy {
+            policy.check(&checked, PathAccess::Read)?;
+            return Ok(checked);
+        }
         let managed = self
             .allowed_roots
             .iter()
@@ -1876,7 +2009,7 @@ impl ExecutorRuntime {
 
     fn run_command(&self, params: &Value) -> Result<Value, RpcError> {
         let cwd_input = required_str(params, "cwd")?;
-        let cwd = self.path(params, "cwd", true)?;
+        let cwd = self.write_path(params, "cwd", true)?;
         let argv = string_array(params, "argv")?;
         validate_command(
             &argv,
@@ -3356,8 +3489,9 @@ fn search_tree(
     query: &str,
     max_results: usize,
     matches: &mut Vec<Value>,
+    read_denied: &impl Fn(&Path) -> Result<bool, RpcError>,
 ) -> Result<(), RpcError> {
-    if matches.len() >= max_results {
+    if matches.len() >= max_results || read_denied(path)? {
         return Ok(());
     }
     let metadata =
@@ -3369,7 +3503,7 @@ fn search_tree(
             .map_err(|error| io_error("FS_SEARCH_FAILED", path, error))?;
         children.sort_by_key(|entry| entry.file_name());
         for entry in children {
-            search_tree(&entry.path(), query, max_results, matches)?;
+            search_tree(&entry.path(), query, max_results, matches, read_denied)?;
             if matches.len() >= max_results {
                 break;
             }
@@ -3433,6 +3567,122 @@ fn io_error(code: &str, path: &Path, error: std::io::Error) -> RpcError {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn desktop_executor_reads_outside_legacy_roots_but_protects_credentials_and_writes() {
+        let directory = tempfile::tempdir().unwrap();
+        let home = directory.path().join("home");
+        let code = home.join("Code");
+        let secrets = home.join(".ssh");
+        fs::create_dir_all(&code).unwrap();
+        fs::create_dir_all(&secrets).unwrap();
+        fs::write(secrets.join("id_ed25519"), "secret marker").unwrap();
+        let application = directory.path().join("Program Files/App.exe");
+        fs::create_dir_all(application.parent().unwrap()).unwrap();
+        fs::write(&application, "application bytes").unwrap();
+        let runtime = ExecutorRuntime::base("desktop", vec![code.clone()], Some(&home)).unwrap();
+
+        assert_eq!(
+            runtime
+                .dispatch("fs.read", json!({"path": application}))
+                .unwrap()["content"],
+            "application bytes"
+        );
+        assert_eq!(
+            runtime
+                .application_path(&json!({"applicationPath": application}), "applicationPath")
+                .unwrap(),
+            application.canonicalize().unwrap()
+        );
+        assert_eq!(
+            runtime
+                .dispatch(
+                    "fs.write",
+                    json!({"path": application, "content": "changed"})
+                )
+                .unwrap_err()
+                .code,
+            "PATH_WRITE_DENIED"
+        );
+        assert_eq!(
+            fs::read_to_string(&application).unwrap(),
+            "application bytes"
+        );
+        assert_eq!(
+            runtime
+                .dispatch("fs.read", json!({"path": secrets.join("id_ed25519")}))
+                .unwrap_err()
+                .code,
+            "PATH_READ_DENIED"
+        );
+        let listing = runtime.dispatch("fs.list", json!({"path": home})).unwrap();
+        assert!(
+            listing["entries"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|entry| entry["name"] != ".ssh")
+        );
+        let search = runtime
+            .dispatch("fs.search", json!({"path": home, "query": "secret marker"}))
+            .unwrap();
+        assert!(search["matches"].as_array().unwrap().is_empty());
+        #[cfg(unix)]
+        {
+            let moved = directory.path().join("moved-secrets");
+            fs::rename(&secrets, &moved).unwrap();
+            std::os::unix::fs::symlink(&moved, &secrets).unwrap();
+            assert_eq!(
+                runtime
+                    .dispatch("fs.read", json!({"path": secrets.join("id_ed25519")}))
+                    .unwrap_err()
+                    .code,
+                "PATH_READ_DENIED"
+            );
+            let staging = code.join("staging");
+            fs::create_dir(&staging).unwrap();
+            std::os::unix::fs::symlink(&application, staging.join("payload.tar.gz")).unwrap();
+            assert_eq!(
+                runtime
+                    .dispatch(
+                        "artifact.relay.archive.write",
+                        json!({"staging": staging, "offset": 0, "data": "YQ=="}),
+                    )
+                    .unwrap_err()
+                    .code,
+                "PATH_WRITE_DENIED"
+            );
+            assert_eq!(
+                fs::read_to_string(&application).unwrap(),
+                "application bytes"
+            );
+            let temporary = code
+                .join("new.txt")
+                .with_extension(format!("fabric.{}.tmp", std::process::id()));
+            std::os::unix::fs::symlink(&application, &temporary).unwrap();
+            assert_eq!(
+                runtime
+                    .dispatch(
+                        "fs.write",
+                        json!({"path": code.join("new.txt"), "content": "changed"}),
+                    )
+                    .unwrap_err()
+                    .code,
+                "PATH_WRITE_DENIED"
+            );
+            assert_eq!(
+                fs::read_to_string(&application).unwrap(),
+                "application bytes"
+            );
+            fs::remove_file(temporary).unwrap();
+        }
+        runtime
+            .dispatch(
+                "fs.write",
+                json!({"path": code.join("new.txt"), "content": "okay"}),
+            )
+            .unwrap();
+    }
+
     #[test]
     fn recovery_inspection_guard_preserves_queue_and_cleans_up_all_exits() {
         use std::panic::{AssertUnwindSafe, catch_unwind};

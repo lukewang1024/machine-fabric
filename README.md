@@ -51,6 +51,30 @@ systemd user services on Linux, Windows Services on Windows, and
 `termux-services` on Android aarch64. SSH aliases and keys remain user-managed
 through the normal SSH configuration.
 
+## Desktop Executor paths
+
+The macOS and Windows installers start their Executors with `--path-policy
+desktop` and an explicit `--policy-home`. Direct file reads and application
+paths are open by default. The read deny list covers common credential
+directories and sensitive OS data, while leaving application locations such as
+`/Applications`, `/System/Applications`, and `Program Files` readable. A read
+deny also overrides a write allow. Directory listings and searches omit denied
+children; artifact tree operations refuse a tree containing one.
+
+Writes are admitted only below the selected user's `Code`, `Workspace`,
+`Downloads`, `Documents`, `Desktop`, `Pictures`, `.cache`, `.config`,
+`.local/state`, and `.local/share`, plus absolute XDG cache, state, and config
+roots beneath that user's home when set. macOS also admits user `Applications`, `Library/Caches`,
+`Library/Application Support`, `Library/Preferences`, and `Library/Logs`; Windows also admits
+user `AppData/Local` and `AppData/Roaming`. The Windows installer can resolve
+`-PolicyUser` to that account's profile instead of using the installer's
+profile. `allowRoots` remains the legacy Linux path gate and provides an
+internal relay root; it does not expand the desktop write allow list.
+
+This is admission control for Executor path arguments. Commands and launched
+applications run with their normal OS privileges and are not filesystem
+sandboxed by this policy. macOS TCC and Windows ACL checks still apply.
+
 ## Image clipboard transfer
 
 Send the current Mac clipboard image to one connected machine explicitly:
