@@ -129,7 +129,7 @@ impl DesktopQueue {
             .position(|j| j.state == "active" || j.state == "draining")
     }
     pub(crate) fn needs_cleanup(&mut self) -> bool {
-        if self.blocked || self.in_flight {
+        if self.in_flight {
             return false;
         }
         if let Some(i) = self.active() {
@@ -143,7 +143,11 @@ impl DesktopQueue {
     pub(crate) fn cleanup_done(&mut self, success: bool) -> Result<(), RpcError> {
         if success {
             if let Some(i) = self.active() {
-                self.jobs[i].state = if self.jobs[i].expires_at <= now_ms() {
+                // Stopping owned helpers is cleanup, not recovery or evidence
+                // that the timed-out desktop action completed successfully.
+                self.jobs[i].state = if self.blocked {
+                    "interrupted"
+                } else if self.jobs[i].expires_at <= now_ms() {
                     "expired"
                 } else {
                     "completed"
@@ -501,6 +505,50 @@ mod tests {
         assert_eq!(q.jobs[0].state, "expired");
         assert_eq!(q.jobs[1].state, "active");
     }
+    #[test]
+    fn quarantined_close_cleans_helpers_without_recovering_or_promoting() {
+        let mut q = DesktopQueue::default();
+        let a = submit(&mut q, "a");
+        q.begin(
+            "computer-use.call",
+            &mut json!({"_desktop":credentials(&a)}),
+        )
+        .unwrap();
+        q.end(true).unwrap();
+        submit(&mut q, "b");
+        // An uncertain active operation is not implicitly closed on observation.
+        assert!(!q.needs_cleanup());
+        q.command("desktop.finish", &credentials(&a)).unwrap();
+        assert!(q.needs_cleanup());
+        q.cleanup_done(true).unwrap();
+        assert!(q.blocked);
+        assert_eq!(q.jobs[0].state, "interrupted");
+        assert_eq!(q.jobs[1].state, "queued");
+        assert!(q.begin("ui.input", &mut json!({})).is_err());
+        assert!(q.command("desktop.recover", &json!({})).is_err());
+        q.command("desktop.recover", &json!({"confirmDesktopReset":true}))
+            .unwrap();
+        assert_eq!(q.jobs[1].state, "active");
+    }
+
+    #[test]
+    fn quarantined_cleanup_waits_for_inflight_and_retains_failed_cleanup() {
+        let mut q = DesktopQueue::default();
+        let a = submit(&mut q, "a");
+        q.begin(
+            "computer-use.call",
+            &mut json!({"_desktop":credentials(&a)}),
+        )
+        .unwrap();
+        q.command("desktop.finish", &credentials(&a)).unwrap();
+        assert!(!q.needs_cleanup());
+        q.end(true).unwrap();
+        assert!(q.needs_cleanup());
+        q.cleanup_done(false).unwrap();
+        assert!(q.blocked);
+        assert_eq!(q.jobs[0].state, "draining");
+    }
+
     #[test]
     fn restart_quarantines_active_session_and_preserves_fifo() {
         let dir = tempfile::tempdir().unwrap();
