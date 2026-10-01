@@ -623,6 +623,8 @@ impl ExecutorRuntime {
             "ping" | "status" => Ok(json!({
                 "executorId": self.id,
                 "status": "ready",
+                "runtimeVersion": env!("CARGO_PKG_VERSION"),
+                "pid": std::process::id(),
                 "allowedRoots": self.allowed_roots,
                 "pathPolicy": self.desktop_policy.as_ref().map(|policy| json!({
                     "mode": "desktop",

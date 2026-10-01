@@ -775,6 +775,17 @@ mod tests {
                     .unwrap();
             });
         }
+        let ready_deadline = Instant::now() + Duration::from_secs(2);
+        while ![&controller_a, &executor_a, &controller_b, &executor_b]
+            .iter()
+            .all(|socket| socket.exists())
+        {
+            assert!(
+                Instant::now() < ready_deadline,
+                "fake role listeners did not bind"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
         let (a_to_b, b_to_a) = UnixStream::pair().unwrap();
         let a_read = a_to_b.try_clone().unwrap();
         let b_read = b_to_a.try_clone().unwrap();
@@ -796,7 +807,6 @@ mod tests {
             directory.path().join("b-sees-a-executor.sock"),
         )
         .unwrap();
-        thread::sleep(Duration::from_millis(50));
         let a_calls_b = bridge_a.call(
             TargetRole::Executor,
             Request::new("status", serde_json::Value::Null),

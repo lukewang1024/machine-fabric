@@ -235,7 +235,7 @@ impl Controller {
         }
         match action {
             "ping" => Ok(json!({
-                "controller": {"id": self.id, "status": "ready"},
+                "controller": {"id": self.id, "status": "ready", "runtimeVersion": env!("CARGO_PKG_VERSION"), "pid": std::process::id()},
             })),
             "fabric.context" => {
                 let requested_executor = params.get("executorId").and_then(Value::as_str);
@@ -339,7 +339,7 @@ impl Controller {
                 let tasks =
                     bounded_task_page_from_table(&task_table, None, TASK_LIST_DEFAULT_LIMIT, 0);
                 Ok(json!({
-                    "controller": {"id": self.id, "status": "ready"},
+                    "controller": {"id": self.id, "status": "ready", "runtimeVersion": env!("CARGO_PKG_VERSION"), "pid": std::process::id()},
                     "controllers": controllers,
                     "executors": executors,
                     "leases": self.leases.lock().expect("lease lock").snapshot(),
@@ -505,7 +505,7 @@ impl Controller {
                 let healthy = checks.iter().all(|check| check["status"] == "ready");
                 Ok(json!({
                     "healthy": healthy,
-                    "controller": {"id": self.id, "status": "ready"},
+                    "controller": {"id": self.id, "status": "ready", "runtimeVersion": env!("CARGO_PKG_VERSION"), "pid": std::process::id()},
                     "checks": checks
                 }))
             }
@@ -513,7 +513,7 @@ impl Controller {
                 let state = self.state.lock().expect("state lock").clone();
                 Ok(json!({
                     "generatedAt": now_ms(),
-                    "controller": {"id": self.id, "status": "ready"},
+                    "controller": {"id": self.id, "status": "ready", "runtimeVersion": env!("CARGO_PKG_VERSION"), "pid": std::process::id()},
                     "controllers": state.controllers,
                     "sessions": state.sessions,
                     "executors": state.executors,
@@ -4324,6 +4324,21 @@ mod tests {
         assert_eq!(compact["inspection"]["processCount"], 1);
         assert!(compact["inspection"].get("processes").is_none());
         assert_eq!(retained_task_output("ui.evaluate", &output), output);
+    }
+
+    #[test]
+    fn live_status_and_ping_identify_the_running_binary() {
+        let directory = tempfile::tempdir().unwrap();
+        let controller =
+            Controller::open(JsonStore::new(directory.path().join("state.json"))).unwrap();
+        for action in ["ping", "status"] {
+            let response = controller.dispatch(action, json!({})).unwrap();
+            assert_eq!(
+                response["controller"]["runtimeVersion"],
+                env!("CARGO_PKG_VERSION")
+            );
+            assert_eq!(response["controller"]["pid"], std::process::id());
+        }
     }
 
     #[test]
