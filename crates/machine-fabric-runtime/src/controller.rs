@@ -282,9 +282,15 @@ impl Controller {
                     .filter(|response| response.ok)
                     .and_then(|response| response.result)
                     .unwrap_or_else(|| json!({"available": false, "status": "unreachable"}));
+                    let observed_health = if availability["status"] == "unreachable" {
+                        HealthStatus::Offline
+                    } else {
+                        executor.health.clone()
+                    };
                     nodes.push(json!({
                         "executorId": executor.metadata.id,
-                        "health": executor.health,
+                        "health": observed_health,
+                        "registeredHealth": executor.health,
                         "availability": availability,
                         "capabilityCount": executor.capabilities.len(),
                         "capabilities": capabilities,
@@ -3474,6 +3480,9 @@ mod tests {
         assert!(context.ok, "{:?}", context.error);
         let executor = &context.result.unwrap()["executors"][0];
         assert_eq!(executor["executorId"], "linux-build");
+        assert_eq!(executor["health"], "offline");
+        assert_eq!(executor["registeredHealth"], "ready");
+        assert_eq!(executor["availability"]["status"], "unreachable");
         assert_eq!(executor["capabilities"][0]["name"], "command.run");
         assert!(executor["capabilities"][0].get("inputSchema").is_none());
 

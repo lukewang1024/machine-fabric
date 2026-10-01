@@ -18,6 +18,15 @@ const PEER_BACKOFF_INITIAL: Duration = Duration::from_secs(1);
 const PEER_BACKOFF_MAX: Duration = Duration::from_secs(5);
 const PEER_STABLE_CONNECTION: Duration = Duration::from_secs(30);
 
+fn peer_response_timeout(action: &str) -> Duration {
+    match action {
+        "ping" | "status" | "availability" | "capability.list" | "capability.describe" => {
+            Duration::from_secs(10)
+        }
+        _ => Duration::from_secs(3600),
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct PeerConnectConfig {
     pub local_id: String,
@@ -98,6 +107,17 @@ struct PeerBridge {
 
 impl PeerBridge {
     fn call(&self, target_role: TargetRole, request: Request) -> Response {
+        let timeout = peer_response_timeout(&request.action);
+        self.call_with_timeout(target_role, request, timeout)
+    }
+
+    fn call_with_timeout(
+        &self,
+        target_role: TargetRole,
+        request: Request,
+        timeout: Duration,
+    ) -> Response {
+        let request_id = request.request_id.clone();
         let id = format!("peer_request_{}", Uuid::new_v4().simple());
         log_event(
             "info",
@@ -117,19 +137,17 @@ impl PeerBridge {
         if let Err(error) = write_frame(&self.writer, &frame) {
             self.pending.lock().expect("peer pending lock").remove(&id);
             return Response::failure(
-                "peer",
+                request_id,
                 RpcError::new("PEER_WRITE_FAILED", error.to_string()),
             );
         }
-        receiver
-            .recv_timeout(Duration::from_secs(3600))
-            .unwrap_or_else(|error| {
-                self.pending.lock().expect("peer pending lock").remove(&id);
-                Response::failure(
-                    "peer",
-                    RpcError::new("PEER_RESPONSE_TIMEOUT", error.to_string()),
-                )
-            })
+        receiver.recv_timeout(timeout).unwrap_or_else(|error| {
+            self.pending.lock().expect("peer pending lock").remove(&id);
+            Response::failure(
+                request_id,
+                RpcError::new("PEER_RESPONSE_TIMEOUT", error.to_string()),
+            )
+        })
     }
 }
 
@@ -671,6 +689,70 @@ mod tests {
     use super::*;
     use std::io::Cursor;
     use std::os::unix::net::UnixStream;
+
+    #[test]
+    fn health_deadlines_do_not_shorten_action_or_build_waits() {
+        for action in [
+            "ping",
+            "status",
+            "availability",
+            "capability.list",
+            "capability.describe",
+        ] {
+            assert_eq!(peer_response_timeout(action), Duration::from_secs(10));
+        }
+        for action in [
+            "command.run",
+            "computer-use.call",
+            "computer-use.tools",
+            "desktop.finish",
+        ] {
+            assert_eq!(peer_response_timeout(action), Duration::from_secs(3600));
+        }
+    }
+
+    #[test]
+    fn response_timeout_keeps_request_identity_sends_once_and_ignores_late_reply() {
+        let (writer, reader) = UnixStream::pair().unwrap();
+        reader
+            .set_read_timeout(Some(Duration::from_millis(100)))
+            .unwrap();
+        let bridge = PeerBridge {
+            writer: Arc::new(Mutex::new(Box::new(writer))),
+            pending: Arc::new(Mutex::new(HashMap::new())),
+        };
+        let request = Request::new("status", serde_json::Value::Null);
+        let expected_id = request.request_id.clone();
+        let response =
+            bridge.call_with_timeout(TargetRole::Executor, request, Duration::from_millis(5));
+        assert_eq!(response.request_id, expected_id);
+        assert_eq!(response.error.unwrap().code, "PEER_RESPONSE_TIMEOUT");
+        assert!(bridge.pending.lock().unwrap().is_empty());
+        let mut reader = BufReader::new(reader);
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        let PeerFrame::Request { id, .. } = serde_json::from_str(&line).unwrap() else {
+            panic!("expected one request frame");
+        };
+        let mut late = serde_json::to_vec(&PeerFrame::Response {
+            id,
+            response: Response::success(expected_id, serde_json::json!({"late":true})),
+        })
+        .unwrap();
+        late.push(b'\n');
+        let _ = read_frames_inner(
+            Box::new(Cursor::new(late)),
+            bridge.clone(),
+            PathBuf::new(),
+            PathBuf::new(),
+        );
+        assert!(bridge.pending.lock().unwrap().is_empty());
+        line.clear();
+        assert!(
+            reader.read_line(&mut line).is_err(),
+            "timeout or late reply must not resend the request"
+        );
+    }
 
     #[test]
     fn one_framed_connection_routes_both_roles_in_both_directions() {
