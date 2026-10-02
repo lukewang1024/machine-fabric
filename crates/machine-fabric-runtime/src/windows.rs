@@ -624,7 +624,7 @@ pub fn cdp_evaluate(
     target_url_prefix: Option<&str>,
     expression: &str,
 ) -> Result<Value, RpcError> {
-    let pages = cdp_json(port, "/json")?;
+    let (pages, loopback_host) = cdp_json(port, "/json")?;
     let page = pages
         .as_array()
         .and_then(|items| {
@@ -642,12 +642,9 @@ pub fn cdp_evaluate(
         .get("webSocketDebuggerUrl")
         .and_then(Value::as_str)
         .ok_or_else(|| RpcError::new("CDP_TARGET_INVALID", "target has no debugger URL"))?;
-    // The discovery endpoint is deliberately reached over IPv4 loopback. Some
-    // Chromium builds advertise `localhost` even when the debugger only listens
-    // on 127.0.0.1, and Windows may resolve localhost to ::1 first.
-    let websocket_url = websocket_url
-        .replacen("ws://localhost:", "ws://127.0.0.1:", 1)
-        .replacen("ws://[::1]:", "ws://127.0.0.1:", 1);
+    // Bind the socket to the numeric address that answered discovery, before any
+    // Runtime command is sent. Never retry a command on another address.
+    let websocket_url = local_debugger_url(websocket_url, port, &loopback_host)?;
     let (mut socket, _) = connect(websocket_url.as_str())
         .map_err(|error| RpcError::new("CDP_WEBSOCKET_FAILED", error.to_string()))?;
     socket
@@ -947,18 +944,46 @@ $result=[pscustomobject]@{
     }))
 }
 
-fn cdp_json(port: u16, path: &str) -> Result<Value, RpcError> {
-    let mut stream = TcpStream::connect_timeout(
-        &format!("127.0.0.1:{port}").parse().expect("loopback"),
-        Duration::from_millis(500),
-    )
-    .map_err(|error| RpcError::new("CDP_UNAVAILABLE", error.to_string()))?;
+fn local_debugger_url(url: &str, port: u16, host: &str) -> Result<String, RpcError> {
+    for advertised in ["127.0.0.1", "localhost", "[::1]"] {
+        let prefix = format!("ws://{advertised}:{port}/");
+        if let Some(path) = url.strip_prefix(&prefix) {
+            return Ok(format!("ws://{host}:{port}/{path}"));
+        }
+    }
+    Err(RpcError::new(
+        "CDP_TARGET_INVALID",
+        "debugger URL is not the selected local port",
+    ))
+}
+
+fn cdp_json(port: u16, path: &str) -> Result<(Value, String), RpcError> {
+    let mut selected = None;
+    let mut last_error = None;
+    for host in ["127.0.0.1", "[::1]"] {
+        match TcpStream::connect_timeout(
+            &format!("{host}:{port}").parse().expect("numeric loopback"),
+            Duration::from_millis(500),
+        ) {
+            Ok(stream) => {
+                selected = Some((stream, host));
+                break;
+            }
+            Err(error) => last_error = Some(error),
+        }
+    }
+    let (mut stream, host) = selected.ok_or_else(|| {
+        RpcError::new(
+            "CDP_UNAVAILABLE",
+            last_error.expect("both connections failed").to_string(),
+        )
+    })?;
     stream
         .set_read_timeout(Some(Duration::from_secs(2)))
         .map_err(|error| RpcError::new("CDP_UNAVAILABLE", error.to_string()))?;
     write!(
         stream,
-        "GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
+        "GET {path} HTTP/1.1\r\nHost: {host}:{port}\r\nConnection: close\r\n\r\n"
     )
     .map_err(|error| RpcError::new("CDP_UNAVAILABLE", error.to_string()))?;
     let mut response = Vec::new();
@@ -984,6 +1009,7 @@ fn cdp_json(port: u16, path: &str) -> Result<Value, RpcError> {
         .map(|position| &response[position + 4..])
         .ok_or_else(|| RpcError::new("CDP_INVALID_RESPONSE", "missing HTTP response body"))?;
     serde_json::from_slice(body)
+        .map(|value| (value, host.to_string()))
         .map_err(|error| RpcError::new("CDP_INVALID_RESPONSE", error.to_string()))
 }
 
@@ -1227,5 +1253,56 @@ mod tests {
         assert_eq!(state["example"]["other"], 1);
         assert_eq!(state["example"]["use_file_resource"], true);
         assert_eq!(state["example"]["hotfix"]["is_enabled"], false);
+    }
+    #[test]
+    fn debugger_url_follows_selected_numeric_loopback_and_rejects_other_hosts() {
+        for host in ["127.0.0.1", "[::1]"] {
+            assert_eq!(
+                local_debugger_url("ws://localhost:9222/devtools/page/a", 9222, host).unwrap(),
+                format!("ws://{host}:9222/devtools/page/a")
+            );
+        }
+        for bad in [
+            "ws://example.com:9222/a",
+            "ws://localhost:9223/a",
+            "ws://user@localhost:9222/a",
+        ] {
+            assert!(local_debugger_url(bad, 9222, "[::1]").is_err());
+        }
+    }
+
+    #[test]
+    fn cdp_discovery_supports_each_loopback_family() {
+        for address in ["127.0.0.1:0", "[::1]:0"] {
+            let listener = std::net::TcpListener::bind(address).unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let worker = thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                let mut request = [0_u8; 4096];
+                let count = stream.read(&mut request).unwrap();
+                assert!(
+                    String::from_utf8_lossy(&request[..count]).starts_with("GET /json HTTP/1.1")
+                );
+                stream
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n[]",
+                    )
+                    .unwrap();
+            });
+            let (pages, host) = cdp_json(port, "/json").unwrap();
+            assert_eq!(pages, json!([]));
+            assert_eq!(
+                host,
+                if address.starts_with('[') {
+                    "[::1]"
+                } else {
+                    "127.0.0.1"
+                }
+            );
+            worker.join().unwrap();
+        }
     }
 }
