@@ -2972,6 +2972,25 @@ fn render_authority_resource(template: &str, params: &Value) -> Result<String, R
     Ok(rendered)
 }
 
+// Match the launcher's platform-specific port behavior without inventing a
+// debug listener for ordinary Windows applications.
+fn render_execution_resource(
+    template: &str,
+    action: &str,
+    params: &Value,
+    default_launch_port: Option<u16>,
+) -> Result<Option<String>, RpcError> {
+    if action == "application.launch" && template == "debug-port:${remoteDebuggingPort}" {
+        let port = if params.get("remoteDebuggingPort").is_some() {
+            Some(required_port(params, "remoteDebuggingPort")?)
+        } else {
+            default_launch_port
+        };
+        return Ok(port.map(|port| format!("debug-port:{port}")));
+    }
+    render_authority_resource(template, params).map(Some)
+}
+
 fn execution_resources(
     action: &str,
     params: &Value,
@@ -2993,8 +3012,22 @@ fn execution_resources(
     let mut resources = contract
         .locks
         .iter()
-        .map(|lock| render_authority_resource(&lock.key, params))
-        .collect::<Result<Vec<_>, _>>()?;
+        .map(|lock| {
+            render_execution_resource(
+                &lock.key,
+                canonical,
+                params,
+                if cfg!(target_os = "macos") {
+                    Some(9222)
+                } else {
+                    None
+                },
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
     if !matches!(contract.effect, Effect::ReadOnly) && resources.is_empty() {
         let scope = params
             .get("_workspaceSessionId")
@@ -3569,6 +3602,61 @@ fn io_error(code: &str, path: &Path, error: std::io::Error) -> RpcError {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn launch_resources_match_optional_and_default_ports() {
+        let params = serde_json::json!({"bundleIdentifier":"owned.app"});
+        let debug = "debug-port:${remoteDebuggingPort}";
+        assert_eq!(
+            super::render_execution_resource(debug, "application.launch", &params, None).unwrap(),
+            None
+        );
+        assert_eq!(
+            super::render_execution_resource(debug, "application.launch", &params, Some(9222))
+                .unwrap(),
+            Some("debug-port:9222".into())
+        );
+        assert_eq!(
+            super::render_execution_resource(
+                "application-instance:${bundleIdentifier}",
+                "application.launch",
+                &params,
+                None
+            )
+            .unwrap(),
+            Some("application-instance:owned.app".into())
+        );
+        for default in [None, Some(9222)] {
+            assert_eq!(
+                super::render_execution_resource(
+                    debug,
+                    "application.launch",
+                    &serde_json::json!({"remoteDebuggingPort":9333}),
+                    default
+                )
+                .unwrap(),
+                Some("debug-port:9333".into())
+            );
+            for invalid in [
+                serde_json::json!(0),
+                serde_json::json!(65536),
+                serde_json::json!(-1),
+                serde_json::json!("9333"),
+                serde_json::Value::Null,
+            ] {
+                assert!(
+                    super::render_execution_resource(
+                        debug,
+                        "application.launch",
+                        &serde_json::json!({"remoteDebuggingPort":invalid}),
+                        default
+                    )
+                    .is_err()
+                );
+            }
+        }
+        assert!(super::render_execution_resource(debug, "ui.inspect", &params, None).is_err());
+    }
+
     #[test]
     fn desktop_executor_reads_outside_legacy_roots_but_protects_credentials_and_writes() {
         let directory = tempfile::tempdir().unwrap();
