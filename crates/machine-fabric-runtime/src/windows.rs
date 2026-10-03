@@ -1282,9 +1282,19 @@ mod tests {
                     .set_read_timeout(Some(Duration::from_secs(2)))
                     .unwrap();
                 let mut request = [0_u8; 4096];
-                let count = stream.read(&mut request).unwrap();
+                let mut count = 0;
+                while !request[..count].windows(4).any(|part| part == b"\r\n\r\n") {
+                    assert!(
+                        count < request.len(),
+                        "HTTP request headers exceed test limit"
+                    );
+                    let received = stream.read(&mut request[count..]).unwrap();
+                    assert!(received > 0, "HTTP request ended before complete headers");
+                    count += received;
+                }
                 assert!(
-                    String::from_utf8_lossy(&request[..count]).starts_with("GET /json HTTP/1.1")
+                    String::from_utf8_lossy(&request[..count])
+                        .starts_with("GET /json HTTP/1.1\r\n")
                 );
                 stream
                     .write_all(
