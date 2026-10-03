@@ -13,10 +13,13 @@ pub enum ComputerUseCommand {
         #[arg(long)]
         executor: String,
     },
-    /// List the target desktop FIFO (credentials are redacted).
+    /// List current desktop sessions and history counts (credentials are redacted).
     Queue {
         #[arg(long)]
         executor: String,
+        /// Include terminal sessions from the durable history.
+        #[arg(long)]
+        history: bool,
     },
     /// Query a submitted session; only state=active permits tool calls.
     Status {
@@ -144,9 +147,11 @@ fn invoke(
 }
 pub fn run(socket: &Path, command: ComputerUseCommand) -> Result<()> {
     let result = match command {
-        ComputerUseCommand::Queue { executor } => {
-            rpc(socket, "desktop.list", json!({"executorId":executor}))
-        }
+        ComputerUseCommand::Queue { executor, history } => rpc(
+            socket,
+            "desktop.list",
+            json!({"executorId":executor,"includeTerminal":history}),
+        ),
         ComputerUseCommand::Status {
             executor,
             owner,
@@ -221,6 +226,32 @@ pub fn run(socket: &Path, command: ComputerUseCommand) -> Result<()> {
 #[cfg(test)]
 mod diagnostic_tests {
     use super::*;
+
+    #[test]
+    fn queue_defaults_to_live_sessions_and_history_is_explicit() {
+        use clap::Parser;
+        #[derive(Parser)]
+        struct Arguments {
+            #[command(subcommand)]
+            command: ComputerUseCommand,
+        }
+        for (args, expected) in [
+            (vec!["cu", "queue", "--executor", "desktop"], false),
+            (
+                vec!["cu", "queue", "--executor", "desktop", "--history"],
+                true,
+            ),
+        ] {
+            let parsed = Arguments::try_parse_from(args).unwrap();
+            match parsed.command {
+                ComputerUseCommand::Queue { executor, history } => {
+                    assert_eq!(executor, "desktop");
+                    assert_eq!(history, expected);
+                }
+                _ => panic!("expected queue command"),
+            }
+        }
+    }
 
     #[test]
     fn preserves_transport_metadata_without_private_payload() {
