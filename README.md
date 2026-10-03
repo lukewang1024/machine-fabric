@@ -53,6 +53,14 @@ through the normal SSH configuration.
 
 ## Desktop Executor paths
 
+`machine-fabric computer-use queue --executor <id>` lists current sessions and
+history counts without returning completed sessions. Add `--history` when
+investigating past sessions. Active, queued, draining, and unknown states remain
+visible; blocked, in-flight, and maintenance status are reported in either mode.
+This changes only the response, not durable history or desktop admission.
+Raw `desktop.list` retains its full-history default for existing callers; pass
+`includeTerminal: false` for the compact response. Session tokens remain redacted.
+
 The macOS and Windows installers start their Executors with `--path-policy
 desktop` and an explicit `--policy-home`. Direct file reads and application
 paths are open by default. The read deny list covers common credential

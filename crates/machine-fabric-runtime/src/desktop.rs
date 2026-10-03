@@ -239,9 +239,26 @@ impl DesktopQueue {
                 Ok(serde_json::to_value(self.jobs.last().unwrap()).unwrap())
             }
             "desktop.list" => {
+                let include_terminal = match params.get("includeTerminal") {
+                    None => true,
+                    Some(Value::Bool(value)) => *value,
+                    Some(_) => {
+                        return Err(error("INVALID_PARAMS", "includeTerminal must be a boolean"));
+                    }
+                };
+                // Retain unknown states: hiding an unrecognized job could conceal
+                // contention or recovery work. This filters presentation only.
+                let terminal = |job: &Job| {
+                    matches!(
+                        job.state.as_str(),
+                        "completed" | "cancelled" | "expired" | "interrupted"
+                    )
+                };
+                let history_count = self.jobs.iter().filter(|job| terminal(job)).count();
                 let jobs: Vec<_> = self
                     .jobs
                     .iter()
+                    .filter(|job| include_terminal || !terminal(job))
                     .map(|j| {
                         let mut value = serde_json::to_value(j).unwrap();
                         value.as_object_mut().unwrap().remove("token");
@@ -249,7 +266,7 @@ impl DesktopQueue {
                     })
                     .collect();
                 Ok(
-                    json!({"jobs":jobs,"blocked":self.blocked,"inFlight":self.in_flight,"maintenanceOwner":self.maintenance_owner,"safePoint":self.maintenance_owner.is_some() && !self.blocked && !self.in_flight && self.active().is_none()}),
+                    json!({"jobs":jobs,"historyCount":history_count,"totalCount":self.jobs.len(),"historyIncluded":include_terminal,"blocked":self.blocked,"inFlight":self.in_flight,"maintenanceOwner":self.maintenance_owner,"safePoint":self.maintenance_owner.is_some() && !self.blocked && !self.in_flight && self.active().is_none()}),
                 )
             }
             "desktop.get" | "desktop.renew" | "desktop.finish" | "desktop.cancel" => {
@@ -392,6 +409,64 @@ mod tests {
     }
     fn credentials(job: &Value) -> Value {
         json!({"owner":job["owner"],"token":job["token"]})
+    }
+    #[test]
+    fn live_listing_keeps_contention_and_recovery_without_historical_payload() {
+        let mut q = DesktopQueue::default();
+        let first = submit(&mut q, "current");
+        let prototype = q.jobs[0].clone();
+        q.jobs.clear();
+        for n in 0..1000 {
+            let mut job = prototype.clone();
+            job.id = format!("history-{n}");
+            job.state = ["completed", "cancelled", "expired", "interrupted"][n % 4].into();
+            q.jobs.push(job);
+        }
+        for state in ["active", "queued", "draining", "future-recovery-state"] {
+            let mut job = prototype.clone();
+            job.id = state.into();
+            job.state = state.into();
+            q.jobs.push(job);
+        }
+        q.blocked = true;
+        q.in_flight = true;
+        let before = serde_json::to_value(&q).unwrap();
+        let live = q
+            .command("desktop.list", &json!({"includeTerminal":false}))
+            .unwrap();
+        assert_eq!(live["historyCount"], 1000);
+        assert_eq!(live["totalCount"], 1004);
+        assert_eq!(live["historyIncluded"], false);
+        assert_eq!(live["blocked"], true);
+        assert_eq!(live["inFlight"], true);
+        assert_eq!(live["safePoint"], false);
+        let states: Vec<_> = live["jobs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|j| j["state"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            states,
+            ["active", "queued", "draining", "future-recovery-state"]
+        );
+        assert!(!live.to_string().contains(first["token"].as_str().unwrap()));
+        let legacy = q.command("desktop.list", &json!({})).unwrap();
+        let history = q
+            .command("desktop.list", &json!({"includeTerminal":true}))
+            .unwrap();
+        assert_eq!(legacy, history);
+        assert_eq!(history["jobs"].as_array().unwrap().len(), 1004);
+        assert!(live.to_string().len() * 50 < history.to_string().len());
+        assert_eq!(serde_json::to_value(&q).unwrap(), before);
+        for malformed in [Value::Null, json!("false"), json!(0)] {
+            assert_eq!(
+                q.command("desktop.list", &json!({"includeTerminal":malformed}))
+                    .unwrap_err()
+                    .code,
+                "INVALID_PARAMS"
+            );
+        }
     }
     #[test]
     fn maintenance_drains_owner_and_preserves_fifo_across_restart() {
