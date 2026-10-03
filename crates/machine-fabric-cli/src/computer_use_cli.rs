@@ -1,7 +1,7 @@
 //! Thin CLI over an Executor's pinned Pi extension. All calls use the local Controller.
 use anyhow::{Result, bail};
 use clap::Subcommand;
-use machine_fabric_protocol::Request;
+use machine_fabric_protocol::{Request, RpcError};
 use machine_fabric_runtime::call_unix;
 use serde_json::{Value, json};
 use std::path::Path;
@@ -80,13 +80,47 @@ pub enum ComputerUseCommand {
         token: String,
     },
 }
+// Only expose bounded transport metadata, never extension payloads or credentials.
+fn format_rpc_error(error: &RpcError) -> String {
+    let mut diagnostic = serde_json::Map::new();
+    for key in ["transportReason", "operationOutcome"] {
+        if let Some(value) = error.details[key].as_str().filter(|v| v.len() <= 64) {
+            diagnostic.insert(key.into(), json!(value));
+        }
+    }
+    for key in ["receivedBytes", "maxResponseBytes"] {
+        if let Some(value) = error.details[key].as_u64() {
+            diagnostic.insert(key.into(), json!(value));
+        }
+    }
+    let host = &error.details["hostExit"];
+    if let Some(state) = host["state"]
+        .as_str()
+        .filter(|v| matches!(*v, "running" | "exited" | "unavailable" | "untracked"))
+    {
+        let mut exit = json!({"state": state});
+        for key in ["exitCode", "signal"] {
+            if let Some(value) = host[key].as_i64() {
+                exit[key] = json!(value);
+            }
+        }
+        diagnostic.insert("hostExit".into(), exit);
+    }
+    let base = format!("{}: {}", error.code, error.message);
+    if diagnostic.is_empty() {
+        base
+    } else {
+        format!("{base}; diagnostics={}", Value::Object(diagnostic))
+    }
+}
+
 fn rpc(socket: &Path, action: &str, params: Value) -> Result<Value> {
     let response = call_unix(socket, &Request::new(action, params))?;
     if !response.ok {
         let error = response
             .error
             .ok_or_else(|| anyhow::anyhow!("missing RPC error"))?;
-        bail!("{}: {}", error.code, error.message);
+        bail!("{}", format_rpc_error(&error));
     }
     Ok(response.result.unwrap_or(Value::Null))
 }
@@ -182,4 +216,35 @@ pub fn run(socket: &Path, command: ComputerUseCommand) -> Result<()> {
     }?;
     println!("{}", serde_json::to_string_pretty(&result)?);
     Ok(())
+}
+
+#[cfg(test)]
+mod diagnostic_tests {
+    use super::*;
+
+    #[test]
+    fn preserves_transport_metadata_without_private_payload() {
+        let mut error = RpcError::new("COMPUTER_USE_UNAVAILABLE", "host unavailable");
+        error.details = json!({"transportReason":"truncated_response",
+            "operationOutcome":"unknown", "receivedBytes":12, "maxResponseBytes":16777216,
+            "hostExit":{"state":"exited","exitCode":7,"signal":null,"token":"secret"},
+            "payload":"private", "token":"secret"});
+        let output = format_rpc_error(&error);
+        assert!(output.contains("truncated_response"));
+        assert!(output.contains("unknown"));
+        assert!(output.contains("\"exitCode\":7"));
+        assert!(!output.contains("private"));
+        assert!(!output.contains("secret"));
+        assert!(!output.contains("token"));
+    }
+
+    #[test]
+    fn rejects_unbounded_and_malformed_diagnostics() {
+        let mut error = RpcError::new("FAILED", "unchanged");
+        error.details = json!({"transportReason":"x".repeat(65),
+            "receivedBytes":-1,"hostExit":{"state":"secret"}});
+        assert_eq!(format_rpc_error(&error), "FAILED: unchanged");
+        error.details = Value::Null;
+        assert_eq!(format_rpc_error(&error), "FAILED: unchanged");
+    }
 }

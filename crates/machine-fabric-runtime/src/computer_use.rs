@@ -39,6 +39,16 @@ fn failed(error: impl std::fmt::Display) -> RpcError {
     RpcError::new("COMPUTER_USE_UNAVAILABLE", error.to_string())
 }
 
+#[cfg(windows)]
+fn host_exit_details(status: u32) -> Value {
+    json!({"state":"exited", "exitCode":status, "signal":null})
+}
+#[cfg(not(windows))]
+fn host_exit_details(status: std::process::ExitStatus) -> Value {
+    use std::os::unix::process::ExitStatusExt;
+    json!({"state":"exited", "exitCode":status.code(), "signal":status.signal()})
+}
+
 fn retire_exited_host(host: &mut Option<Host>) {
     // The host exits after its idle timeout. Retire a proven-dead local child
     // before submitting a new request, rather than treating its stale socket
@@ -57,10 +67,20 @@ fn read_frame(reader: &mut BufReader<TcpStream>) -> Result<Value, RpcError> {
         .take(MAX_RESPONSE + 1)
         .read_until(b'\n', &mut bytes)
         .map_err(failed)?;
-    if bytes.is_empty() || bytes.len() as u64 > MAX_RESPONSE || bytes.last() != Some(&b'\n') {
-        return Err(failed(
-            "host closed or response exceeded 16 MiB; operation outcome may be unknown",
-        ));
+    let reason = if bytes.is_empty() {
+        Some("host_eof")
+    } else if bytes.len() as u64 > MAX_RESPONSE {
+        Some("response_limit_exceeded")
+    } else if bytes.last() != Some(&b'\n') {
+        Some("truncated_response")
+    } else {
+        None
+    };
+    if let Some(reason) = reason {
+        let mut error = failed(format!("{reason}; operation outcome may be unknown"));
+        error.details = json!({"transportReason": reason, "receivedBytes": bytes.len(),
+            "maxResponseBytes": MAX_RESPONSE, "operationOutcome": "unknown"});
+        return Err(error);
     }
     serde_json::from_slice(&bytes).map_err(failed)
 }
@@ -176,6 +196,23 @@ impl ComputerUseService {
                 response["result"].clone()
             })
         })();
+        let result = result.map_err(|mut error| {
+            if error.code == "COMPUTER_USE_UNAVAILABLE" {
+                let observation = match host.child.as_mut() {
+                    None => json!({"state":"untracked"}),
+                    Some(child) => match child.try_wait() {
+                        Ok(None) => json!({"state":"running"}),
+                        Ok(Some(status)) => host_exit_details(status),
+                        Err(_) => json!({"state":"unavailable"}),
+                    },
+                };
+                if !error.details.is_object() {
+                    error.details = json!({});
+                }
+                error.details["hostExit"] = observation;
+            }
+            error
+        });
         // Never replay actions after a timeout, disconnect, or ambiguous result.
         if method == "close"
             || result
@@ -398,15 +435,59 @@ mod tests {
         fs::write(root.join("node-path"), "relative/node").unwrap();
         assert!(node_executable(root).is_err());
     }
-    fn frame(bytes: &'static [u8]) -> Result<Value, RpcError> {
+    fn frame(bytes: &[u8]) -> Result<Value, RpcError> {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
         let (mut server, _) = listener.accept().unwrap();
+        let bytes = bytes.to_vec();
         std::thread::spawn(move || {
-            server.write_all(bytes).unwrap();
+            server.write_all(&bytes).unwrap();
         });
         read_frame(&mut BufReader::new(client))
     }
+    #[cfg(not(windows))]
+    #[test]
+    fn exit_diagnostics_distinguish_exit_code_from_signal() {
+        use std::os::unix::process::ExitStatusExt;
+        let normal = host_exit_details(std::process::ExitStatus::from_raw(7 << 8));
+        assert_eq!(normal["exitCode"], 7);
+        assert!(normal["signal"].is_null());
+        let signaled = host_exit_details(std::process::ExitStatus::from_raw(9));
+        assert!(signaled["exitCode"].is_null());
+        assert_eq!(signaled["signal"], 9);
+    }
+    #[cfg(windows)]
+    #[test]
+    fn exit_diagnostics_record_windows_process_status() {
+        let observation = host_exit_details(7);
+        assert_eq!(observation["exitCode"], 7);
+        assert!(observation["signal"].is_null());
+    }
+
+    #[test]
+    fn failed_frame_reports_cause_without_payload_or_retry_authorization() {
+        for (bytes, reason) in [
+            (b"".as_slice(), "host_eof"),
+            (b"private payload".as_slice(), "truncated_response"),
+        ] {
+            let error = frame(bytes).unwrap_err();
+            assert_eq!(error.code, "COMPUTER_USE_UNAVAILABLE");
+            assert_eq!(error.details["transportReason"], reason);
+            assert_eq!(error.details["receivedBytes"], bytes.len());
+            assert_eq!(error.details["operationOutcome"], "unknown");
+            assert!(!error.retryable);
+            assert!(
+                !serde_json::to_string(&error)
+                    .unwrap()
+                    .contains("private payload")
+            );
+        }
+        let error = frame(&vec![b'x'; MAX_RESPONSE as usize + 1]).unwrap_err();
+        assert_eq!(error.details["transportReason"], "response_limit_exceeded");
+        assert_eq!(error.details["receivedBytes"], MAX_RESPONSE + 1);
+        assert!(!error.retryable);
+    }
+
     #[test]
     fn rejects_truncated_or_invalid_frames() {
         assert!(frame(b"{\"ok\":true}").is_err());
