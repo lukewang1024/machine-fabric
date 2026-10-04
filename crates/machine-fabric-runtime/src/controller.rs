@@ -36,6 +36,72 @@ const TASK_LIST_DEFAULT_LIMIT: usize = 100;
 const TASK_LIST_MAX_LIMIT: usize = 200;
 const TASK_SUMMARY_TEXT_LIMIT: usize = 512;
 
+fn unavailable_executor_probe(code: &str) -> Value {
+    json!({
+        "available": false,
+        "status": "unreachable",
+        "probe": {"status": "failed", "errorCode": code, "scope": "executor-route"},
+    })
+}
+
+/// Report route failure without echoing transport commands, paths or error data.
+fn executor_availability_result(
+    endpoint: &ExecutorEndpoint,
+    response: anyhow::Result<Response>,
+) -> Value {
+    match response {
+        Ok(response) if response.ok => match response.result {
+            Some(value) if value.is_object() && value["available"].is_boolean() => value,
+            _ => unavailable_executor_probe("INVALID_AVAILABILITY_RESPONSE"),
+        },
+        Ok(response) => {
+            let code = response.error.as_ref().map(|error| error.code.as_str());
+            let code = code
+                .filter(|code| {
+                    !code.is_empty()
+                        && code.len() <= 64
+                        && code.bytes().next().is_some_and(|c| c.is_ascii_uppercase())
+                        && code
+                            .bytes()
+                            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == b'_')
+                })
+                .unwrap_or("EXECUTOR_PROBE_FAILED");
+            unavailable_executor_probe(code)
+        }
+        Err(error) => {
+            let kind = error.chain().find_map(|cause| {
+                cause
+                    .downcast_ref::<std::io::Error>()
+                    .map(std::io::Error::kind)
+            });
+            let code = match kind {
+                Some(std::io::ErrorKind::NotFound)
+                    if matches!(endpoint, ExecutorEndpoint::Local { .. }) =>
+                {
+                    "EXECUTOR_ENDPOINT_NOT_FOUND"
+                }
+                Some(
+                    std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::AddrNotAvailable,
+                ) => "EXECUTOR_ENDPOINT_UNAVAILABLE",
+                Some(std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock) => {
+                    "EXECUTOR_PROBE_TIMEOUT"
+                }
+                Some(
+                    std::io::ErrorKind::UnexpectedEof
+                    | std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::ConnectionAborted
+                    | std::io::ErrorKind::BrokenPipe,
+                ) => "EXECUTOR_CONNECTION_CLOSED",
+                _ if error.chain().any(|cause| cause.is::<serde_json::Error>()) => {
+                    "INVALID_EXECUTOR_RESPONSE"
+                }
+                _ => "EXECUTOR_TRANSPORT_FAILED",
+            };
+            unavailable_executor_probe(code)
+        }
+    }
+}
+
 fn traced_request(action: impl Into<String>, params: Value) -> Request {
     let mut request = Request::new(action, params);
     CURRENT_TRACE.with(|current| {
@@ -274,14 +340,13 @@ impl Controller {
                     if requested_capability.is_some() && capabilities.is_empty() {
                         continue;
                     }
-                    let availability = call_executor(
+                    let availability = executor_availability_result(
                         &executor.endpoint,
-                        &traced_request("availability", json!({"resources": resources})),
-                    )
-                    .ok()
-                    .filter(|response| response.ok)
-                    .and_then(|response| response.result)
-                    .unwrap_or_else(|| json!({"available": false, "status": "unreachable"}));
+                        call_executor(
+                            &executor.endpoint,
+                            &traced_request("availability", json!({"resources": resources})),
+                        ),
+                    );
                     let observed_health = if availability["status"] == "unreachable" {
                         HealthStatus::Offline
                     } else {
@@ -3483,6 +3548,12 @@ mod tests {
         assert_eq!(executor["health"], "offline");
         assert_eq!(executor["registeredHealth"], "ready");
         assert_eq!(executor["availability"]["status"], "unreachable");
+        assert_eq!(executor["availability"]["probe"]["scope"], "executor-route");
+        #[cfg(unix)]
+        assert_eq!(
+            executor["availability"]["probe"]["errorCode"],
+            "EXECUTOR_ENDPOINT_NOT_FOUND"
+        );
         assert_eq!(executor["capabilities"][0]["name"], "command.run");
         assert!(executor["capabilities"][0].get("inputSchema").is_none());
 
@@ -3492,6 +3563,86 @@ mod tests {
         ));
         assert!(description.ok, "{:?}", description.error);
         assert!(description.result.unwrap().get("inputSchema").is_some());
+    }
+
+    #[test]
+    fn availability_capacity_exhaustion_is_not_a_route_failure() {
+        let endpoint = ExecutorEndpoint::Local {
+            socket: "unused.sock".to_owned(),
+        };
+        let value = json!({"executorId":"busy-node", "available":false, "active":4, "maximum":4});
+        let observed =
+            executor_availability_result(&endpoint, Ok(Response::success("probe", value.clone())));
+        assert_eq!(observed, value);
+        assert!(observed.get("probe").is_none());
+    }
+
+    #[test]
+    fn availability_rejects_malformed_success_and_redacts_failed_probe_payloads() {
+        let endpoint = ExecutorEndpoint::Local {
+            socket: "private-path.sock".to_owned(),
+        };
+        for value in [
+            Value::Null,
+            json!([]),
+            json!({"available":"true", "secret":"never-echo"}),
+        ] {
+            let observed =
+                executor_availability_result(&endpoint, Ok(Response::success("probe", value)));
+            assert_eq!(
+                observed["probe"]["errorCode"],
+                "INVALID_AVAILABILITY_RESPONSE"
+            );
+            assert!(!observed.to_string().contains("never-echo"));
+        }
+        let failed = executor_availability_result(
+            &endpoint,
+            Ok(Response::failure(
+                "probe",
+                RpcError::new(
+                    "PEER_RESPONSE_TIMEOUT",
+                    "private command and credentials: never-echo",
+                ),
+            )),
+        );
+        assert_eq!(failed["probe"]["errorCode"], "PEER_RESPONSE_TIMEOUT");
+        assert!(!failed.to_string().contains("never-echo"));
+        let invalid_code = executor_availability_result(
+            &endpoint,
+            Ok(Response::failure(
+                "probe",
+                RpcError::new("SECRET=never-echo\ncommand", "never-echo"),
+            )),
+        );
+        assert_eq!(invalid_code["probe"]["errorCode"], "EXECUTOR_PROBE_FAILED");
+        assert!(!invalid_code.to_string().contains("never-echo"));
+    }
+
+    #[test]
+    fn availability_missing_local_endpoint_differs_from_missing_transport_helper() {
+        let local = ExecutorEndpoint::Local {
+            socket: "private-path.sock".to_owned(),
+        };
+        let missing = || {
+            anyhow::Error::new(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "private path: never-echo",
+            ))
+            .context("private context: never-echo")
+        };
+        let observed = executor_availability_result(&local, Err(missing()));
+        assert_eq!(
+            observed["probe"]["errorCode"],
+            "EXECUTOR_ENDPOINT_NOT_FOUND"
+        );
+        assert!(!observed.to_string().contains("never-echo"));
+        let command = ExecutorEndpoint::Command {
+            executable: "private-helper".to_owned(),
+            args: vec![],
+            cwd: None,
+        };
+        let observed = executor_availability_result(&command, Err(missing()));
+        assert_eq!(observed["probe"]["errorCode"], "EXECUTOR_TRANSPORT_FAILED");
     }
 
     #[test]
