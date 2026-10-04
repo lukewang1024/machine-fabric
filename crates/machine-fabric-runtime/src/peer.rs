@@ -20,9 +20,15 @@ const PEER_STABLE_CONNECTION: Duration = Duration::from_secs(30);
 
 fn peer_response_timeout(action: &str) -> Duration {
     match action {
-        "ping" | "status" | "availability" | "capability.list" | "capability.describe" => {
-            Duration::from_secs(10)
-        }
+        "ping"
+        | "status"
+        | "availability"
+        | "capability.list"
+        | "capability.describe"
+        | "desktop.list"
+        | "desktop.get"
+        | "process.get"
+        | "process.list" => Duration::from_secs(10),
         _ => Duration::from_secs(3600),
     }
 }
@@ -691,13 +697,17 @@ mod tests {
     use std::os::unix::net::UnixStream;
 
     #[test]
-    fn health_deadlines_do_not_shorten_action_or_build_waits() {
+    fn readonly_diagnostics_do_not_shorten_action_or_build_waits() {
         for action in [
             "ping",
             "status",
             "availability",
             "capability.list",
             "capability.describe",
+            "desktop.list",
+            "desktop.get",
+            "process.get",
+            "process.list",
         ] {
             assert_eq!(peer_response_timeout(action), Duration::from_secs(10));
         }
@@ -706,6 +716,11 @@ mod tests {
             "computer-use.call",
             "computer-use.tools",
             "desktop.finish",
+            "desktop.recover",
+            "desktop.maintenance",
+            "desktop.submit",
+            "process.start",
+            "process.stop",
         ] {
             assert_eq!(peer_response_timeout(action), Duration::from_secs(3600));
         }
