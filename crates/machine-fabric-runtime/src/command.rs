@@ -76,13 +76,13 @@ impl Tree {
             return Err(failed(std::io::Error::last_os_error()));
         }
         let tree = Self(handle);
-        let mut limits: JOB_OBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
+        let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
         limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
         if unsafe {
             SetInformationJobObject(
                 handle,
                 JobObjectExtendedLimitInformation,
-                (&limits as *const JOB_OBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
+                (&limits as *const JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
                 std::mem::size_of_val(&limits) as u32,
             )
         } == 0
