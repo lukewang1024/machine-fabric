@@ -189,3 +189,11 @@ Builds, Computer Use calls and desktop/process mutations retain their existing
 completion waits. A peer response timeout does not cancel remote execution or
 prove that an input was not sent. Keep the original request identity, reconcile
 its effect and desktop admission state, and never automatically replay input.
+
+Unix RPC endpoints are held by one listener generation using an exclusive,
+owner-only lock file. A reconnect cannot replace a live endpoint. Peer role
+listeners bind before the bridge is announced and stop before the disconnected
+bridge returns. Cleanup removes only the socket inode owned by that generation;
+an older generation cannot remove a replacement endpoint. Persistent `.lock`
+files are intentional and must not be removed while a listener is running.
+Disconnected bridges reject new requests and do not replay pending requests.
