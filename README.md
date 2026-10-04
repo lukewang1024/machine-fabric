@@ -38,6 +38,15 @@ resource to keep the response small. `capability.describe` returns the
 selected input/output contract. The normal `capability.invoke` API creates a
 task on the local Controller and routes the call to the chosen Executor.
 
+If an availability probe fails, `availability.probe` supplies a bounded
+`errorCode` and `scope: executor-route`. Missing local endpoints, unavailable
+connections, closed connections, timeouts and malformed replies are distinct;
+valid remote RPC error codes are preserved. Raw transport errors, command
+arguments and error payloads are omitted. `health: offline` describes this
+Executor route, not proof that the physical machine or its desktop is off.
+An Executor that responds with `available: false` because capacity is full
+remains reachable; capacity exhaustion is not reported as a transport failure.
+
 ## A common three-machine arrangement
 
 `examples/mac-linux-windows.yaml` describes a Mac Agent node, a Linux build
