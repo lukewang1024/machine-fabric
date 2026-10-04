@@ -172,3 +172,11 @@ release management. Runtime installation uses the internal CDN only.
 The local CLI communicates with the node Controller over Unix sockets or
 Windows Named Pipes. State and logs are stored under the platform's normal
 XDG/application data locations.
+
+Read-only peer health, desktop queue and managed process status requests have a
+10-second response deadline. This bounds diagnostics when a connected peer
+stops responding; cached registration health alone is not live confirmation.
+Builds, Computer Use calls and desktop/process mutations retain their existing
+completion waits. A peer response timeout does not cancel remote execution or
+prove that an input was not sent. Keep the original request identity, reconcile
+its effect and desktop admission state, and never automatically replay input.
