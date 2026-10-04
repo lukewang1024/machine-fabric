@@ -945,7 +945,7 @@ impl ExecutorRuntime {
             }
             "command.run" => self.run_command(&params),
             "artifact.build" => {
-                let result = self.run_command(&params)?;
+                let result = self.run_command_with_default(&params, 3_600_000)?;
                 let artifact_path = self.path(&params, "artifactPath", true)?;
                 let metadata = fs::metadata(&artifact_path)
                     .map_err(|error| io_error("ARTIFACT_READ_FAILED", &artifact_path, error))?;
@@ -2010,6 +2010,14 @@ impl ExecutorRuntime {
     }
 
     fn run_command(&self, params: &Value) -> Result<Value, RpcError> {
+        self.run_command_with_default(params, 300_000)
+    }
+
+    fn run_command_with_default(
+        &self,
+        params: &Value,
+        default_timeout: u64,
+    ) -> Result<Value, RpcError> {
         let cwd_input = required_str(params, "cwd")?;
         let cwd = self.write_path(params, "cwd", true)?;
         let argv = string_array(params, "argv")?;
@@ -2025,13 +2033,8 @@ impl ExecutorRuntime {
             .transpose()
             .map_err(|error| RpcError::new("INVALID_PARAMS", error.to_string()))?
             .unwrap_or_default();
-        let output = Command::new(&argv[0])
-            .args(&argv[1..])
-            .current_dir(&cwd)
-            .envs(env)
-            .stdin(Stdio::null())
-            .output()
-            .map_err(|error| RpcError::new("COMMAND_FAILED", error.to_string()))?;
+        let timeout = crate::command::timeout_ms(params.get("timeoutMs"), default_timeout)?;
+        let output = crate::command::run(&argv, &cwd, &env, timeout)?;
         let stdout = bounded_output(&output.stdout);
         let stderr = bounded_output(&output.stderr);
         if !output.status.success() {
@@ -2250,10 +2253,11 @@ fn contract(name: &str, effect: Effect) -> CapabilityDescriptor {
                 "cwd": {"type": "string"},
                 "argv": {"type": "array", "items": {"type": "string"}},
                 "env": {"type": "object", "additionalProperties": {"type": "string"}},
-                "approvalDigest": {"type": "string"}
+                "approvalDigest": {"type": "string"},
+                "timeoutMs": {"type": "integer", "minimum": 1, "maximum": 3_600_000, "default": 300_000}
             }),
             vec!["command:${cwd}"],
-            vec!["cwd", "argv", "env"],
+            vec!["cwd", "argv", "env", "timeoutMs"],
             3_600_000,
             RollbackStrategy::None,
             vec!["command-result"],
@@ -2266,10 +2270,18 @@ fn contract(name: &str, effect: Effect) -> CapabilityDescriptor {
                 "env": {"type": "object", "additionalProperties": {"type": "string"}},
                 "artifactPath": {"type": "string"},
                 "artifactType": {"type": "string"},
-                "approvalDigest": {"type": "string"}
+                "approvalDigest": {"type": "string"},
+                "timeoutMs": {"type": "integer", "minimum": 1, "maximum": 3_600_000, "default": 3_600_000}
             }),
             vec!["build:${artifactPath}"],
-            vec!["cwd", "argv", "env", "artifactPath", "artifactType"],
+            vec![
+                "cwd",
+                "argv",
+                "env",
+                "artifactPath",
+                "artifactType",
+                "timeoutMs",
+            ],
             3_600_000,
             RollbackStrategy::None,
             vec!["build-log", "artifact-digest", "provenance"],
@@ -4310,6 +4322,43 @@ mod tests {
             fs::read_to_string(path).unwrap(),
             "before\nchanged\nafter\n"
         );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn command_timeout_releases_admission_and_rejects_invalid_deadlines_before_dispatch() {
+        let directory = tempfile::tempdir().unwrap();
+        let runtime =
+            ExecutorRuntime::new("bounded", vec![directory.path().to_path_buf()]).unwrap();
+        let marker = directory.path().join("not-dispatched");
+        let invalid = runtime.handle(Request::new(
+            "command.run",
+            json!({
+                "cwd": directory.path(), "argv": ["/usr/bin/touch", marker], "timeoutMs": 0
+            }),
+        ));
+        assert_eq!(invalid.error.unwrap().code, "INVALID_PARAMS");
+        assert!(!marker.exists());
+        let started = Instant::now();
+        let timed = runtime.handle(Request::new(
+            "command.run",
+            json!({
+                "cwd": directory.path(), "argv": ["/bin/sleep", "1"], "timeoutMs": 100
+            }),
+        ));
+        let error = timed.error.unwrap();
+        assert_eq!(error.code, "COMMAND_TIMED_OUT");
+        assert!(!error.retryable);
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert_eq!(runtime.execution_summary()["active"], 0);
+        let successor = runtime.handle(Request::new(
+            "command.run",
+            json!({
+                "cwd": directory.path(), "argv": ["/usr/bin/touch", marker], "timeoutMs": 1000
+            }),
+        ));
+        assert!(successor.ok, "{successor:?}");
+        assert!(marker.exists());
     }
 
     #[test]
