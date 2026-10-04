@@ -7,7 +7,11 @@ use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, Ordering},
+    mpsc,
+};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
@@ -109,6 +113,7 @@ type Pending = Arc<Mutex<HashMap<String, mpsc::Sender<Response>>>>;
 struct PeerBridge {
     writer: SharedWriter,
     pending: Pending,
+    connected: Arc<AtomicBool>,
 }
 
 impl PeerBridge {
@@ -131,10 +136,16 @@ impl PeerBridge {
             serde_json::json!({"peerRequestId": id.clone(), "requestId": request.request_id.clone(), "correlationId": request.correlation_id.clone(), "targetRole": target_role}),
         );
         let (sender, receiver) = mpsc::channel();
-        self.pending
-            .lock()
-            .expect("peer pending lock")
-            .insert(id.clone(), sender);
+        {
+            let mut pending = self.pending.lock().expect("peer pending lock");
+            if !self.connected.load(Ordering::Acquire) {
+                return Response::failure(
+                    request_id,
+                    RpcError::new("PEER_DISCONNECTED", "peer framed connection closed"),
+                );
+            }
+            pending.insert(id.clone(), sender);
+        }
         let frame = PeerFrame::Request {
             id: id.clone(),
             target_role,
@@ -289,8 +300,6 @@ pub fn read_peer_status(path: impl AsRef<Path>) -> Result<PeerStatus> {
 }
 
 fn connect_once(config: &PeerConnectConfig, connection_id: &str, generation: u64) -> Result<()> {
-    remove_socket(&config.expose_controller_socket)?;
-    remove_socket(&config.expose_executor_socket)?;
     let separator = if config.remote_windows { "\\" } else { "/" };
     let remote_controller = format!(
         "{}{}fabric{}{}-controller.sock",
@@ -363,36 +372,50 @@ fn connect_once(config: &PeerConnectConfig, connection_id: &str, generation: u64
         return Err(error);
     }
     let stdin = child.stdin.take().expect("SSH stdin is piped");
-    let (bridge, reader) = start_bridge(
+    let (bridge, reader) = match start_bridge(
         Box::new(stdout),
         Box::new(stdin),
         config.local_controller_socket.clone(),
         config.local_executor_socket.clone(),
         config.expose_controller_socket.clone(),
         config.expose_executor_socket.clone(),
-    )?;
-    for role in [TargetRole::Controller, TargetRole::Executor] {
-        let response = bridge.call(role, Request::new("ping", serde_json::Value::Null));
-        if !response.ok {
+    ) {
+        Ok(bridge) => bridge,
+        Err(error) => {
             let _ = child.kill();
-            return Err(anyhow!("remote {role:?} did not become ready"));
+            let _ = child.wait();
+            return Err(error);
         }
+    };
+    let ready = (|| -> Result<()> {
+        for role in [TargetRole::Controller, TargetRole::Executor] {
+            let response = bridge.call(role, Request::new("ping", serde_json::Value::Null));
+            if !response.ok {
+                return Err(anyhow!("remote {role:?} did not become ready"));
+            }
+        }
+        write_status(
+            &config.state_path,
+            &config.peer_id,
+            &config.host,
+            connection_id,
+            generation,
+            "ready",
+            None,
+        )
+    })();
+    if ready.is_err() {
+        // Drive framed EOF so the reader retires both listeners before retry.
+        let _ = child.kill();
+        let _ = child.wait();
     }
-    write_status(
-        &config.state_path,
-        &config.peer_id,
-        &config.host,
-        connection_id,
-        generation,
-        "ready",
-        None,
-    )?;
     let reader_result = reader
         .join()
-        .map_err(|_| anyhow!("peer reader thread panicked"))?;
+        .map_err(|_| anyhow!("peer reader thread panicked"));
     let _ = child.kill();
     let _ = child.wait();
-    reader_result
+    ready?;
+    reader_result?
 }
 
 fn start_bridge(
@@ -403,37 +426,50 @@ fn start_bridge(
     expose_controller_socket: PathBuf,
     expose_executor_socket: PathBuf,
 ) -> Result<(PeerBridge, thread::JoinHandle<Result<()>>)> {
-    remove_socket(&expose_controller_socket)?;
-    remove_socket(&expose_executor_socket)?;
     let bridge = PeerBridge {
         writer: Arc::new(Mutex::new(writer)),
         pending: Arc::new(Mutex::new(HashMap::new())),
+        connected: Arc::new(AtomicBool::new(true)),
     };
-    let cleanup_controller_socket = expose_controller_socket.clone();
-    let cleanup_executor_socket = expose_executor_socket.clone();
-    for (socket, role) in [
-        (expose_controller_socket, TargetRole::Controller),
-        (expose_executor_socket, TargetRole::Executor),
+    // Acquire both endpoints before any background listener starts. A partial
+    // bind failure drops the first endpoint and cannot announce a healthy peer.
+    let controller = RpcServer::new(expose_controller_socket).bind()?;
+    let executor = RpcServer::new(expose_executor_socket).bind()?;
+    let stop = Arc::new(AtomicBool::new(false));
+    let mut listeners = Vec::new();
+    for (server, role) in [
+        (controller, TargetRole::Controller),
+        (executor, TargetRole::Executor),
     ] {
         let handler_bridge = bridge.clone();
-        thread::spawn(move || {
-            if let Err(error) =
-                RpcServer::new(socket).serve(move |request| handler_bridge.call(role, request))
-            {
-                eprintln!("peer role listener failed: {error:#}");
-            }
-        });
+        let listener_stop = Arc::clone(&stop);
+        listeners.push(thread::spawn(move || {
+            server.serve(
+                move |request| handler_bridge.call(role, request),
+                Some(listener_stop),
+            )
+        }));
     }
     let reader_bridge = bridge.clone();
     let handle = thread::spawn(move || {
-        read_frames(
+        let result = read_frames(
             reader,
             reader_bridge,
             local_controller_socket,
             local_executor_socket,
-            cleanup_controller_socket,
-            cleanup_executor_socket,
-        )
+        );
+        stop.store(true, Ordering::Release);
+        // Retire and join both role listeners before this connection returns or
+        // its supervisor attempts another generation. Existing requests receive
+        // PEER_DISCONNECTED; no request or desktop input is replayed.
+        for listener in listeners {
+            match listener.join() {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => eprintln!("peer role listener failed: {error:#}"),
+                Err(_) => eprintln!("peer role listener panicked"),
+            }
+        }
+        result
     });
     Ok((bridge, handle))
 }
@@ -443,8 +479,6 @@ fn read_frames(
     bridge: PeerBridge,
     local_controller_socket: PathBuf,
     local_executor_socket: PathBuf,
-    expose_controller_socket: PathBuf,
-    expose_executor_socket: PathBuf,
 ) -> Result<()> {
     let result = read_frames_inner(
         reader,
@@ -452,17 +486,16 @@ fn read_frames(
         local_controller_socket,
         local_executor_socket,
     );
-    let pending = std::mem::take(&mut *bridge.pending.lock().expect("peer pending lock"));
+    let pending = {
+        let mut pending = bridge.pending.lock().expect("peer pending lock");
+        bridge.connected.store(false, Ordering::Release);
+        std::mem::take(&mut *pending)
+    };
     for sender in pending.into_values() {
         let _ = sender.send(Response::failure(
             "peer",
             RpcError::new("PEER_DISCONNECTED", "peer framed connection closed"),
         ));
-    }
-    for socket in [&expose_controller_socket, &expose_executor_socket] {
-        if let Err(error) = remove_socket(socket) {
-            eprintln!("remove disconnected peer socket failed: {error:#}");
-        }
     }
     result
 }
@@ -618,19 +651,6 @@ fn write_frame(writer: &SharedWriter, frame: &PeerFrame) -> Result<()> {
     Ok(())
 }
 
-#[cfg(unix)]
-fn remove_socket(path: &Path) -> Result<()> {
-    if path.exists() {
-        fs::remove_file(path).with_context(|| format!("remove stale socket {}", path.display()))?;
-    }
-    Ok(())
-}
-
-#[cfg(windows)]
-fn remove_socket(_path: &Path) -> Result<()> {
-    Ok(())
-}
-
 fn validate_id(name: &str, value: &str) -> Result<()> {
     if value.is_empty()
         || !value
@@ -735,6 +755,7 @@ mod tests {
         let bridge = PeerBridge {
             writer: Arc::new(Mutex::new(Box::new(writer))),
             pending: Arc::new(Mutex::new(HashMap::new())),
+            connected: Arc::new(AtomicBool::new(true)),
         };
         let request = Request::new("status", serde_json::Value::Null);
         let expected_id = request.request_id.clone();
@@ -894,5 +915,67 @@ mod tests {
         assert!(reader_thread.join().unwrap().is_err());
         assert!(!exposed_controller.exists());
         assert!(!exposed_executor.exists());
+    }
+    #[test]
+    fn peer_disconnect_retires_listeners_before_rebinding() {
+        let directory = tempfile::tempdir().unwrap();
+        let c = directory.path().join("peer-c.sock");
+        let e = directory.path().join("peer-e.sock");
+        for _ in 0..3 {
+            let (local, remote) = UnixStream::pair().unwrap();
+            let (bridge, reader) = start_bridge(
+                Box::new(local.try_clone().unwrap()),
+                Box::new(local),
+                directory.path().join("c.sock"),
+                directory.path().join("e.sock"),
+                c.clone(),
+                e.clone(),
+            )
+            .unwrap();
+            assert!(c.exists() && e.exists());
+            assert!(
+                start_bridge(
+                    Box::new(Cursor::new(Vec::<u8>::new())),
+                    Box::new(Vec::<u8>::new()),
+                    directory.path().join("c.sock"),
+                    directory.path().join("e.sock"),
+                    c.clone(),
+                    e.clone()
+                )
+                .is_err()
+            );
+            assert!(c.exists() && e.exists());
+            drop(remote);
+            assert!(reader.join().unwrap().is_err());
+            assert!(!c.exists() && !e.exists());
+            let response = bridge.call(
+                TargetRole::Executor,
+                Request::new("desktop.list", serde_json::Value::Null),
+            );
+            assert_eq!(response.error.unwrap().code, "PEER_DISCONNECTED");
+            assert!(bridge.pending.lock().unwrap().is_empty());
+            drop(bridge);
+        }
+    }
+
+    #[test]
+    fn second_role_bind_failure_releases_first_endpoint() {
+        let directory = tempfile::tempdir().unwrap();
+        let c = directory.path().join("peer-c.sock");
+        let e = directory.path().join("peer-e.sock");
+        let _holder = RpcServer::new(&e).bind().unwrap();
+        assert!(
+            start_bridge(
+                Box::new(Cursor::new(Vec::<u8>::new())),
+                Box::new(Vec::<u8>::new()),
+                directory.path().join("c.sock"),
+                directory.path().join("e.sock"),
+                c.clone(),
+                e.clone()
+            )
+            .is_err()
+        );
+        assert!(!c.exists());
+        assert!(e.exists());
     }
 }
