@@ -4,7 +4,7 @@ use machine_fabric_protocol::{Request, Response, RpcError};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{
@@ -645,10 +645,19 @@ fn has_required_roles(roles: &[TargetRole]) -> bool {
 
 fn write_frame(writer: &SharedWriter, frame: &PeerFrame) -> Result<()> {
     let mut writer = writer.lock().expect("peer writer lock");
-    serde_json::to_writer(&mut *writer, frame)?;
-    writer.write_all(b"\n")?;
-    writer.flush()?;
-    Ok(())
+    // Serialize under the existing whole-frame lock, but coalesce serde's
+    // small writes with bounded memory before reaching the peer pipe.
+    let mut buffered = BufWriter::with_capacity(64 * 1024, &mut *writer);
+    let result: Result<()> = (|| {
+        serde_json::to_writer(&mut buffered, frame)?;
+        buffered.write_all(b"\n")?;
+        buffered.flush()?;
+        Ok(())
+    })();
+    // BufWriter's Drop may write pending bytes after an error. Discard them
+    // explicitly: a partial peer write is unknown and must never be replayed.
+    let _ = buffered.into_parts();
+    result
 }
 
 fn validate_id(name: &str, value: &str) -> Result<()> {
@@ -977,5 +986,155 @@ mod tests {
         );
         assert!(!c.exists());
         assert!(e.exists());
+    }
+}
+
+#[cfg(test)]
+mod buffered_frame_tests {
+    use super::*;
+
+    #[derive(Default)]
+    struct Stats {
+        bytes: Vec<u8>,
+        writes: usize,
+        flushes: usize,
+    }
+    struct Probe {
+        stats: Arc<Mutex<Stats>>,
+        fail: bool,
+        max_write: usize,
+    }
+    impl Write for Probe {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            let mut stats = self.stats.lock().unwrap();
+            stats.writes += 1;
+            if self.fail {
+                return Err(std::io::Error::other("controlled pipe write failure"));
+            }
+            let count = bytes.len().min(self.max_write);
+            stats.bytes.extend_from_slice(&bytes[..count]);
+            Ok(count)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.stats.lock().unwrap().flushes += 1;
+            Ok(())
+        }
+    }
+    fn probe(fail: bool, max_write: usize) -> (Probe, Arc<Mutex<Stats>>) {
+        let stats = Arc::new(Mutex::new(Stats::default()));
+        (
+            Probe {
+                stats: stats.clone(),
+                fail,
+                max_write,
+            },
+            stats,
+        )
+    }
+    fn frame(count: usize) -> PeerFrame {
+        let nodes: Vec<_> = (0..count)
+            .map(|i| {
+                serde_json::json!({
+                    "ref": format!("@e{i}"), "role": "AXTextArea", "title": "Owned 中文🙂",
+                    "value": "quotes \" and newline\n", "focused": false
+                })
+            })
+            .collect();
+        PeerFrame::Response {
+            id: "controlled-frame".into(),
+            response: Response::success(
+                "controlled-request",
+                serde_json::json!({"outline": nodes}),
+            ),
+        }
+    }
+    #[test]
+    fn frames_preserve_protocol_bytes_and_coalesce_writes() {
+        for count in [1, 2000] {
+            let frame = frame(count);
+            let (mut baseline, baseline_stats) = probe(false, usize::MAX);
+            serde_json::to_writer(&mut baseline, &frame).unwrap();
+            baseline.write_all(b"\n").unwrap();
+            baseline.flush().unwrap();
+            let (buffered, buffered_stats) = probe(false, usize::MAX);
+            let writer: SharedWriter = Arc::new(Mutex::new(Box::new(buffered)));
+            write_frame(&writer, &frame).unwrap();
+            let baseline = baseline_stats.lock().unwrap();
+            let buffered = buffered_stats.lock().unwrap();
+            assert_eq!(buffered.bytes, baseline.bytes);
+            assert_eq!(buffered.flushes, 1);
+            if count == 1 {
+                assert_eq!(buffered.writes, 1);
+            } else {
+                assert!(buffered.writes * 100 < baseline.writes);
+            }
+            eprintln!(
+                "peer frame: nodes={count} bytes={} originalWrites={} bufferedWrites={}",
+                buffered.bytes.len(),
+                baseline.writes,
+                buffered.writes
+            );
+        }
+    }
+    #[test]
+    fn short_writes_preserve_the_complete_frame() {
+        let frame = frame(2);
+        let (probe, stats) = probe(false, 7);
+        let writer: SharedWriter = Arc::new(Mutex::new(Box::new(probe)));
+        write_frame(&writer, &frame).unwrap();
+        let mut expected = serde_json::to_vec(&frame).unwrap();
+        expected.push(b'\n');
+        assert_eq!(stats.lock().unwrap().bytes, expected);
+    }
+    #[test]
+    fn partial_delivery_failure_discards_pending_bytes() {
+        struct PartialFailure {
+            stats: Arc<Mutex<Stats>>,
+        }
+        impl Write for PartialFailure {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                let mut stats = self.stats.lock().unwrap();
+                stats.writes += 1;
+                if stats.writes == 1 {
+                    let count = bytes.len().min(7);
+                    stats.bytes.extend_from_slice(&bytes[..count]);
+                    Ok(count)
+                } else {
+                    Err(std::io::Error::other("failure after partial delivery"))
+                }
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                self.stats.lock().unwrap().flushes += 1;
+                Ok(())
+            }
+        }
+        for count in [1, 2000] {
+            let stats = Arc::new(Mutex::new(Stats::default()));
+            let writer: SharedWriter = Arc::new(Mutex::new(Box::new(PartialFailure {
+                stats: stats.clone(),
+            })));
+            let frame = frame(count);
+            assert!(write_frame(&writer, &frame).is_err());
+            let stats = stats.lock().unwrap();
+            assert_eq!(stats.writes, 2, "no write after observed failure");
+            assert_eq!(stats.flushes, 0);
+            assert_eq!(stats.bytes, serde_json::to_vec(&frame).unwrap()[..7]);
+        }
+    }
+
+    #[test]
+    fn failed_writes_do_not_flush_or_retry_on_drop() {
+        for count in [1, 2000] {
+            let (probe, stats) = probe(true, usize::MAX);
+            let writer: SharedWriter = Arc::new(Mutex::new(Box::new(probe)));
+            assert!(write_frame(&writer, &frame(count)).is_err());
+            let stats = stats.lock().unwrap();
+            assert_eq!(
+                stats.writes, 1,
+                "error must not trigger an implicit buffered retry"
+            );
+            assert_eq!(stats.flushes, 0);
+            assert!(stats.bytes.is_empty());
+        }
     }
 }
