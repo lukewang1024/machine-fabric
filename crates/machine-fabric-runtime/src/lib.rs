@@ -9,6 +9,7 @@ mod controller;
 mod datapack;
 mod desktop;
 mod executor;
+mod filesystem_capacity;
 mod generation;
 #[cfg(target_os = "macos")]
 mod macos;

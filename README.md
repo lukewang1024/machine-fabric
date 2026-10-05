@@ -38,6 +38,15 @@ resource to keep the response small. `capability.describe` returns the
 selected input/output contract. The normal `capability.invoke` API creates a
 task on the local Controller and routes the call to the chosen Executor.
 
+For disk-pressure diagnosis, discover `filesystem.capacity` and supply an
+existing file or directory in the Executor's allowed roots. It returns
+`availableBytes`, `freeBytes`, and `totalBytes` from native filesystem
+statistics without starting a process or writing an execution fence. Available
+bytes describe space accessible to the Executor user at collection time;
+they do not reserve space for an installation. This read remains available
+when persistence errors reject mutating operations. It does not permit those
+operations to bypass their durable-write gate.
+
 If an availability probe fails, `availability.probe` supplies a bounded
 `errorCode` and `scope: executor-route`. Missing local endpoints, unavailable
 connections, closed connections, timeouts and malformed replies are distinct;
