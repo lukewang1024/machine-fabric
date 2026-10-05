@@ -291,12 +291,25 @@ mod tests {
         let script = "echo once >> receipt; echo before; sleep 30";
         #[cfg(windows)]
         let script = "echo once >> receipt & echo before & ping -n 30 127.0.0.1 >NUL";
+        // Windows CI can spend more than 500 ms starting cmd.exe under
+        // parallel test load. This fixture must reach its marker before the
+        // deadline to test partial output, rather than process startup speed.
+        #[cfg(unix)]
+        let deadline_ms = 500;
+        #[cfg(windows)]
+        let deadline_ms = 3_000;
         let started = Instant::now();
-        let error = run(&shell(script), directory.path(), &BTreeMap::new(), 500).unwrap_err();
+        let error = run(
+            &shell(script),
+            directory.path(),
+            &BTreeMap::new(),
+            deadline_ms,
+        )
+        .unwrap_err();
         assert_eq!(error.code, "COMMAND_TIMED_OUT");
         assert_eq!(error.details["rootStopped"], true);
         assert!(error.details["stdout"].as_str().unwrap().contains("before"));
-        assert!(started.elapsed() < Duration::from_secs(4));
+        assert!(started.elapsed() < Duration::from_millis(deadline_ms + 3_500));
         assert_eq!(
             std::fs::read_to_string(directory.path().join("receipt"))
                 .unwrap()
