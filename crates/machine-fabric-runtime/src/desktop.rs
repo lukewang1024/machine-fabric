@@ -201,7 +201,9 @@ impl DesktopQueue {
                 self.maintenance_owner = enabled.then(|| owner.to_owned());
                 self.save()?;
                 self.promote()?;
-                self.command("desktop.list", &json!({}))
+                // A maintenance receipt describes current admission, not the audit history.
+                // Historical jobs remain available through an explicit desktop.list read.
+                self.command("desktop.list", &json!({"includeTerminal":false}))
             }
             "desktop.submit" => {
                 let owner = field(params, "owner")?;
@@ -467,6 +469,53 @@ mod tests {
                 "INVALID_PARAMS"
             );
         }
+    }
+    #[test]
+    fn maintenance_receipt_omits_history_without_losing_fifo_or_audit() {
+        let mut q = DesktopQueue::default();
+        let first = submit(&mut q, "active");
+        let prototype = q.jobs[0].clone();
+        for n in 0..1000 {
+            let mut job = prototype.clone();
+            job.id = format!("history-{n}");
+            job.state = "completed".into();
+            q.jobs.push(job);
+        }
+        let waiting = submit(&mut q, "waiting");
+        let enabled = q
+            .command(
+                "desktop.maintenance",
+                &json!({"owner":"upgrade", "enabled":true}),
+            )
+            .unwrap();
+        assert_eq!(enabled["historyIncluded"], false);
+        assert_eq!(enabled["historyCount"], 1000);
+        assert_eq!(enabled["totalCount"], 1002);
+        assert_eq!(enabled["safePoint"], false);
+        assert_eq!(enabled["jobs"].as_array().unwrap().len(), 2);
+        assert_eq!(enabled["jobs"][0]["id"], first["id"]);
+        assert_eq!(enabled["jobs"][1]["id"], waiting["id"]);
+        assert!(
+            !enabled
+                .to_string()
+                .contains(first["token"].as_str().unwrap())
+        );
+        let history = q
+            .command("desktop.list", &json!({"includeTerminal":true}))
+            .unwrap();
+        assert_eq!(history["jobs"].as_array().unwrap().len(), 1002);
+        assert!(enabled.to_string().len() * 50 < history.to_string().len());
+        let disabled = q
+            .command(
+                "desktop.maintenance",
+                &json!({"owner":"upgrade", "enabled":false}),
+            )
+            .unwrap();
+        assert_eq!(disabled["maintenanceOwner"], Value::Null);
+        assert_eq!(disabled["historyIncluded"], false);
+        assert_eq!(disabled["jobs"][0]["state"], "active");
+        assert_eq!(disabled["jobs"][1]["state"], "queued");
+        assert_eq!(q.jobs.len(), 1002);
     }
     #[test]
     fn maintenance_drains_owner_and_preserves_fifo_across_restart() {

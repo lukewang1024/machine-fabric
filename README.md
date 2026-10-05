@@ -69,6 +69,9 @@ visible; blocked, in-flight, and maintenance status are reported in either mode.
 This changes only the response, not durable history or desktop admission.
 Raw `desktop.list` retains its full-history default for existing callers; pass
 `includeTerminal: false` for the compact response. Session tokens remain redacted.
+`desktop.maintenance` returns the compact current-state receipt, including
+maintenance ownership, safe-point status and history counts. Read `desktop.list`
+explicitly when audit history is needed; maintenance does not remove past jobs.
 
 One-shot command stdout and stderr retain at most 64 KiB each. When clipped,
 the returned text starts with an explicit truncation notice; `stdoutTruncated`
