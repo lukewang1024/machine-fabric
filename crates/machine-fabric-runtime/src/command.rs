@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
-use std::process::{Child, Command, Output, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
 pub fn timeout_ms(value: Option<&Value>, default: u64) -> Result<u64, RpcError> {
@@ -28,16 +28,65 @@ fn failed(error: impl std::fmt::Display) -> RpcError {
     RpcError::new("COMMAND_FAILED", error.to_string())
 }
 
-fn tail(file: &mut File) -> Result<Vec<u8>, RpcError> {
-    const LIMIT: u64 = 64 * 1024;
+pub const OUTPUT_LIMIT: usize = 64 * 1024;
+
+#[derive(Debug)]
+pub struct CapturedOutput {
+    pub bytes: Vec<u8>,
+    pub original_bytes: u64,
+}
+
+impl CapturedOutput {
+    pub fn truncated(&self) -> bool {
+        self.original_bytes > self.bytes.len() as u64
+            || String::from_utf8_lossy(&self.bytes).len() > OUTPUT_LIMIT
+    }
+
+    pub fn text(&self) -> String {
+        let notice = if self.truncated() {
+            format!(
+                "[machine-fabric: output truncated; showing tail of {} original bytes]\n",
+                self.original_bytes
+            )
+        } else {
+            String::new()
+        };
+        let budget = OUTPUT_LIMIT - notice.len();
+        let start = self.bytes.len().saturating_sub(budget);
+        let tail = String::from_utf8_lossy(&self.bytes[start..]);
+        // Lossy decoding can expand a cut/invalid UTF-8 sequence. Keep the
+        // response byte bound and a valid UTF-8 suffix even for binary output.
+        let mut offset = tail.len().saturating_sub(budget);
+        while !tail.is_char_boundary(offset) {
+            offset += 1;
+        }
+        notice + &tail[offset..]
+    }
+}
+
+#[derive(Debug)]
+pub struct Output {
+    pub status: ExitStatus,
+    pub stdout: CapturedOutput,
+    pub stderr: CapturedOutput,
+}
+
+fn tail(file: &mut File) -> Result<CapturedOutput, RpcError> {
     // Private anonymous files avoid an unbounded in-memory output buffer and
     // pipe EOF waits when a descendant inherits stdout/stderr.
     let len = file.metadata().map_err(failed)?.len();
-    file.seek(SeekFrom::Start(len.saturating_sub(LIMIT)))
-        .map_err(failed)?;
+    let start = len.saturating_sub(OUTPUT_LIMIT as u64);
+    file.seek(SeekFrom::Start(start)).map_err(failed)?;
     let mut bytes = Vec::new();
-    file.take(LIMIT).read_to_end(&mut bytes).map_err(failed)?;
-    Ok(bytes)
+    // A descendant may still append after the root exits. Read the measured
+    // snapshot only, so its original byte count describes these same bytes.
+    file.take(len - start)
+        .read_to_end(&mut bytes)
+        .map_err(failed)?;
+    Ok(CapturedOutput {
+        bytes,
+        original_bytes: len,
+    })
 }
 
 #[cfg(unix)]
@@ -172,10 +221,14 @@ pub fn run(
                 "COMMAND_TIMED_OUT",
                 "Command deadline exceeded; side effects may have occurred; do not replay automatically",
             );
+            let stdout = tail(&mut stdout)?;
+            let stderr = tail(&mut stderr)?;
             error.details = json!({"timeoutMs": timeout, "pid": child.id(),
                 "terminationRequested": status.is_none() && termination.is_ok(), "rootStopped": stopped,
-                "outcome": "unknown", "stdout": String::from_utf8_lossy(&tail(&mut stdout)?),
-                "stderr": String::from_utf8_lossy(&tail(&mut stderr)?) });
+                "outcome": "unknown", "stdout": stdout.text(), "stderr": stderr.text(),
+                "stdoutBytes": stdout.original_bytes, "stderrBytes": stderr.original_bytes,
+                "stdoutTruncated": stdout.truncated(), "stderrTruncated": stderr.truncated(),
+                "outputLimitBytes": OUTPUT_LIMIT });
             return Err(error);
         }
         if let Some(status) = status {
@@ -228,8 +281,8 @@ mod tests {
         let script = "echo output & echo diagnostic >&2 & exit 7";
         let output = run(&shell(script), directory.path(), &BTreeMap::new(), 2_000).unwrap();
         assert_eq!(output.status.code(), Some(7));
-        assert!(String::from_utf8_lossy(&output.stdout).contains("output"));
-        assert!(String::from_utf8_lossy(&output.stderr).contains("diagnostic"));
+        assert!(output.stdout.text().contains("output"));
+        assert!(output.stderr.text().contains("diagnostic"));
     }
     #[test]
     fn hanging_command_stops_with_partial_output_without_replay() {
@@ -252,6 +305,27 @@ mod tests {
             1
         );
     }
+    #[test]
+    fn deadline_keeps_original_counts_and_truncation_for_both_streams() {
+        let directory = tempfile::tempdir().unwrap();
+        let raw = vec![b'x'; 200_000];
+        std::fs::write(directory.path().join("stream"), &raw).unwrap();
+        #[cfg(unix)]
+        let script = "cat stream; cat stream >&2; sleep 30";
+        #[cfg(windows)]
+        let script = "type stream & type stream 1>&2 & ping -n 30 127.0.0.1 >NUL";
+        let error = run(&shell(script), directory.path(), &BTreeMap::new(), 2_000).unwrap_err();
+        assert_eq!(error.code, "COMMAND_TIMED_OUT");
+        assert_eq!(error.details["outcome"], "unknown");
+        for stream in ["stdout", "stderr"] {
+            assert_eq!(error.details[format!("{stream}Bytes")], raw.len());
+            assert_eq!(error.details[format!("{stream}Truncated")], true);
+            let text = error.details[stream].as_str().unwrap();
+            assert!(text.starts_with("[machine-fabric: output truncated;"));
+            assert!(text.len() <= OUTPUT_LIMIT);
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn inherited_output_descriptor_does_not_hold_the_rpc_open() {
@@ -274,7 +348,41 @@ mod tests {
         file.write_all(&vec![b'x'; 200_000]).unwrap();
         file.write_all(b"last").unwrap();
         let output = tail(&mut file).unwrap();
-        assert_eq!(output.len(), 65536);
-        assert!(output.ends_with(b"last"));
+        assert_eq!(output.bytes.len(), 65536);
+        assert_eq!(output.original_bytes, 200_004);
+        assert!(output.truncated());
+        assert!(
+            output
+                .text()
+                .starts_with("[machine-fabric: output truncated;")
+        );
+        assert!(output.text().ends_with("last"));
+        assert!(output.text().len() <= OUTPUT_LIMIT);
+    }
+    #[test]
+    fn exact_limit_is_complete_and_invalid_utf8_expansion_is_explicit() {
+        let exact = CapturedOutput {
+            bytes: vec![b'x'; OUTPUT_LIMIT],
+            original_bytes: OUTPUT_LIMIT as u64,
+        };
+        assert!(!exact.truncated());
+        assert_eq!(exact.text(), "x".repeat(OUTPUT_LIMIT));
+        let binary = CapturedOutput {
+            bytes: vec![0xff; OUTPUT_LIMIT],
+            original_bytes: OUTPUT_LIMIT as u64,
+        };
+        assert!(binary.truncated());
+        assert!(
+            binary
+                .text()
+                .starts_with("[machine-fabric: output truncated;")
+        );
+        assert!(binary.text().len() <= OUTPUT_LIMIT);
+        let small = CapturedOutput {
+            bytes: "中文🙂".as_bytes().to_vec(),
+            original_bytes: "中文🙂".len() as u64,
+        };
+        assert!(!small.truncated());
+        assert_eq!(small.text(), "中文🙂");
     }
 }

@@ -2035,18 +2035,24 @@ impl ExecutorRuntime {
             .unwrap_or_default();
         let timeout = crate::command::timeout_ms(params.get("timeoutMs"), default_timeout)?;
         let output = crate::command::run(&argv, &cwd, &env, timeout)?;
-        let stdout = bounded_output(&output.stdout);
-        let stderr = bounded_output(&output.stderr);
+        let stdout = output.stdout.text();
+        let stderr = output.stderr.text();
+        let result = json!({
+            "cwd": cwd, "argv": argv, "exitCode": output.status.code(),
+            "stdout": stdout, "stderr": stderr,
+            "stdoutBytes": output.stdout.original_bytes, "stderrBytes": output.stderr.original_bytes,
+            "stdoutTruncated": output.stdout.truncated(), "stderrTruncated": output.stderr.truncated(),
+            "outputLimitBytes": crate::command::OUTPUT_LIMIT
+        });
         if !output.status.success() {
-            return Err(RpcError::new(
+            let mut error = RpcError::new(
                 "COMMAND_FAILED",
                 format!("command exited with {}: {stderr}", output.status),
-            ));
+            );
+            error.details = result;
+            return Err(error);
         }
-        Ok(json!({
-            "cwd": cwd, "argv": argv, "exitCode": output.status.code(),
-            "stdout": stdout, "stderr": stderr
-        }))
+        Ok(result)
     }
 }
 
@@ -2847,7 +2853,10 @@ fn output_schema(name: &str) -> Value {
         "command.run" => json!({
             "cwd": {"type": "string"}, "argv": {"type": "array"},
             "exitCode": {"type": ["integer", "null"]},
-            "stdout": {"type": "string"}, "stderr": {"type": "string"}
+            "stdout": {"type": "string"}, "stderr": {"type": "string"},
+            "stdoutBytes": {"type": "integer"}, "stderrBytes": {"type": "integer"},
+            "stdoutTruncated": {"type": "boolean"}, "stderrTruncated": {"type": "boolean"},
+            "outputLimitBytes": {"type": "integer"}
         }),
         "artifact.build" => json!({
             "command": {"type": "object"}, "artifact": {"type": "object"}
@@ -3299,12 +3308,6 @@ fn validate_command(
         ));
     }
     Ok(())
-}
-
-fn bounded_output(bytes: &[u8]) -> String {
-    const LIMIT: usize = 64 * 1024;
-    let start = bytes.len().saturating_sub(LIMIT);
-    String::from_utf8_lossy(&bytes[start..]).into_owned()
 }
 
 fn digest_file(path: &Path) -> Result<String, RpcError> {
@@ -4322,6 +4325,47 @@ mod tests {
             fs::read_to_string(path).unwrap(),
             "before\nchanged\nafter\n"
         );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn command_output_cannot_masquerade_as_a_complete_process_inventory() {
+        let directory = tempfile::tempdir().unwrap();
+        let runtime = ExecutorRuntime::new("output", vec![directory.path().to_path_buf()]).unwrap();
+        let path = directory.path().join("inventory.txt");
+        let raw = format!(
+            "owned-helper-at-start\n{}\nformal-helper-at-end\n",
+            "x".repeat(100_000)
+        );
+        fs::write(&path, &raw).unwrap();
+        let response = runtime.handle(Request::new(
+            "command.run",
+            json!({
+                "cwd": directory.path(), "argv": ["/bin/cat", path]
+            }),
+        ));
+        assert!(response.ok, "{response:?}");
+        let value = response.result.unwrap();
+        assert_eq!(value["stdoutBytes"], raw.len());
+        assert_eq!(value["stdoutTruncated"], true);
+        assert_eq!(value["stderrTruncated"], false);
+        let text = value["stdout"].as_str().unwrap();
+        assert!(text.starts_with("[machine-fabric: output truncated;"));
+        assert!(!text.contains("owned-helper-at-start"));
+        assert!(text.contains("formal-helper-at-end"));
+        assert!(text.len() <= crate::command::OUTPUT_LIMIT);
+
+        let failure = runtime.handle(Request::new(
+            "command.run",
+            json!({
+                "cwd": directory.path(), "argv": ["/bin/cat", path, directory.path().join("absent")]
+            }),
+        ));
+        let error = failure.error.unwrap();
+        assert_eq!(error.code, "COMMAND_FAILED");
+        assert_eq!(error.details["stdoutBytes"], raw.len());
+        assert_eq!(error.details["stdoutTruncated"], true);
+        assert!(error.details["stderrBytes"].as_u64().unwrap() > 0);
     }
 
     #[test]
