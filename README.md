@@ -190,6 +190,11 @@ The local CLI communicates with the node Controller over Unix sockets or
 Windows Named Pipes. State and logs are stored under the platform's normal
 XDG/application data locations.
 
+Peer frame serialization uses a bounded 64 KiB write buffer under the existing
+whole-frame lock. Each completed JSON frame retains its newline and explicit
+flush. A write failure discards remaining buffered bytes without an implicit
+retry; partial delivery remains unknown and must not replay an operation.
+
 Read-only peer health, desktop queue and managed process status requests have a
 10-second response deadline. This bounds diagnostics when a connected peer
 stops responding; cached registration health alone is not live confirmation.
