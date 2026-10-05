@@ -553,8 +553,8 @@ mod tests {
         ));
         fs::create_dir_all(&root).expect("create root");
         let log_path = root.join("process.log");
+        let readiness_gate = root.join("release-readiness");
         let table = ProcessTable::default();
-        let started = std::time::Instant::now();
         let record = table
             .start(
                 "readiness-test".to_owned(),
@@ -562,7 +562,9 @@ mod tests {
                 vec![
                     "sh".to_owned(),
                     "-c".to_owned(),
-                    "sleep 0.2; echo ready; sleep 1".to_owned(),
+                    "attempts=0; while [ ! -f \"$1\" ]; do attempts=$((attempts+1)); [ \"$attempts\" -lt 200 ] || exit 7; sleep 0.01; done; echo ready; sleep 1".to_owned(),
+                    "readiness-fixture".to_owned(),
+                    readiness_gate.to_string_lossy().into_owned(),
                 ],
                 Default::default(),
                 log_path,
@@ -571,8 +573,18 @@ mod tests {
                 Value::Null,
             )
             .expect("start process");
-        assert!(started.elapsed() < Duration::from_millis(150));
+        // Prove start returns before readiness using an explicit gate, rather
+        // than treating machine scheduling/spawn latency as a 150 ms SLA.
         assert_eq!(record.readiness.state, ReadinessState::Pending);
+        assert_eq!(
+            table
+                .get("readiness-test")
+                .expect("get pending process")
+                .readiness
+                .state,
+            ReadinessState::Pending
+        );
+        fs::write(&readiness_gate, "release").expect("release readiness");
         let deadline = std::time::Instant::now() + Duration::from_secs(1);
         loop {
             let record = table.get("readiness-test").expect("get process");

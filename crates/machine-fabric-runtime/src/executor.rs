@@ -764,6 +764,15 @@ impl ExecutorRuntime {
                     "digest": if metadata.is_file() { Some(digest_file(&path)?) } else { None },
                 }))
             }
+            "filesystem.capacity" => {
+                let path = self.path(&params, "path", true)?;
+                let capacity = crate::filesystem_capacity::capacity(&path)
+                    .map_err(|error| io_error("FS_CAPACITY_FAILED", &path, error))?;
+                Ok(
+                    json!({"path": path, "availableBytes": capacity.available_bytes,
+                          "freeBytes": capacity.free_bytes, "totalBytes": capacity.total_bytes}),
+                )
+            }
             "fs.resolve" | "filesystem.resolve" => {
                 let path = self.path(&params, "path", false)?;
                 Ok(json!({"path": path, "exists": path.exists()}))
@@ -2061,6 +2070,7 @@ pub fn capability_catalog() -> Vec<CapabilityDescriptor> {
     let mut capabilities = vec![
         ("filesystem.resolve", Effect::ReadOnly),
         ("filesystem.stat", Effect::ReadOnly),
+        ("filesystem.capacity", Effect::ReadOnly),
         ("filesystem.read", Effect::ReadOnly),
         ("filesystem.list", Effect::ReadOnly),
         ("filesystem.search", Effect::ReadOnly),
@@ -2169,7 +2179,11 @@ fn contract(name: &str, effect: Effect) -> CapabilityDescriptor {
             RollbackStrategy::None,
             vec!["clipboard-digest"],
         ),
-        "filesystem.resolve" | "filesystem.stat" | "filesystem.read" | "filesystem.list" => (
+        "filesystem.resolve"
+        | "filesystem.stat"
+        | "filesystem.capacity"
+        | "filesystem.read"
+        | "filesystem.list" => (
             vec!["filesystem"],
             json!({"path": {"type": "string"}}),
             Vec::new(),
@@ -2820,6 +2834,10 @@ fn output_schema(name: &str) -> Value {
             "path": {"type": "string"}, "exists": {"type": "boolean"},
             "kind": {"type": "string"}, "size": {"type": "integer"},
             "digest": {"type": ["string", "null"]}
+        }),
+        "filesystem.capacity" => json!({
+            "path": {"type": "string"}, "availableBytes": {"type": "integer", "minimum": 0},
+            "freeBytes": {"type": "integer", "minimum": 0}, "totalBytes": {"type": "integer", "minimum": 0}
         }),
         "filesystem.read" => json!({
             "path": {"type": "string"}, "content": {"type": "string"},
@@ -3617,6 +3635,63 @@ fn io_error(code: &str, path: &Path, error: std::io::Error) -> RpcError {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn filesystem_capacity_remains_read_only_when_fence_persistence_fails() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().to_path_buf();
+        let state = root.join("fences.json");
+        let runtime =
+            super::ExecutorRuntime::open("capacity", vec![root.clone()], state.clone()).unwrap();
+        // Deterministically reject atomic replacement without exhausting the
+        // test machine's volume. This models the failing durable-write gate.
+        if state.exists() {
+            std::fs::remove_file(&state).unwrap();
+        }
+        std::fs::create_dir(&state).unwrap();
+        let destination = root.join("must-not-exist");
+        let denied = runtime.handle(machine_fabric_protocol::Request::new(
+            "filesystem.write",
+            serde_json::json!({"path":destination,"content":"blocked"}),
+        ));
+        assert!(!denied.ok);
+        assert_eq!(denied.error.unwrap().code, "FENCE_STATE_FAILED");
+        assert!(!destination.exists());
+        let observed = runtime.handle(machine_fabric_protocol::Request::new(
+            "filesystem.capacity",
+            serde_json::json!({"path":root}),
+        ));
+        assert!(observed.ok, "{:?}", observed.error);
+        let observed = observed.result.unwrap();
+        assert!(observed["totalBytes"].as_u64().unwrap() > 0);
+        assert!(observed["availableBytes"].as_u64().is_some());
+        assert!(state.is_dir(), "capacity must not rewrite the failed fence");
+    }
+
+    #[test]
+    fn filesystem_capacity_obeys_allowed_roots_and_accepts_files() {
+        let directory = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let root = directory.path().to_path_buf();
+        let runtime = super::ExecutorRuntime::new("capacity", vec![root.clone()]).unwrap();
+        let file = root.join("owned.txt");
+        std::fs::write(&file, "owned").unwrap();
+        let allowed = runtime.handle(machine_fabric_protocol::Request::new(
+            "filesystem.capacity",
+            serde_json::json!({"path":file}),
+        ));
+        assert!(allowed.ok);
+        let denied = runtime.handle(machine_fabric_protocol::Request::new(
+            "filesystem.capacity",
+            serde_json::json!({"path":outside.path()}),
+        ));
+        assert!(!denied.ok);
+        let missing = runtime.handle(machine_fabric_protocol::Request::new(
+            "filesystem.capacity",
+            serde_json::json!({"path":root.join("missing")}),
+        ));
+        assert!(!missing.ok);
+    }
+
     #[test]
     fn launch_resources_match_optional_and_default_ports() {
         let params = serde_json::json!({"bundleIdentifier":"owned.app"});
