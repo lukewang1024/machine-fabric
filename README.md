@@ -70,6 +70,14 @@ This changes only the response, not durable history or desktop admission.
 Raw `desktop.list` retains its full-history default for existing callers; pass
 `includeTerminal: false` for the compact response. Session tokens remain redacted.
 
+One-shot command stdout and stderr retain at most 64 KiB each. When clipped,
+the returned text starts with an explicit truncation notice; `stdoutTruncated`
+and `stderrTruncated` indicate incomplete output, and `stdoutBytes` and
+`stderrBytes` report the measured original byte counts. These fields also
+appear in failed-command and deadline error details. Never infer that a process,
+window or error is absent from truncated output. Filter the inventory at its
+source or query the exact identity, then verify lifecycle changes independently.
+
 The macOS and Windows installers start their Executors with `--path-policy
 desktop` and an explicit `--policy-home`. Direct file reads and application
 paths are open by default. The read deny list covers common credential

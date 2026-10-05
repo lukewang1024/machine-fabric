@@ -28,6 +28,13 @@ interpret a peer connection as remote task ownership or automatic failover.
 An explicit session handoff, if deliberately requested, is a separate
 operation and never happens just because a node disconnects.
 
+Command responses are bounded. Check `stdoutTruncated`/`stderrTruncated` and
+the original byte counts; a truncation notice also prefixes clipped text.
+Never use a partial inventory as proof that a helper/process is absent. Filter
+before returning large output, query the exact PID and executable identity,
+and independently confirm owned process shutdown. Keep older-version callers
+safe by treating an exactly limit-sized response as potentially incomplete.
+
 ## Fabric setup and diagnosis
 
 Use a `machine-fabric.dev/v1` manifest to validate node IDs, platform,
