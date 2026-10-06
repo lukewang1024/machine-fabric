@@ -4,7 +4,7 @@ use interprocess::local_socket::{
 };
 use machine_fabric_protocol::{Request, Response, RpcError};
 use std::fs;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{
     Arc,
@@ -205,6 +205,20 @@ impl Drop for SocketOwnership {
     }
 }
 
+// Keep local IPC writes bounded and coalesced, without buffering a whole response.
+fn write_json_frame(writer: &mut impl Write, frame: &impl serde::Serialize) -> Result<()> {
+    let mut buffered = BufWriter::with_capacity(64 * 1024, writer);
+    let result = (|| {
+        serde_json::to_writer(&mut buffered, frame)?;
+        buffered.write_all(b"\n")?;
+        buffered.flush()?;
+        Ok(())
+    })();
+    // Drop must not retry pending bytes after a partial write or failed flush.
+    let _ = buffered.into_parts();
+    result
+}
+
 fn handle_stream<F>(mut stream: Stream, handler: Arc<F>) -> Result<()>
 where
     F: Fn(Request) -> Response,
@@ -220,8 +234,7 @@ where
             RpcError::new("INVALID_REQUEST", format!("invalid JSON request: {error}")),
         ),
     };
-    serde_json::to_writer(&mut stream, &response)?;
-    stream.write_all(b"\n")?;
+    write_json_frame(&mut stream, &response)?;
     Ok(())
 }
 
@@ -233,8 +246,7 @@ pub fn call_unix(socket: impl AsRef<Path>, request: &Request) -> Result<Response
         .with_context(|| format!("map local IPC name {}", socket.as_ref().display()))?;
     let mut stream = Stream::connect(name)
         .with_context(|| format!("connect local IPC {}", socket.as_ref().display()))?;
-    serde_json::to_writer(&mut stream, request)?;
-    stream.write_all(b"\n")?;
+    write_json_frame(&mut stream, request)?;
     let mut line = String::new();
     BufReader::new(stream).read_line(&mut line)?;
     if line.is_empty() {
@@ -344,5 +356,80 @@ mod tests {
         fs::write(&path, "important").unwrap();
         assert!(RpcServer::new(&path).bind().is_err());
         assert_eq!(fs::read_to_string(path).unwrap(), "important");
+    }
+}
+
+#[cfg(test)]
+mod frame_write_tests {
+    use super::*;
+    #[derive(Default)]
+    struct Probe {
+        bytes: Vec<u8>,
+        writes: usize,
+        flushes: usize,
+        limit: usize,
+        fail_after: Option<usize>,
+    }
+    impl Write for Probe {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.writes += 1;
+            if self.fail_after.is_some_and(|n| self.bytes.len() >= n) {
+                return Err(std::io::Error::other("controlled write failure"));
+            }
+            let count = bytes.len().min(self.limit);
+            self.bytes.extend_from_slice(&bytes[..count]);
+            Ok(count)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.flushes += 1;
+            Ok(())
+        }
+    }
+    fn large_response() -> Response {
+        Response::success(
+            "owned",
+            serde_json::json!({"nodes":(0..12000).map(|i|
+            serde_json::json!({"ref":format!("@e{i}"),"value":"Owned 中文🙂 with \"quotes\" and newline\n"})).collect::<Vec<_>>()}),
+        )
+    }
+    #[test]
+    fn large_frames_are_byte_exact_with_bounded_write_count() {
+        let frame = large_response();
+        let mut expected = serde_json::to_vec(&frame).unwrap();
+        expected.push(b'\n');
+        let mut p = Probe {
+            limit: usize::MAX,
+            ..Probe::default()
+        };
+        write_json_frame(&mut p, &frame).unwrap();
+        assert_eq!(p.bytes, expected);
+        assert!(p.writes <= expected.len().div_ceil(64 * 1024));
+        assert_eq!(p.flushes, 1);
+    }
+    #[test]
+    fn short_writes_preserve_unicode_and_one_complete_frame() {
+        let frame = large_response();
+        let mut expected = serde_json::to_vec(&frame).unwrap();
+        expected.push(b'\n');
+        let mut p = Probe {
+            limit: 7,
+            ..Probe::default()
+        };
+        write_json_frame(&mut p, &frame).unwrap();
+        assert_eq!(p.bytes, expected);
+    }
+    #[test]
+    fn partial_write_failure_never_retries_during_drop() {
+        let frame = large_response();
+        let expected = serde_json::to_vec(&frame).unwrap();
+        let mut p = Probe {
+            limit: 7,
+            fail_after: Some(7),
+            ..Probe::default()
+        };
+        assert!(write_json_frame(&mut p, &frame).is_err());
+        assert_eq!(p.bytes, expected[..7]);
+        assert_eq!(p.writes, 2);
+        assert_eq!(p.flushes, 0);
     }
 }
