@@ -1,4 +1,6 @@
 use anyhow::{Context, Result, anyhow};
+use base64::{Engine, engine::general_purpose::STANDARD};
+use flate2::{Compression, read::GzDecoder, write::GzEncoder};
 use machine_fabric_core::atomic_replace;
 use machine_fabric_protocol::{Request, Response, RpcError};
 use serde::{Deserialize, Serialize};
@@ -89,11 +91,15 @@ enum PeerFrame {
         protocol: String,
         node_id: String,
         roles: Vec<TargetRole>,
+        #[serde(default)]
+        response_gzip: bool,
     },
     HelloAck {
         protocol: String,
         node_id: String,
         roles: Vec<TargetRole>,
+        #[serde(default)]
+        response_gzip: bool,
     },
     Request {
         id: String,
@@ -103,6 +109,11 @@ enum PeerFrame {
     Response {
         id: String,
         response: Response,
+    },
+    ResponseGzip {
+        id: String,
+        expanded_bytes: usize,
+        payload: String,
     },
 }
 
@@ -114,6 +125,7 @@ struct PeerBridge {
     writer: SharedWriter,
     pending: Pending,
     connected: Arc<AtomicBool>,
+    response_gzip: bool,
 }
 
 impl PeerBridge {
@@ -281,14 +293,16 @@ pub fn accept_peer(config: PeerAcceptConfig) -> Result<()> {
     }
     let mut input = BufReader::new(std::io::stdin());
     let mut output = std::io::stdout();
-    accept_handshake(&mut input, &mut output, &config.peer_id, actual_local_id)?;
-    let (_bridge, reader) = start_bridge(
+    let response_gzip =
+        accept_handshake(&mut input, &mut output, &config.peer_id, actual_local_id)?;
+    let (_bridge, reader) = start_bridge_with_compression(
         Box::new(input),
         Box::new(output),
         config.local_controller_socket,
         config.local_executor_socket,
         config.expose_controller_socket,
         config.expose_executor_socket,
+        response_gzip,
     )?;
     reader
         .join()
@@ -361,24 +375,28 @@ fn connect_once(config: &PeerConnectConfig, connection_id: &str, generation: u64
         .with_context(|| format!("start SSH peer transport to {}", config.host))?;
     let stdout = child.stdout.take().expect("SSH stdout is piped");
     let mut stdout = BufReader::new(stdout);
-    if let Err(error) = initiate_handshake(
+    let response_gzip = match initiate_handshake(
         &mut stdout,
         &mut child.stdin.as_mut().expect("SSH stdin is piped"),
         &config.local_id,
         &config.peer_id,
     ) {
-        let _ = child.kill();
-        let _ = child.wait();
-        return Err(error);
-    }
+        Ok(enabled) => enabled,
+        Err(error) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(error);
+        }
+    };
     let stdin = child.stdin.take().expect("SSH stdin is piped");
-    let (bridge, reader) = match start_bridge(
+    let (bridge, reader) = match start_bridge_with_compression(
         Box::new(stdout),
         Box::new(stdin),
         config.local_controller_socket.clone(),
         config.local_executor_socket.clone(),
         config.expose_controller_socket.clone(),
         config.expose_executor_socket.clone(),
+        response_gzip,
     ) {
         Ok(bridge) => bridge,
         Err(error) => {
@@ -418,6 +436,7 @@ fn connect_once(config: &PeerConnectConfig, connection_id: &str, generation: u64
     reader_result?
 }
 
+#[cfg(all(test, unix))]
 fn start_bridge(
     reader: Box<dyn Read + Send>,
     writer: Box<dyn Write + Send>,
@@ -426,10 +445,31 @@ fn start_bridge(
     expose_controller_socket: PathBuf,
     expose_executor_socket: PathBuf,
 ) -> Result<(PeerBridge, thread::JoinHandle<Result<()>>)> {
+    start_bridge_with_compression(
+        reader,
+        writer,
+        local_controller_socket,
+        local_executor_socket,
+        expose_controller_socket,
+        expose_executor_socket,
+        false,
+    )
+}
+
+fn start_bridge_with_compression(
+    reader: Box<dyn Read + Send>,
+    writer: Box<dyn Write + Send>,
+    local_controller_socket: PathBuf,
+    local_executor_socket: PathBuf,
+    expose_controller_socket: PathBuf,
+    expose_executor_socket: PathBuf,
+    response_gzip: bool,
+) -> Result<(PeerBridge, thread::JoinHandle<Result<()>>)> {
     let bridge = PeerBridge {
         writer: Arc::new(Mutex::new(writer)),
         pending: Arc::new(Mutex::new(HashMap::new())),
         connected: Arc::new(AtomicBool::new(true)),
+        response_gzip,
     };
     // Acquire both endpoints before any background listener starts. A partial
     // bind failure drops the first endpoint and cannot announce a healthy peer.
@@ -517,6 +557,7 @@ fn read_frames_inner(
     for line in BufReader::new(reader).lines() {
         let line = line.context("read peer frame")?;
         let frame: PeerFrame = serde_json::from_str(&line).context("decode peer frame")?;
+        let frame = decode_response_frame(frame, bridge.response_gzip)?;
         match frame {
             PeerFrame::Hello { .. } | PeerFrame::HelloAck { .. } => {
                 return Err(anyhow!(
@@ -533,12 +574,14 @@ fn read_frames_inner(
                     let _ = sender.send(response);
                 }
             }
+            PeerFrame::ResponseGzip { .. } => unreachable!("compressed responses were decoded"),
             PeerFrame::Request {
                 id,
                 target_role,
                 request,
             } => {
                 let writer = Arc::clone(&bridge.writer);
+                let response_gzip = bridge.response_gzip;
                 let socket = match target_role {
                     TargetRole::Controller => local_controller_socket.clone(),
                     TargetRole::Executor => local_executor_socket.clone(),
@@ -550,8 +593,8 @@ fn read_frames_inner(
                             RpcError::new("LOCAL_ROLE_UNAVAILABLE", error.to_string()),
                         )
                     });
-                    if let Err(error) = write_frame(&writer, &PeerFrame::Response { id, response })
-                    {
+                    let frame = encode_response_frame(id, response, response_gzip);
+                    if let Err(error) = write_frame(&writer, &frame) {
                         eprintln!("write peer response failed: {error:#}");
                     }
                 });
@@ -568,13 +611,14 @@ fn initiate_handshake<R: BufRead, W: Write>(
     writer: &mut W,
     local_id: &str,
     expected_peer_id: &str,
-) -> Result<()> {
+) -> Result<bool> {
     serde_json::to_writer(
         &mut *writer,
         &PeerFrame::Hello {
             protocol: PEER_PROTOCOL.to_owned(),
             node_id: local_id.to_owned(),
             roles: vec![TargetRole::Controller, TargetRole::Executor],
+            response_gzip: true,
         },
     )?;
     writer.write_all(b"\n")?;
@@ -585,11 +629,12 @@ fn initiate_handshake<R: BufRead, W: Write>(
             protocol,
             node_id,
             roles,
+            response_gzip,
         } if protocol == PEER_PROTOCOL
             && node_id == expected_peer_id
             && has_required_roles(&roles) =>
         {
-            Ok(())
+            Ok(response_gzip)
         }
         other => Err(anyhow!("invalid peer handshake acknowledgement: {other:?}")),
     }
@@ -600,29 +645,34 @@ fn accept_handshake<R: BufRead, W: Write>(
     writer: &mut W,
     expected_peer_id: &str,
     local_id: &str,
-) -> Result<()> {
+) -> Result<bool> {
     let frame = read_handshake_frame(reader)?;
-    match frame {
+    let response_gzip = match frame {
         PeerFrame::Hello {
             protocol,
             node_id,
             roles,
+            response_gzip,
         } if protocol == PEER_PROTOCOL
             && node_id == expected_peer_id
-            && has_required_roles(&roles) => {}
+            && has_required_roles(&roles) =>
+        {
+            response_gzip
+        }
         other => return Err(anyhow!("invalid peer handshake: {other:?}")),
-    }
+    };
     serde_json::to_writer(
         &mut *writer,
         &PeerFrame::HelloAck {
             protocol: PEER_PROTOCOL.to_owned(),
             node_id: local_id.to_owned(),
             roles: vec![TargetRole::Controller, TargetRole::Executor],
+            response_gzip,
         },
     )?;
     writer.write_all(b"\n")?;
     writer.flush()?;
-    Ok(())
+    Ok(response_gzip)
 }
 
 fn read_handshake_frame(reader: &mut impl BufRead) -> Result<PeerFrame> {
@@ -641,6 +691,88 @@ fn has_required_roles(roles: &[TargetRole]) -> bool {
         && roles
             .iter()
             .any(|role| matches!(role, TargetRole::Executor))
+}
+
+// Each response has its own gzip dictionary. Requests and handshake frames stay
+// unchanged; old peers omit the capability and receive ordinary responses.
+const MAX_GZIP_RESPONSE: usize = 32 * 1024 * 1024;
+const MIN_GZIP_RESPONSE: usize = 64 * 1024;
+
+struct ResponseSize(usize);
+impl Write for ResponseSize {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0 = self
+            .0
+            .checked_add(bytes.len())
+            .filter(|n| *n <= MAX_GZIP_RESPONSE)
+            .ok_or_else(|| std::io::Error::other("response exceeds compression budget"))?;
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn encode_response_frame(id: String, response: Response, negotiated: bool) -> PeerFrame {
+    if negotiated && response.ok {
+        let mut size = ResponseSize(0);
+        if serde_json::to_writer(&mut size, &response).is_ok() && size.0 >= MIN_GZIP_RESPONSE {
+            let mut gzip = GzEncoder::new(Vec::new(), Compression::fast());
+            let mut buffered = BufWriter::with_capacity(64 * 1024, &mut gzip);
+            let serialized = serde_json::to_writer(&mut buffered, &response)
+                .map_err(std::io::Error::other)
+                .and_then(|()| buffered.flush());
+            let _ = buffered.into_parts();
+            if serialized.is_ok()
+                && let Ok(bytes) = gzip.finish()
+            {
+                // Include base64/envelope overhead; incompressible responses
+                // use the existing format without changing the tool result.
+                if bytes.len().div_ceil(3) * 4 + 256 < size.0 {
+                    return PeerFrame::ResponseGzip {
+                        id,
+                        expanded_bytes: size.0,
+                        payload: STANDARD.encode(bytes),
+                    };
+                }
+            }
+        }
+    }
+    PeerFrame::Response { id, response }
+}
+
+fn decode_response_frame(frame: PeerFrame, negotiated: bool) -> Result<PeerFrame> {
+    let PeerFrame::ResponseGzip {
+        id,
+        expanded_bytes,
+        payload,
+    } = frame
+    else {
+        return Ok(frame);
+    };
+    if !negotiated
+        || !(MIN_GZIP_RESPONSE..=MAX_GZIP_RESPONSE).contains(&expanded_bytes)
+        || payload.len() > MAX_GZIP_RESPONSE.div_ceil(3) * 4
+    {
+        return Err(anyhow!("invalid or unnegotiated compressed peer response"));
+    }
+    let compressed = STANDARD
+        .decode(payload)
+        .context("decode compressed peer response base64")?;
+    let mut bytes = Vec::new();
+    GzDecoder::new(compressed.as_slice())
+        .take(expanded_bytes as u64 + 1)
+        .read_to_end(&mut bytes)
+        .context("decode compressed peer response gzip")?;
+    if bytes.len() != expanded_bytes {
+        return Err(anyhow!("compressed peer response length mismatch"));
+    }
+    let response: Response =
+        serde_json::from_slice(&bytes).context("decode compressed peer response JSON")?;
+    if !response.ok {
+        return Err(anyhow!("compressed error response is not supported"));
+    }
+    Ok(PeerFrame::Response { id, response })
 }
 
 fn write_frame(writer: &SharedWriter, frame: &PeerFrame) -> Result<()> {
@@ -765,6 +897,7 @@ mod tests {
             writer: Arc::new(Mutex::new(Box::new(writer))),
             pending: Arc::new(Mutex::new(HashMap::new())),
             connected: Arc::new(AtomicBool::new(true)),
+            response_gzip: false,
         };
         let request = Request::new("status", serde_json::Value::Null);
         let expected_id = request.request_id.clone();
@@ -865,11 +998,79 @@ mod tests {
     }
 
     #[test]
+    fn compressed_responses_route_both_roles_in_both_directions() {
+        let directory = tempfile::tempdir().unwrap();
+        let controller_a = directory.path().join("controller-a.sock");
+        let executor_a = directory.path().join("executor-a.sock");
+        let controller_b = directory.path().join("controller-b.sock");
+        let executor_b = directory.path().join("executor-b.sock");
+        for (socket, role) in [
+            (controller_a.clone(), "controller-a"),
+            (executor_a.clone(), "executor-a"),
+            (controller_b.clone(), "controller-b"),
+            (executor_b.clone(), "executor-b"),
+        ] {
+            thread::spawn(move || {
+                RpcServer::new(socket)
+                    .serve(move |request| {
+                        Response::success(request.request_id, serde_json::json!({"role": role, "outline": "@e1 中文🙂".repeat(20000)}))
+                    })
+                    .unwrap();
+            });
+        }
+        let ready_deadline = Instant::now() + Duration::from_secs(2);
+        while ![&controller_a, &executor_a, &controller_b, &executor_b]
+            .iter()
+            .all(|socket| socket.exists())
+        {
+            assert!(
+                Instant::now() < ready_deadline,
+                "fake role listeners did not bind"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+        let (a_to_b, b_to_a) = UnixStream::pair().unwrap();
+        let a_read = a_to_b.try_clone().unwrap();
+        let b_read = b_to_a.try_clone().unwrap();
+        let (bridge_a, _reader_a) = start_bridge_with_compression(
+            Box::new(a_read),
+            Box::new(a_to_b),
+            controller_a,
+            executor_a,
+            directory.path().join("a-sees-b-controller.sock"),
+            directory.path().join("a-sees-b-executor.sock"),
+            true,
+        )
+        .unwrap();
+        let (bridge_b, _reader_b) = start_bridge_with_compression(
+            Box::new(b_read),
+            Box::new(b_to_a),
+            controller_b,
+            executor_b,
+            directory.path().join("b-sees-a-controller.sock"),
+            directory.path().join("b-sees-a-executor.sock"),
+            true,
+        )
+        .unwrap();
+        let a_calls_b = bridge_a.call(
+            TargetRole::Executor,
+            Request::new("status", serde_json::Value::Null),
+        );
+        let b_calls_a = bridge_b.call(
+            TargetRole::Controller,
+            Request::new("status", serde_json::Value::Null),
+        );
+        assert_eq!(a_calls_b.result.unwrap()["role"], "executor-b");
+        assert_eq!(b_calls_a.result.unwrap()["role"], "controller-a");
+    }
+
+    #[test]
     fn handshake_rejects_wrong_node_identity() {
         let hello = serde_json::to_vec(&PeerFrame::HelloAck {
             protocol: PEER_PROTOCOL.to_owned(),
             node_id: "unexpected".to_owned(),
             roles: vec![TargetRole::Controller, TargetRole::Executor],
+            response_gzip: true,
         })
         .unwrap();
         let mut input = Cursor::new([hello, b"\n".to_vec()].concat());
@@ -1136,5 +1337,171 @@ mod buffered_frame_tests {
             assert_eq!(stats.flushes, 0);
             assert!(stats.bytes.is_empty());
         }
+    }
+}
+
+#[cfg(test)]
+mod compression_tests {
+    use super::*;
+    use std::io::Cursor;
+
+    fn response() -> Response {
+        Response::success(
+            "request-identity",
+            serde_json::json!({
+                "stateId":"fresh-state", "outline": "@e1 中文🙂\n".repeat(12000),
+                "actions":[{"ref":"@e1","outcome":"unknown-effect"}], "image":"unchanged"
+            }),
+        )
+    }
+    fn assert_same(original: &Response, frame: PeerFrame) {
+        let PeerFrame::Response { id, response } = decode_response_frame(frame, true).unwrap()
+        else {
+            panic!("expected response");
+        };
+        assert_eq!(id, "routing-identity");
+        assert_eq!(
+            serde_json::to_value(original).unwrap(),
+            serde_json::to_value(response).unwrap()
+        );
+    }
+    #[test]
+    fn unicode_refs_ids_and_unknown_action_outcomes_roundtrip_exactly() {
+        let original = response();
+        let encoded = encode_response_frame("routing-identity".into(), original.clone(), true);
+        assert!(matches!(encoded, PeerFrame::ResponseGzip { .. }));
+        assert!(
+            serde_json::to_vec(&encoded).unwrap().len()
+                < serde_json::to_vec(&original).unwrap().len() / 10
+        );
+        assert_same(&original, encoded);
+    }
+    #[test]
+    fn unnegotiated_small_and_error_responses_keep_old_format() {
+        assert!(matches!(
+            encode_response_frame("id".into(), response(), false),
+            PeerFrame::Response { .. }
+        ));
+        let small = Response::success("id", serde_json::json!({"ok":true}));
+        assert!(matches!(
+            encode_response_frame("id".into(), small, true),
+            PeerFrame::Response { .. }
+        ));
+        let error = Response::failure("id", RpcError::new("INPUT_UNKNOWN", "x".repeat(100000)));
+        assert!(matches!(
+            encode_response_frame("id".into(), error, true),
+            PeerFrame::Response { .. }
+        ));
+    }
+    #[test]
+    fn incompressible_responses_keep_original_format_and_result() {
+        let mut seed = 0x123456789abcdef_u64;
+        let text: String = (0..200000)
+            .map(|_| {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                char::from(33 + (seed % 94) as u8)
+            })
+            .collect();
+        let original = Response::success("request-identity", serde_json::json!({"text":text}));
+        let frame = encode_response_frame("routing-identity".into(), original.clone(), true);
+        assert!(matches!(frame, PeerFrame::Response { .. }));
+        assert_same(&original, frame);
+    }
+
+    #[test]
+    fn both_old_peer_handshake_directions_disable_compression() {
+        for kind in ["hello", "hello-ack"] {
+            let input = serde_json::json!({"type":kind,"protocol":PEER_PROTOCOL,"node_id":"remote","roles":["controller","executor"]});
+            let mut reader = Cursor::new(format!("{input}\n"));
+            let mut writer = Vec::new();
+            let negotiated = if kind == "hello" {
+                accept_handshake(&mut reader, &mut writer, "remote", "local")
+            } else {
+                initiate_handshake(&mut reader, &mut writer, "local", "remote")
+            }
+            .unwrap();
+            assert!(!negotiated);
+            if kind == "hello" {
+                assert!(
+                    !serde_json::from_slice::<serde_json::Value>(&writer).unwrap()["response_gzip"]
+                        .as_bool()
+                        .unwrap()
+                );
+            }
+        }
+    }
+    #[test]
+    fn both_new_peer_handshake_directions_negotiate_compression() {
+        for kind in ["hello", "hello-ack"] {
+            let input = serde_json::json!({"type":kind,"protocol":PEER_PROTOCOL,"node_id":"remote","roles":["controller","executor"],"response_gzip":true});
+            let mut reader = Cursor::new(format!("{input}\n"));
+            let mut writer = Vec::new();
+            assert!(
+                if kind == "hello" {
+                    accept_handshake(&mut reader, &mut writer, "remote", "local")
+                } else {
+                    initiate_handshake(&mut reader, &mut writer, "local", "remote")
+                }
+                .unwrap()
+            );
+        }
+    }
+    #[test]
+    fn compressed_frames_reject_unnegotiated_length_mismatch_and_corruption() {
+        let frame = encode_response_frame("id".into(), response(), true);
+        assert!(decode_response_frame(frame, false).is_err());
+        let PeerFrame::ResponseGzip {
+            id,
+            expanded_bytes,
+            payload,
+        } = encode_response_frame("id".into(), response(), true)
+        else {
+            panic!();
+        };
+        assert!(
+            decode_response_frame(
+                PeerFrame::ResponseGzip {
+                    id: id.clone(),
+                    expanded_bytes: expanded_bytes - 1,
+                    payload: payload.clone()
+                },
+                true
+            )
+            .is_err()
+        );
+        let mut gzip = STANDARD.decode(&payload).unwrap();
+        gzip.truncate(gzip.len() - 4);
+        assert!(
+            decode_response_frame(
+                PeerFrame::ResponseGzip {
+                    id,
+                    expanded_bytes,
+                    payload: STANDARD.encode(gzip)
+                },
+                true
+            )
+            .is_err()
+        );
+    }
+    #[test]
+    fn oversized_declarations_and_expansion_bombs_are_bounded() {
+        let frame = PeerFrame::ResponseGzip {
+            id: "id".into(),
+            expanded_bytes: MAX_GZIP_RESPONSE + 1,
+            payload: String::new(),
+        };
+        assert!(decode_response_frame(frame, true).is_err());
+        let mut gzip = GzEncoder::new(Vec::new(), Compression::fast());
+        gzip.write_all(&vec![b'x'; MIN_GZIP_RESPONSE * 8]).unwrap();
+        let frame = PeerFrame::ResponseGzip {
+            id: "id".into(),
+            expanded_bytes: MIN_GZIP_RESPONSE,
+            payload: STANDARD.encode(gzip.finish().unwrap()),
+        };
+        assert!(decode_response_frame(frame, true).is_err());
+        let mut size = ResponseSize(MAX_GZIP_RESPONSE - 1);
+        assert!(size.write_all(b"xx").is_err());
     }
 }
