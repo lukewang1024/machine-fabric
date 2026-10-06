@@ -16,6 +16,11 @@ Every machine normally runs a Controller and an Executor:
 - SSH authenticates and connects peers. One persistent framed connection per
   node pair carries calls to remote Executors in either logical direction.
 
+Local RPC requests and responses use 64 KiB write buffers, so large Computer
+Use outlines do not issue a socket write for every JSON token. Frames remain
+newline-delimited JSON; a failed write or flush discards pending buffer bytes
+without retrying or replaying the operation.
+
 If a Controller goes down, task control for Agents that depend on that
 Controller is unavailable; tasks are not silently adopted by another node.
 Executor admission remains node-local and does not require a central service.
