@@ -212,6 +212,14 @@ whole-frame lock. Each completed JSON frame retains its newline and explicit
 flush. A write failure discards remaining buffered bytes without an implicit
 retry; partial delivery remains unknown and must not replay an operation.
 
+Peers negotiate independent gzip responses during the existing v1 handshake.
+Only successful responses from 64 KiB through 32 MiB are eligible, and only
+when the encoded frame is smaller. Each response uses a fresh dictionary;
+requests remain ordinary JSON. A peer without the capability receives the
+original format. Decoding checks negotiation, bounded expansion, exact length
+and gzip integrity before routing the unchanged response. Invalid frames close
+the connection; they never trigger a retry or relax desktop input guards.
+
 Read-only peer health, desktop queue and managed process status requests have a
 10-second response deadline. This bounds diagnostics when a connected peer
 stops responding; cached registration health alone is not live confirmation.
