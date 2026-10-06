@@ -496,24 +496,12 @@ impl ExecutorRuntime {
             .lock()
             .map_err(|error| RpcError::new("DESKTOP_STATE_FAILED", error.to_string()))?
             .begin(action, &mut params)?;
-        let read_only_observe = action == "computer-use.call"
-            && params.get("tool").and_then(Value::as_str) == Some("observe_ui");
+        let tool = params
+            .get("tool")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
         let result = self.dispatch(action, params);
-        let uncertain = match &result {
-            Err(error) => {
-                let message = error.message.to_ascii_lowercase();
-                !read_only_observe
-                    && (error.code == "COMPUTER_USE_UNAVAILABLE"
-                        || error.code.contains("TIMEOUT")
-                        || (error.code == "COMPUTER_USE_TOOL_FAILED"
-                            && (message.contains("timeout")
-                                || message.contains("timed out")
-                                || message.contains("abort"))))
-            }
-            Ok(value) => {
-                action == "computer-use.call" && has_structured_computer_use_unknown(value)
-            }
-        };
+        let uncertain = desktop_dispatch_uncertain(action, tool.as_deref(), &result);
         self.desktop
             .lock()
             .map_err(|error| RpcError::new("DESKTOP_STATE_FAILED", error.to_string()))?
@@ -3591,6 +3579,30 @@ fn search_tree(
     Ok(())
 }
 
+// A failed observation poll cannot have posted desktop input. Keep arbitrary
+// JavaScript, navigation, input and structured unknown dispatches fail-closed.
+fn desktop_dispatch_uncertain(
+    action: &str,
+    tool: Option<&str>,
+    result: &Result<Value, RpcError>,
+) -> bool {
+    let read_only_poll =
+        action == "computer-use.call" && matches!(tool, Some("observe_ui" | "wait_for"));
+    match result {
+        Err(error) => {
+            let message = error.message.to_ascii_lowercase();
+            !read_only_poll
+                && (error.code == "COMPUTER_USE_UNAVAILABLE"
+                    || error.code.contains("TIMEOUT")
+                    || (error.code == "COMPUTER_USE_TOOL_FAILED"
+                        && (message.contains("timeout")
+                            || message.contains("timed out")
+                            || message.contains("abort"))))
+        }
+        Ok(value) => action == "computer-use.call" && has_structured_computer_use_unknown(value),
+    }
+}
+
 fn has_structured_computer_use_unknown(value: &Value) -> bool {
     if value.pointer("/details/tool").and_then(Value::as_str) != Some("act_ui")
         || value.pointer("/details/status").and_then(Value::as_str)
@@ -4026,6 +4038,70 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn observation_poll_errors_do_not_quarantine_but_mutation_errors_do() {
+        for code in [
+            "COMPUTER_USE_TOOL_FAILED",
+            "COMPUTER_USE_UNAVAILABLE",
+            "RPC_TIMEOUT",
+        ] {
+            let result = Err(RpcError::new(
+                code,
+                "CDP command Runtime.enable timed out after 5000ms",
+            ));
+            for tool in ["observe_ui", "wait_for"] {
+                assert!(!desktop_dispatch_uncertain(
+                    "computer-use.call",
+                    Some(tool),
+                    &result
+                ));
+            }
+            for tool in [
+                "act_ui",
+                "evaluate_js",
+                "launch_browser",
+                "navigate_browser",
+                "wait_for ",
+                "unknown",
+            ] {
+                assert!(desktop_dispatch_uncertain(
+                    "computer-use.call",
+                    Some(tool),
+                    &result
+                ));
+            }
+            assert!(desktop_dispatch_uncertain(
+                "computer-use.call",
+                None,
+                &result
+            ));
+            assert!(desktop_dispatch_uncertain(
+                "application.open-file",
+                Some("wait_for"),
+                &result
+            ));
+            assert!(desktop_dispatch_uncertain(
+                "clipboard.write",
+                Some("observe_ui"),
+                &result
+            ));
+        }
+    }
+
+    #[test]
+    fn read_only_tool_name_never_suppresses_structured_unknown_input() {
+        let result = Ok(
+            json!({"details":{"tool":"act_ui","status":"dispatch_outcome_unknown","execution":{"transport":{"outcome":"unknown"}}}}),
+        );
+        for tool in ["observe_ui", "wait_for", "act_ui", "evaluate_js"] {
+            assert!(desktop_dispatch_uncertain(
+                "computer-use.call",
+                Some(tool),
+                &result
+            ));
+        }
+    }
 
     #[test]
     fn application_launch_contract_requires_explicit_conflict_policy() {
@@ -4509,6 +4585,7 @@ mod tests {
             "transport",
             "partial_hid",
             "capture_read_error",
+            "wait_read_error",
             "capture_read_result",
             "effect_unverified",
         ] {
@@ -4560,7 +4637,13 @@ while True:
         stream.write((json.dumps({'id': request['id'], 'ok': False,
             'error': {'code': 'COMPUTER_USE_TOOL_FAILED', 'message': 'Capture timed out'}}) + '\n').encode())
         continue
-    if mode in ('capture_read_result', 'capture_read_error'):
+    if mode == 'wait_read_error' and request.get('method') == 'wait_for':
+        stream.write((json.dumps({'id': request['id'], 'ok': False,
+            'error': "CDP command Runtime.enable timed out after 5000ms"}) + '\n').encode())
+        continue
+    if mode == 'wait_read_error':
+        result = {'details': {'tool': request.get('method'), 'execution': {'outcome': 'worked', 'dispatchCompletion': 'returned'}}}
+    elif mode in ('capture_read_result', 'capture_read_error'):
         result = {'details': {'tool': 'observe_ui', 'observation': {'status': 'semantic_only',
             'readOnly': True, 'nativeCompletion': 'unconfirmed', 'imageError': 'Capture timed out'}}}
     elif mode == 'effect_unverified':
@@ -4618,17 +4701,29 @@ sock.close()
             let call_params = || {
                 json!({
                     "sessionId": "discovery",
-                    "tool": if mode.starts_with("capture_read") { "observe_ui" } else { "act_ui" },
+                    "tool": if mode.starts_with("capture_read") { "observe_ui" } else if mode == "wait_read_error" { "wait_for" } else { "act_ui" },
                     "arguments": {"stateId": "cu-state", "actions": [{"action": "click", "ref": "@e1"}]},
                     "_desktop": {"owner": "fake-host-test", "token": job["token"]}
                 })
             };
 
             let first = runtime.handle(Request::new("computer-use.call", call_params()));
-            if mode.starts_with("capture_read") || mode == "effect_unverified" {
-                assert_eq!(first.ok, mode != "capture_read_error", "{first:?}");
+            if mode.starts_with("capture_read")
+                || mode == "wait_read_error"
+                || mode == "effect_unverified"
+            {
+                assert_eq!(
+                    first.ok,
+                    !matches!(mode, "capture_read_error" | "wait_read_error"),
+                    "{first:?}"
+                );
+                if mode == "wait_read_error" {
+                    let error = first.error.as_ref().expect("wait error must be returned");
+                    assert_eq!(error.code, "COMPUTER_USE_TOOL_FAILED");
+                    assert!(error.message.contains("Runtime.enable timed out"));
+                }
                 let desktop = runtime.handle(Request::new("desktop.list", json!({})));
-                assert_eq!(desktop.result.unwrap()["blocked"], false);
+                assert_eq!(desktop.result.unwrap()["blocked"], false, "{mode}");
                 let mut next_input = call_params();
                 next_input["tool"] = json!("act_ui");
                 let second = runtime.handle(Request::new("computer-use.call", next_input));
