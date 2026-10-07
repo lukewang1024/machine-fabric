@@ -17,6 +17,7 @@ import shutil
 import signal
 import socket
 import subprocess
+import sys
 import tempfile
 import time
 import uuid
@@ -444,6 +445,28 @@ class Installer:
                                (self.backup, original)) from original
         print(json.dumps({'ok': True, 'version': self.version, 'rollback': str(self.backup), 'stateRestored': False}))
 
+    def prune_rollbacks(self):
+        """Called under the install lock only after readiness and registration succeed."""
+        parent = self.state / 'installer-rollbacks'
+        if parent.is_symlink() or self.backup is None or self.backup.parent != parent:
+            return
+        for entry in parent.iterdir():
+            if entry == self.backup or entry.is_symlink() or not entry.is_dir():
+                continue
+            if not re.fullmatch(r'\d{8}T\d{6}-[0-9a-f]{32}', entry.name):
+                continue
+            manifest = entry / 'manifest.json'
+            if manifest.is_symlink():
+                continue
+            try:
+                value = json.loads(manifest.read_text())
+                if not isinstance(value.get('records'), list) or not isinstance(value.get('files'), dict):
+                    continue
+                shutil.rmtree(entry)
+            except (OSError, ValueError) as error:
+                # A cleanup failure must not undo an already healthy installation.
+                print('installer rollback cleanup deferred: %s: %s' % (entry.name, error), file=sys.stderr)
+
     def install(self):
         self.state.mkdir(parents=True, exist_ok=True)
         lock_path = self.state / '.install-macos.lock'
@@ -453,7 +476,7 @@ class Installer:
             with tempfile.TemporaryDirectory(prefix='install-stage-', dir=self.state) as temporary:
                 staged = self.stage(Path(temporary))
                 self.transaction(staged)
-        # No automatic prune: installer-rollbacks contain the only known-good identity.
+                self.prune_rollbacks()
 
 
 def main():

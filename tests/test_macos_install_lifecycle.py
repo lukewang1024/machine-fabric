@@ -118,6 +118,42 @@ class LifecycleTests(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         self.x = Fake(self.tmp.name)
 
+    def old_snapshot(self):
+        old = self.x.state / 'installer-rollbacks' / ('20260101T000000-' + 'a' * 32)
+        old.mkdir(parents=True)
+        (old / 'manifest.json').write_text(json.dumps({'records': [], 'files': {}}))
+        (old / 'identity').write_text('previous')
+        return old
+
+    def test_healthy_install_keeps_only_its_latest_rollback(self):
+        old = self.old_snapshot()
+        self.x.install()
+        self.assertFalse(old.exists())
+        self.assertTrue((self.x.backup / 'manifest.json').exists())
+        self.assertEqual(list(self.x.backup.parent.iterdir()), [self.x.backup])
+
+    def test_failed_readiness_does_not_prune_previous_snapshot(self):
+        old = self.old_snapshot()
+        self.x.fail_ready = True
+        with self.assertRaises(RuntimeError):
+            self.x.install()
+        self.assertTrue(old.exists())
+        self.assertTrue((self.x.backup / 'manifest.json').exists())
+
+    def test_prune_preserves_symlink_and_unknown_entries(self):
+        old = self.old_snapshot()
+        outside = self.x.state.parent / 'outside'
+        outside.mkdir()
+        (outside / 'evidence').write_text('keep')
+        link = old.parent / ('20260102T000000-' + 'b' * 32)
+        link.symlink_to(outside)
+        unknown = old.parent / 'manual-recovery'
+        unknown.mkdir()
+        self.x.install()
+        self.assertTrue(link.is_symlink())
+        self.assertTrue((outside / 'evidence').exists())
+        self.assertTrue(unknown.exists())
+
     def test_success_single_bootstrap_and_private_complete_backup(self):
         self.x.install()
         boot = [a for a in self.x.calls if a[:2] == ['/bin/launchctl', 'bootstrap']]
