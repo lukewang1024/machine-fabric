@@ -223,6 +223,12 @@ fn handle_stream<F>(mut stream: Stream, handler: Arc<F>) -> Result<()>
 where
     F: Fn(Request) -> Response,
 {
+    // Darwin inherits O_NONBLOCK from the listener on accepted sockets.
+    // Peer listeners poll accept for shutdown, but each JSON RPC stream must
+    // block through its entire frame instead of closing on a partial write.
+    stream
+        .set_nonblocking(false)
+        .context("set accepted RPC stream blocking")?;
     let mut line = String::new();
     BufReader::new(&mut stream)
         .read_line(&mut line)
@@ -299,6 +305,42 @@ fn windows_pipe_permissions(options: ListenerOptions<'_>) -> Result<ListenerOpti
 mod tests {
     use super::*;
     use std::os::unix::net::UnixListener;
+
+    #[test]
+    fn stoppable_listener_delivers_large_response_to_slow_reader() {
+        use std::os::unix::net::UnixStream;
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("large.sock");
+        let server = RpcServer::new(&path).bind().unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let listener_stop = Arc::clone(&stop);
+        let payload = "response".repeat(32768);
+        let expected = payload.clone();
+        let listener = thread::spawn(move || {
+            server.serve(
+                move |request| {
+                    Response::success(request.request_id, serde_json::json!({"payload":payload}))
+                },
+                Some(listener_stop),
+            )
+        });
+        let mut client = UnixStream::connect(&path).unwrap();
+        write_json_frame(
+            &mut client,
+            &Request::new("status", serde_json::Value::Null),
+        )
+        .unwrap();
+        // Force the response past the socket send buffer before draining it.
+        thread::sleep(Duration::from_millis(100));
+        let mut line = String::new();
+        let read = BufReader::new(client).read_line(&mut line);
+        stop.store(true, Ordering::Release);
+        listener.join().unwrap().unwrap();
+        read.unwrap();
+        let response: Response = serde_json::from_str(&line).unwrap();
+        assert!(response.ok);
+        assert_eq!(response.result.unwrap()["payload"], expected);
+    }
 
     #[test]
     fn concurrent_bind_cannot_unlink_active_endpoint() {
