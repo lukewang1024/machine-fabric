@@ -86,10 +86,14 @@ try {
     $options = @{}
     if ($explicitEmpty) { $options.ManagedPathMapping = @() }
     $rejected = $false
-    try { & $installer -Binary $probe -PolicyHome $homePath @options } catch { $rejected = $true }
+    $failure = $null
+    try { & $installer -Binary $probe -PolicyHome $homePath @options } catch { $rejected = $true; $failure = $_.Exception.Message }
     if (-not $rejected) { throw 'probe did not stop installation before service mutations' }
+    if ($failure -ne 'managed path policy preflight failed; services were not stopped') { throw "unexpected installer rejection: $failure" }
     $recorded = @(Get-Content -LiteralPath $env:FABRIC_POLICY_TEST_ARGS -Raw | ConvertFrom-Json)
-    if (($recorded -contains $mapping) -eq $explicitEmpty) { throw 'upgrade mapping inheritance or explicit clearing failed' }
+    if (($recorded -contains $mapping) -eq $explicitEmpty) {
+      throw ("upgrade mapping inheritance or explicit clearing failed: explicitEmpty={0}; expected={1}; recorded={2}" -f $explicitEmpty, $mapping, ($recorded | ConvertTo-Json -Compress))
+    }
   }
   Remove-Item -LiteralPath $env:FABRIC_POLICY_TEST_ARGS
   $acl.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule((New-Object Security.Principal.SecurityIdentifier('S-1-1-0')), 'Write', 'Allow')))
