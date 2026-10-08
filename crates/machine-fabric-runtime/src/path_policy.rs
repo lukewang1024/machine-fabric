@@ -431,8 +431,10 @@ mod tests {
             {
                 let output = std::process::Command::new("cmd.exe")
                     .args(["/D", "/C", "mklink", "/J"])
-                    .arg(link)
-                    .arg(target)
+                    // mklink treats forward slashes as switches even though
+                    // Windows filesystem APIs accept them in path arguments.
+                    .arg(link.as_os_str().to_string_lossy().replace('/', "\\"))
+                    .arg(target.as_os_str().to_string_lossy().replace('/', "\\"))
                     .output()
                     .unwrap();
                 assert!(
