@@ -865,11 +865,7 @@ impl ExecutorRuntime {
                     fs::create_dir_all(parent)
                         .map_err(|error| io_error("FS_WRITE_FAILED", parent, error))?;
                 }
-                let temporary = self.write_path(
-                    &json!({"path": path.with_extension(format!("fabric.{}.tmp", std::process::id()))}),
-                    "path",
-                    false,
-                )?;
+                let temporary = self.atomic_temporary_path(&params, &path)?;
                 fs::write(&temporary, content)
                     .map_err(|error| io_error("FS_WRITE_FAILED", &temporary, error))?;
                 atomic_replace(&temporary, &path)
@@ -898,11 +894,7 @@ impl ExecutorRuntime {
                     ));
                 }
                 let patched = content.replacen(before, after, 1);
-                let temporary = self.write_path(
-                    &json!({"path": path.with_extension(format!("fabric.{}.tmp", std::process::id()))}),
-                    "path",
-                    false,
-                )?;
+                let temporary = self.atomic_temporary_path(&params, &path)?;
                 fs::write(&temporary, patched)
                     .map_err(|error| io_error("FS_PATCH_FAILED", &temporary, error))?;
                 atomic_replace(&temporary, &path)
@@ -1914,6 +1906,28 @@ impl ExecutorRuntime {
 
     fn write_path(&self, params: &Value, key: &str, must_exist: bool) -> Result<PathBuf, RpcError> {
         self.checked_path(params, key, must_exist, PathAccess::Write)
+    }
+
+    fn atomic_temporary_path(
+        &self,
+        params: &Value,
+        destination: &Path,
+    ) -> Result<PathBuf, RpcError> {
+        // Preserve the caller's logical alias for each policy check. Checking
+        // the resolved destination again discards its registered mapping.
+        let logical = PathBuf::from(required_str(params, "path")?);
+        let temporary = self.write_path(
+            &json!({"path": logical.with_extension(format!("fabric.{}.tmp", std::process::id()))}),
+            "path",
+            false,
+        )?;
+        if temporary.parent() != destination.parent() {
+            return Err(RpcError::new(
+                "PATH_WRITE_DENIED",
+                "atomic temporary directory differs from checked destination",
+            ));
+        }
+        Ok(temporary)
     }
 
     fn checked_path(
@@ -3789,9 +3803,22 @@ mod tests {
         assert!(super::render_execution_resource(debug, "ui.inspect", &params, None).is_err());
     }
 
-    #[cfg(unix)]
     #[test]
-    fn desktop_mkdir_uses_registered_logical_mapping_without_authorizing_other_redirects() {
+    fn desktop_filesystem_uses_registered_logical_mapping_without_authorizing_other_redirects() {
+        fn redirect(target: &Path, link: &Path) {
+            #[cfg(unix)]
+            std::os::unix::fs::symlink(target, link).unwrap();
+            #[cfg(windows)]
+            {
+                let result = std::process::Command::new("cmd.exe")
+                    .args(["/d", "/c", "mklink", "/J"])
+                    .arg(link.to_string_lossy().replace('/', "\\"))
+                    .arg(target.to_string_lossy().replace('/', "\\"))
+                    .output()
+                    .unwrap();
+                assert!(result.status.success(), "{result:?}");
+            }
+        }
         let directory = tempfile::tempdir().unwrap();
         let home = directory.path().join("home");
         let target = directory.path().join("relocated");
@@ -3800,7 +3827,7 @@ mod tests {
         fs::create_dir_all(&target).unwrap();
         fs::create_dir_all(&outside).unwrap();
         let logical = home.join("Documents/managed");
-        std::os::unix::fs::symlink(&target, &logical).unwrap();
+        redirect(&target, &logical);
         let mut runtime =
             ExecutorRuntime::base("desktop", vec![home.clone()], Some(&home)).unwrap();
         runtime
@@ -3813,7 +3840,24 @@ mod tests {
             )
             .unwrap();
         assert!(target.join("baseline/user-data").is_dir());
-        std::os::unix::fs::symlink(&outside, target.join("escape")).unwrap();
+        let file = logical.join("baseline/user-data/document.txt");
+        runtime
+            .dispatch(
+                "filesystem.write",
+                json!({"path": file, "content": "before"}),
+            )
+            .unwrap();
+        assert_eq!(
+            fs::read_to_string(target.join("baseline/user-data/document.txt")).unwrap(),
+            "before"
+        );
+        runtime.dispatch("filesystem.patch", json!({"path": file, "expectedDigest": digest_file(&file).unwrap(), "before": "before", "after": "after"})).unwrap();
+        assert_eq!(
+            fs::read_to_string(target.join("baseline/user-data/document.txt")).unwrap(),
+            "after"
+        );
+
+        redirect(&outside, &target.join("escape"));
         assert_eq!(
             runtime
                 .dispatch(
@@ -3825,6 +3869,50 @@ mod tests {
             "PATH_WRITE_DENIED"
         );
         assert!(!outside.join("denied").exists());
+        fs::write(outside.join("existing.txt"), "unchanged").unwrap();
+        for (method, params) in [
+            (
+                "filesystem.write",
+                json!({"path": logical.join("escape/denied.txt"), "content": "denied"}),
+            ),
+            (
+                "filesystem.patch",
+                json!({"path": logical.join("escape/existing.txt"), "expectedDigest": digest_file(&outside.join("existing.txt")).unwrap(), "before": "unchanged", "after": "denied"}),
+            ),
+        ] {
+            assert_eq!(
+                runtime.dispatch(method, params).unwrap_err().code,
+                "PATH_WRITE_DENIED"
+            );
+        }
+        assert!(!outside.join("denied.txt").exists());
+        assert_eq!(
+            fs::read_to_string(outside.join("existing.txt")).unwrap(),
+            "unchanged"
+        );
+        // A hostile sibling at the temporary filename must not be followed.
+        #[cfg(unix)]
+        {
+            let temporary = target
+                .join("baseline/user-data/document.txt")
+                .with_extension(format!("fabric.{}.tmp", std::process::id()));
+            std::os::unix::fs::symlink(outside.join("existing.txt"), &temporary).unwrap();
+            assert_eq!(
+                runtime
+                    .dispatch(
+                        "filesystem.write",
+                        json!({"path": file, "content": "denied"})
+                    )
+                    .unwrap_err()
+                    .code,
+                "PATH_WRITE_DENIED"
+            );
+            assert_eq!(
+                fs::read_to_string(outside.join("existing.txt")).unwrap(),
+                "unchanged"
+            );
+            assert_eq!(fs::read_to_string(&file).unwrap(), "after");
+        }
     }
 
     #[test]
