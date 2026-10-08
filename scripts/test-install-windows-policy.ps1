@@ -102,6 +102,12 @@ try {
     $directoryAcl.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule((New-Object Security.Principal.SecurityIdentifier($sid)), 'FullControl', 'Allow')))
   }
   Set-Acl -LiteralPath $configRoot -AclObject $directoryAcl
+  # Reproduce Program Files' default effective Windows Modules Installer ACE.
+  # It is a trusted OS service on the installation root, not a permission grant
+  # for arbitrary service identities or the persisted mapping configuration.
+  $trustedInstallerSid = New-Object Security.Principal.SecurityIdentifier('S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464')
+  $directoryAcl.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule($trustedInstallerSid, 'FullControl', 'Allow')))
+  Set-Acl -LiteralPath $configRoot -AclObject $directoryAcl
   # This candidate records preflight arguments and deliberately fails before
   # any service or installation mutation, even when the policy is valid.
   $probe = Join-Path $fixture 'preflight-probe.ps1'
@@ -122,6 +128,21 @@ try {
     }
   }
   Remove-Item -LiteralPath $env:FABRIC_POLICY_TEST_ARGS
+  $otherServiceSid = New-Object Security.Principal.SecurityIdentifier('S-1-5-80-1-2-3-4-5')
+  $directoryAcl.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule($otherServiceSid, 'FullControl', 'Allow')))
+  Set-Acl -LiteralPath $configRoot -AclObject $directoryAcl
+  $rejected = $false
+  try { & $installer -Binary $probe -PolicyHome $homePath } catch { $rejected = $true }
+  if (-not $rejected -or (Test-Path $env:FABRIC_POLICY_TEST_ARGS)) { throw 'arbitrary service writer reached preflight' }
+  $directoryAcl.PurgeAccessRules($otherServiceSid)
+  Set-Acl -LiteralPath $configRoot -AclObject $directoryAcl
+  $acl.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule($trustedInstallerSid, 'FullControl', 'Allow')))
+  Set-Acl -LiteralPath $config -AclObject $acl
+  $rejected = $false
+  try { & $installer -Binary $probe -PolicyHome $homePath } catch { $rejected = $true }
+  if (-not $rejected -or (Test-Path $env:FABRIC_POLICY_TEST_ARGS)) { throw 'mapping configuration accepted service write permission' }
+  $acl.PurgeAccessRules($trustedInstallerSid)
+  Set-Acl -LiteralPath $config -AclObject $acl
   $acl.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule((New-Object Security.Principal.SecurityIdentifier('S-1-1-0')), 'Write', 'Allow')))
   Set-Acl -LiteralPath $config -AclObject $acl
   $rejected = $false
