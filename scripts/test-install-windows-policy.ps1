@@ -1,5 +1,8 @@
 param([Parameter(Mandatory = $true)][string]$Binary)
 $ErrorActionPreference = 'Stop'
+# A PowerShell 7 parent can leave incompatible modules on PSModulePath.
+# Load the native 5.1 security module before changing fixture environment.
+Import-Module (Join-Path $PSHOME 'Modules\Microsoft.PowerShell.Security\Microsoft.PowerShell.Security.psd1') -ErrorAction Stop
 $Binary = (Resolve-Path -LiteralPath $Binary).Path
 $installer = Join-Path $PSScriptRoot 'install-windows.ps1'
 $tokens = $null
@@ -67,6 +70,13 @@ try {
     $acl.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule((New-Object Security.Principal.SecurityIdentifier($sid)), 'FullControl', 'Allow')))
   }
   Set-Acl -LiteralPath $config -AclObject $acl
+  $directoryAcl = New-Object Security.AccessControl.DirectorySecurity
+  $directoryAcl.SetAccessRuleProtection($true, $false)
+  $directoryAcl.SetOwner((New-Object Security.Principal.SecurityIdentifier('S-1-5-32-544')))
+  foreach ($sid in @('S-1-5-18', 'S-1-5-32-544')) {
+    $directoryAcl.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule((New-Object Security.Principal.SecurityIdentifier($sid)), 'FullControl', 'Allow')))
+  }
+  Set-Acl -LiteralPath $configRoot -AclObject $directoryAcl
   # This candidate records preflight arguments and deliberately fails before
   # any service or installation mutation, even when the policy is valid.
   $probe = Join-Path $fixture 'preflight-probe.ps1'
@@ -87,6 +97,13 @@ try {
   $rejected = $false
   try { & $installer -Binary $probe -PolicyHome $homePath } catch { $rejected = $true }
   if (-not $rejected -or (Test-Path $env:FABRIC_POLICY_TEST_ARGS)) { throw 'untrusted writable mapping configuration reached preflight' }
+  $acl.PurgeAccessRules((New-Object Security.Principal.SecurityIdentifier('S-1-1-0')))
+  Set-Acl -LiteralPath $config -AclObject $acl
+  $directoryAcl.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule((New-Object Security.Principal.SecurityIdentifier('S-1-1-0')), 'Write', 'Allow')))
+  Set-Acl -LiteralPath $configRoot -AclObject $directoryAcl
+  $rejected = $false
+  try { & $installer -Binary $probe -PolicyHome $homePath } catch { $rejected = $true }
+  if (-not $rejected -or (Test-Path $env:FABRIC_POLICY_TEST_ARGS)) { throw 'untrusted configuration directory reached preflight' }
 } finally {
   $env:ProgramFiles = $priorProgramFiles
   $env:ProgramData = $priorProgramData

@@ -8,6 +8,7 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+Import-Module (Join-Path $PSHOME 'Modules\Microsoft.PowerShell.Security\Microsoft.PowerShell.Security.psd1') -ErrorAction Stop
 if ($PolicyUser) {
   try {
     $account = New-Object System.Security.Principal.NTAccount($PolicyUser)
@@ -34,10 +35,11 @@ $controllerState = Join-Path $stateRoot "controller.json"
 $executorState = Join-Path $stateRoot "executor-fences.json"
 $backupRoot = Join-Path $stateRoot ("backups\" + (Get-Date).ToUniversalTime().ToString("yyyyMMddTHHmmssZ"))
 $mappingConfig = Join-Path $installRoot "managed-path-mappings.json"
-if (Test-Path -LiteralPath $mappingConfig) {
-  $item = Get-Item -LiteralPath $mappingConfig -Force
+foreach ($trustedPath in @($installRoot, $mappingConfig)) {
+  if (-not (Test-Path -LiteralPath $trustedPath)) { continue }
+  $item = Get-Item -LiteralPath $trustedPath -Force
   if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'managed mapping configuration must not be a redirect' }
-  $acl = Get-Acl -LiteralPath $mappingConfig
+  $acl = Get-Acl -LiteralPath $trustedPath
   $trustedSids = @('S-1-5-18', 'S-1-5-32-544')
   if ($acl.GetOwner([Security.Principal.SecurityIdentifier]).Value -notin $trustedSids) { throw 'managed mapping configuration owner is not an administrator' }
   $writeRights = [Security.AccessControl.FileSystemRights]::Write -bor [Security.AccessControl.FileSystemRights]::Delete -bor [Security.AccessControl.FileSystemRights]::ChangePermissions -bor [Security.AccessControl.FileSystemRights]::TakeOwnership
@@ -47,6 +49,8 @@ if (Test-Path -LiteralPath $mappingConfig) {
       throw 'managed mapping configuration is writable by an untrusted identity'
     }
   }
+}
+if (Test-Path -LiteralPath $mappingConfig) {
   if (-not $PSBoundParameters.ContainsKey('ManagedPathMapping')) {
     $savedMappings = Get-Content -LiteralPath $mappingConfig -Raw -Encoding UTF8 | ConvertFrom-Json
     if ($savedMappings.version -ne 1 -or $null -eq $savedMappings.mappings) { throw 'invalid managed mapping configuration' }
