@@ -11,6 +11,7 @@ case "$termux_marker:$(uname -s):$(uname -m)" in
   ?*:Linux:aarch64|?*:Linux:arm64) target=aarch64-linux-android ;;
   :Linux:x86_64) target=x86_64-unknown-linux-musl ;;
   :Darwin:arm64) target=aarch64-apple-darwin ;;
+  :Darwin:x86_64) target=x86_64-apple-darwin ;;
   *) echo "install-from-release: unsupported platform: $(uname -s) $(uname -m)" >&2; exit 2 ;;
 esac
 

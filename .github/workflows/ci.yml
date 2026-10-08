@@ -40,6 +40,7 @@ jobs:
             $errors += $fileErrors
           }
           if ($errors.Count) { $errors | Format-List; exit 1 }
+          ./scripts/test-release-windows-architecture.ps1
 
   android:
     runs-on: ubuntu-latest
@@ -61,3 +62,23 @@ jobs:
           echo "CC_aarch64_linux_android=$linker" >> "$GITHUB_ENV"
           echo "AR_aarch64_linux_android=$toolchain/llvm-ar" >> "$GITHUB_ENV"
       - run: cargo build --locked --target aarch64-linux-android --bin machine-fabric
+
+  additional-desktop-builds:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-14
+            target: x86_64-apple-darwin
+          - runner: windows-latest
+            target: aarch64-pc-windows-msvc
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2.9.2
+        with:
+          key: ${{ matrix.target }}
+      - run: cargo build --locked --target ${{ matrix.target }} --bins
