@@ -156,6 +156,15 @@ filesystem root and rejects Windows device paths, alternate data streams,
 and ambiguous trailing spaces or dots. File operations use the checked
 resolved destination rather than following the logical alias a second time.
 
+`filesystem.write` accepts optional `expectedAbsent: true` for atomic creation
+without replacing an existing destination. It is mutually exclusive with
+`expectedDigest`; a concurrent creator produces `DIGEST_CONFLICT`. Publication
+uses a same-directory hard link and fails closed if the filesystem cannot
+support it. Clients must discover this input property before requesting it
+from an older Executor. Omitting the property preserves existing write behavior.
+Removal validates the trash destination through the same logical mapping and
+returns a logical restore token; redirected trash directories are rejected.
+
 This is admission control for Executor path arguments. Commands and launched
 applications run with their normal OS privileges and are not filesystem
 sandboxed by this policy. macOS TCC and Windows ACL checks still apply.
