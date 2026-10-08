@@ -3812,8 +3812,8 @@ mod tests {
             {
                 let result = std::process::Command::new("cmd.exe")
                     .args(["/d", "/c", "mklink", "/J"])
-                    .arg(link)
-                    .arg(target)
+                    .arg(link.to_string_lossy().replace('/', "\\"))
+                    .arg(target.to_string_lossy().replace('/', "\\"))
                     .output()
                     .unwrap();
                 assert!(result.status.success(), "{result:?}");
