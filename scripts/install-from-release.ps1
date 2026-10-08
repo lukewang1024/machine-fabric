@@ -5,7 +5,8 @@ param(
   [string[]]$AllowRoot = @("C:\Users", "C:\ProgramData\machine-fabric"),
   [string]$PolicyUserFile,
   [string]$PolicyUser,
-  [string]$PolicyHome = $env:USERPROFILE
+  [string]$PolicyHome = $env:USERPROFILE,
+  [string[]]$ManagedPathMapping = @()
 )
 
 $ErrorActionPreference = "Stop"
@@ -48,7 +49,9 @@ try {
   if ($actual -ne $expected) { throw "checksum mismatch" }
   Expand-Archive -Path (Join-Path $temporary $archive) -DestinationPath $temporary
   $root = Join-Path $temporary "machine-fabric-$Version-$target"
-  & (Join-Path $root "scripts\install-windows.ps1") -Binary (Join-Path $root "bin\machine-fabric.exe") -NodeId $NodeId -AllowRoot $AllowRoot -PolicyUser $PolicyUser -PolicyHome $PolicyHome
+  $mappingOptions = @{}
+  if ($PSBoundParameters.ContainsKey('ManagedPathMapping')) { $mappingOptions.ManagedPathMapping = $ManagedPathMapping }
+  & (Join-Path $root "scripts\install-windows.ps1") -Binary (Join-Path $root "bin\machine-fabric.exe") -NodeId $NodeId -AllowRoot $AllowRoot -PolicyUser $PolicyUser -PolicyHome $PolicyHome @mappingOptions
 } finally {
   Remove-Item -Recurse -Force $temporary -ErrorAction SilentlyContinue
 }

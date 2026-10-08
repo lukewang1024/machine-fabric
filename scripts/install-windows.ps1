@@ -3,10 +3,12 @@ param(
   [string]$NodeId = $env:COMPUTERNAME,
   [string[]]$AllowRoot = @("C:\Users", "C:\ProgramData\machine-fabric"),
   [string]$PolicyUser,
-  [string]$PolicyHome = $env:USERPROFILE
+  [string]$PolicyHome = $env:USERPROFILE,
+  [string[]]$ManagedPathMapping = @()
 )
 
 $ErrorActionPreference = "Stop"
+Import-Module (Join-Path $PSHOME 'Modules\Microsoft.PowerShell.Security\Microsoft.PowerShell.Security.psd1') -ErrorAction Stop
 if ($PolicyUser) {
   try {
     $account = New-Object System.Security.Principal.NTAccount($PolicyUser)
@@ -32,8 +34,55 @@ $executorSocket = Join-Path $stateRoot "executor.sock"
 $controllerState = Join-Path $stateRoot "controller.json"
 $executorState = Join-Path $stateRoot "executor-fences.json"
 $backupRoot = Join-Path $stateRoot ("backups\" + (Get-Date).ToUniversalTime().ToString("yyyyMMddTHHmmssZ"))
+$mappingConfig = Join-Path $installRoot "managed-path-mappings.json"
+foreach ($trustedPath in @($installRoot, $mappingConfig)) {
+  if (-not (Test-Path -LiteralPath $trustedPath)) { continue }
+  $item = Get-Item -LiteralPath $trustedPath -Force
+  if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'managed mapping configuration must not be a redirect' }
+  $acl = Get-Acl -LiteralPath $trustedPath
+  $trustedSids = @('S-1-5-18', 'S-1-5-32-544')
+  if ($acl.GetOwner([Security.Principal.SecurityIdentifier]).Value -notin $trustedSids) { throw 'managed mapping configuration owner is not an administrator' }
+  $writeRights = [Security.AccessControl.FileSystemRights]::Write -bor [Security.AccessControl.FileSystemRights]::Delete -bor [Security.AccessControl.FileSystemRights]::ChangePermissions -bor [Security.AccessControl.FileSystemRights]::TakeOwnership
+  foreach ($rule in $acl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier])) {
+    if ($rule.AccessControlType -eq [Security.AccessControl.AccessControlType]::Allow -and
+        ($rule.FileSystemRights -band $writeRights) -and $rule.IdentityReference.Value -notin $trustedSids) {
+      throw 'managed mapping configuration is writable by an untrusted identity'
+    }
+  }
+}
+if (Test-Path -LiteralPath $mappingConfig) {
+  if (-not $PSBoundParameters.ContainsKey('ManagedPathMapping')) {
+    $savedMappings = Get-Content -LiteralPath $mappingConfig -Raw -Encoding UTF8 | ConvertFrom-Json
+    if ($savedMappings.version -ne 1 -or $null -eq $savedMappings.mappings) { throw 'invalid managed mapping configuration' }
+    $ManagedPathMapping = @($savedMappings.mappings)
+    foreach ($mapping in $ManagedPathMapping) { if ($mapping -isnot [string]) { throw 'managed mapping must be a string' } }
+  }
+}
+# Run the candidate's exact policy validation before any service interruption.
+$validationArgs = @('executor', 'validate-path-policy', '--policy-home', $PolicyHome)
+foreach ($mapping in $ManagedPathMapping) { $validationArgs += @('--managed-path-mapping', $mapping) }
+& $Binary @validationArgs
+if ($LASTEXITCODE -ne 0) { throw 'managed path policy preflight failed; services were not stopped' }
 
 New-Item -ItemType Directory -Force -Path $installRoot, $stateRoot | Out-Null
+$mappingTemporary = Join-Path $installRoot ("managed-path-mappings-" + [guid]::NewGuid().ToString('N') + '.tmp')
+try {
+  $mappingJson = @{ version = 1; mappings = @($ManagedPathMapping) } | ConvertTo-Json -Compress
+  [IO.File]::WriteAllText($mappingTemporary, $mappingJson, (New-Object System.Text.UTF8Encoding $false))
+  $mappingAcl = New-Object Security.AccessControl.FileSecurity
+  $mappingAcl.SetAccessRuleProtection($true, $false)
+  $administrators = New-Object Security.Principal.SecurityIdentifier('S-1-5-32-544')
+  $mappingAcl.SetOwner($administrators)
+  foreach ($sid in @('S-1-5-18', 'S-1-5-32-544')) {
+    $identity = New-Object Security.Principal.SecurityIdentifier($sid)
+    $rule = New-Object Security.AccessControl.FileSystemAccessRule($identity, 'FullControl', 'Allow')
+    $mappingAcl.AddAccessRule($rule)
+  }
+  Set-Acl -LiteralPath $mappingTemporary -AclObject $mappingAcl
+  Move-Item -LiteralPath $mappingTemporary -Destination $mappingConfig -Force
+} finally {
+  if (Test-Path -LiteralPath $mappingTemporary) { Remove-Item -LiteralPath $mappingTemporary -Force }
+}
 if ((Test-Path $controllerState) -or (Test-Path $executorState)) {
   New-Item -ItemType Directory -Force -Path $backupRoot | Out-Null
   foreach ($stateFile in @($controllerState, $executorState)) {
@@ -94,7 +143,12 @@ do {
 Copy-Item -Force -LiteralPath $Binary -Destination $installedBinary
 
 function Quote-Arg([string]$Value) {
-  return '"' + $Value.Replace('"', '\"') + '"'
+  if ($Value -match '[\r\n\x00]') { throw 'service argument contains a control character' }
+  # CommandLineToArgvW/CRT quoting: double backslashes before a quote and
+  # before the closing delimiter, including drive roots ending in backslash.
+  $escaped = [regex]::Replace($Value, '(\\*)"', '$1$1\"')
+  $escaped = [regex]::Replace($escaped, '(\\+)$', '$1$1')
+  return '"' + $escaped + '"'
 }
 
 $controllerArgs = @(
@@ -117,6 +171,10 @@ foreach ($root in $AllowRoot) {
     throw "allow-root must be absolute: $root"
   }
   $executorParts += @("--allow-root", (Quote-Arg $root))
+}
+foreach ($mapping in $ManagedPathMapping) {
+  if (-not $mapping.Contains('=') -or $mapping -match '[\r\n]') { throw 'managed mapping must be LOGICAL=PHYSICAL' }
+  $executorParts += @("--managed-path-mapping", (Quote-Arg $mapping))
 }
 $executorArgs = $executorParts -join " "
 
