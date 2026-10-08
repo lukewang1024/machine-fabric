@@ -4,11 +4,34 @@ param(
   [string[]]$AllowRoot = @("C:\Users", "C:\ProgramData\machine-fabric"),
   [string]$PolicyUser,
   [string]$PolicyHome = $env:USERPROFILE,
-  [string[]]$ManagedPathMapping = @()
+  [string[]]$ManagedPathMapping = @(),
+  [switch]$SideBySide
 )
 
+function Stage-ImmutableBinary([string]$Source, [string]$Root) {
+  $digest = (Get-FileHash -LiteralPath $Source -Algorithm SHA256).Hash.ToLowerInvariant()
+  $versions = Join-Path $Root 'versions'
+  $directory = Join-Path $versions $digest
+  $destination = Join-Path $directory 'machine-fabric.exe'
+  foreach ($path in @($versions, $directory, $destination)) {
+    if ((Test-Path -LiteralPath $path) -and ((Get-Item -LiteralPath $path -Force).Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+      throw 'immutable binary installation contains a redirect'
+    }
+  }
+  if (-not (Test-Path -LiteralPath $destination)) {
+    New-Item -ItemType Directory -Path $directory -Force | Out-Null
+    Copy-Item -LiteralPath $Source -Destination $destination
+  }
+  if ((Get-FileHash -LiteralPath $destination -Algorithm SHA256).Hash.ToLowerInvariant() -ne $digest) {
+    throw 'immutable binary digest mismatch; reconcile existing installation'
+  }
+  return $destination
+}
+
 $ErrorActionPreference = "Stop"
-Import-Module (Join-Path $PSHOME 'Modules\Microsoft.PowerShell.Security\Microsoft.PowerShell.Security.psd1') -ErrorAction Stop
+foreach ($module in @('Microsoft.PowerShell.Utility', 'Microsoft.PowerShell.Management', 'Microsoft.PowerShell.Security', 'CimCmdlets')) {
+  Import-Module (Join-Path $PSHOME ("Modules\$module\$module.psd1")) -Force -ErrorAction Stop
+}
 if ($PolicyUser) {
   try {
     $account = New-Object System.Security.Principal.NTAccount($PolicyUser)
@@ -29,6 +52,7 @@ if (-not $PolicyHome -or $PolicyHome -notmatch '^(?:[A-Za-z]:[\\/]|\\\\[^\\]+\\[
 $installRoot = Join-Path $env:ProgramFiles "machine-fabric"
 $stateRoot = Join-Path $env:ProgramData "machine-fabric"
 $installedBinary = Join-Path $installRoot "machine-fabric.exe"
+$legacyBinary = $installedBinary
 $controllerSocket = Join-Path $stateRoot "controller.sock"
 $executorSocket = Join-Path $stateRoot "executor.sock"
 $controllerState = Join-Path $stateRoot "controller.json"
@@ -64,7 +88,29 @@ foreach ($mapping in $ManagedPathMapping) { $validationArgs += @('--managed-path
 & $Binary @validationArgs
 if ($LASTEXITCODE -ne 0) { throw 'managed path policy preflight failed; services were not stopped' }
 
+$initialServiceProcessIds = @(
+  Get-CimInstance -ClassName Win32_Service -Filter "Name = 'MachineFabricController' OR Name = 'MachineFabricExecutor'" |
+    Where-Object { $_.ProcessId -gt 0 } | Select-Object -ExpandProperty ProcessId
+)
+$initialFabricProcesses = @(Get-CimInstance -ClassName Win32_Process -Filter "Name = 'machine-fabric.exe'")
+$ownedProcessIds = @($initialServiceProcessIds)
+do {
+  $children = @($initialFabricProcesses | Where-Object { $_.ParentProcessId -in $ownedProcessIds -and $_.ProcessId -notin $ownedProcessIds } | Select-Object -ExpandProperty ProcessId)
+  $ownedProcessIds += $children
+} while ($children.Count)
+$ownedProcesses = @($initialFabricProcesses | Where-Object { $_.ProcessId -in $ownedProcessIds })
+$foreignHolders = @($initialFabricProcesses | Where-Object {
+  $_.ExecutablePath -and $_.ExecutablePath.Equals($legacyBinary, [StringComparison]::OrdinalIgnoreCase) -and $_.ProcessId -notin $ownedProcessIds
+})
+if ($foreignHolders.Count -and -not $SideBySide) {
+  throw 'unowned processes hold the legacy binary; use -SideBySide or arrange an owner-controlled stop; services were not stopped'
+}
+if ($SideBySide -and -not (Test-Path -LiteralPath $legacyBinary)) {
+  throw 'side-by-side upgrade requires an existing legacy installation'
+}
+
 New-Item -ItemType Directory -Force -Path $installRoot, $stateRoot | Out-Null
+if ($SideBySide) { $installedBinary = Stage-ImmutableBinary -Source $Binary -Root $installRoot }
 $mappingTemporary = Join-Path $installRoot ("managed-path-mappings-" + [guid]::NewGuid().ToString('N') + '.tmp')
 try {
   $mappingJson = @{ version = 1; mappings = @($ManagedPathMapping) } | ConvertTo-Json -Compress
@@ -95,11 +141,6 @@ New-Item -ItemType Directory -Force -Path $fabricRoot | Out-Null
 # endpoints in this directory. Controller state remains writable by services.
 & icacls.exe $fabricRoot /grant '*S-1-5-11:(OI)(CI)M' /T /C | Out-Null
 if ($LASTEXITCODE -ne 0) { throw "failed to grant fabric IPC directory access" }
-$initialServiceProcessIds = @(
-  Get-CimInstance -ClassName Win32_Service -Filter "Name = 'MachineFabricController' OR Name = 'MachineFabricExecutor'" |
-    Where-Object { $_.ProcessId -gt 0 } |
-    Select-Object -ExpandProperty ProcessId
-)
 foreach ($serviceName in @("MachineFabricController", "MachineFabricExecutor")) {
   if (Get-Service -Name $serviceName -ErrorAction SilentlyContinue) {
     Stop-Service -Name $serviceName -Force -ErrorAction SilentlyContinue
@@ -119,8 +160,8 @@ do {
   $runningProcesses = @(
     Get-CimInstance -ClassName Win32_Process -Filter "Name = 'machine-fabric.exe'" |
       Where-Object {
-        $_.ExecutablePath -and
-          $_.ExecutablePath.Equals($installedBinary, [System.StringComparison]::OrdinalIgnoreCase)
+        $process = $_
+        @($ownedProcesses | Where-Object { $_.ProcessId -eq $process.ProcessId -and $_.CreationDate -eq $process.CreationDate }).Count -gt 0
       }
   )
   if ($runningProcesses.Count -eq 0) { break }
@@ -140,7 +181,7 @@ do {
   }
   Start-Sleep -Milliseconds 200
 } while ($true)
-Copy-Item -Force -LiteralPath $Binary -Destination $installedBinary
+if (-not $SideBySide) { Copy-Item -Force -LiteralPath $Binary -Destination $installedBinary }
 
 function Quote-Arg([string]$Value) {
   if ($Value -match '[\r\n\x00]') { throw 'service argument contains a control character' }
@@ -221,5 +262,21 @@ try {
   if ($LASTEXITCODE -ne 0) { throw "failed to register local executor" }
 } finally {
   Remove-Item -LiteralPath $registrationPath -Force -ErrorAction SilentlyContinue
+}
+$receipt = @{
+  installedBinary = $installedBinary
+  installedSha256 = (Get-FileHash -LiteralPath $installedBinary -Algorithm SHA256).Hash.ToLowerInvariant()
+  sideBySide = [bool]$SideBySide
+  legacyBinary = $legacyBinary
+  legacyBinaryUpdated = (-not $SideBySide)
+  retainedForeignProcessIds = @($foreignHolders | Select-Object -ExpandProperty ProcessId)
+  completedAt = (Get-Date).ToUniversalTime().ToString('o')
+} | ConvertTo-Json -Depth 5
+$receiptTemporary = Join-Path $installRoot ('installation-' + [guid]::NewGuid().ToString('N') + '.tmp')
+try {
+  [IO.File]::WriteAllText($receiptTemporary, $receipt, (New-Object System.Text.UTF8Encoding $false))
+  Move-Item -LiteralPath $receiptTemporary -Destination (Join-Path $installRoot 'installation.json') -Force
+} finally {
+  if (Test-Path -LiteralPath $receiptTemporary) { Remove-Item -LiteralPath $receiptTemporary -Force }
 }
 Write-Output $installedBinary

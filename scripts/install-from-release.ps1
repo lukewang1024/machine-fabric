@@ -6,7 +6,8 @@ param(
   [string]$PolicyUserFile,
   [string]$PolicyUser,
   [string]$PolicyHome = $env:USERPROFILE,
-  [string[]]$ManagedPathMapping = @()
+  [string[]]$ManagedPathMapping = @(),
+  [switch]$SideBySide
 )
 
 $ErrorActionPreference = "Stop"
@@ -50,6 +51,7 @@ try {
   Expand-Archive -Path (Join-Path $temporary $archive) -DestinationPath $temporary
   $root = Join-Path $temporary "machine-fabric-$Version-$target"
   $mappingOptions = @{}
+  if ($SideBySide) { $mappingOptions.SideBySide = $true }
   if ($PSBoundParameters.ContainsKey('ManagedPathMapping')) { $mappingOptions.ManagedPathMapping = $ManagedPathMapping }
   & (Join-Path $root "scripts\install-windows.ps1") -Binary (Join-Path $root "bin\machine-fabric.exe") -NodeId $NodeId -AllowRoot $AllowRoot -PolicyUser $PolicyUser -PolicyHome $PolicyHome @mappingOptions
 } finally {
