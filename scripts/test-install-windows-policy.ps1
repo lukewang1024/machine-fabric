@@ -13,6 +13,9 @@ $quoteFunction = $ast.Find({ param($node) $node -is [Management.Automation.Langu
 if (-not $quoteFunction) { throw 'missing service argument quoting function' }
 # Evaluate only the repository's parsed quoting function, never the installer.
 Invoke-Expression $quoteFunction.Extent.Text
+$stageFunction = $ast.Find({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Stage-ImmutableBinary' }, $true)
+if (-not $stageFunction) { throw 'missing immutable staging function' }
+Invoke-Expression $stageFunction.Extent.Text
 Add-Type @'
 using System;
 using System.Runtime.InteropServices;
@@ -46,6 +49,26 @@ $priorProgramData = $env:ProgramData
 try {
   $homePath = Join-Path $fixture 'home'
   New-Item -ItemType Directory -Path $homePath -Force | Out-Null
+  $stageRoot = Join-Path $fixture 'immutable-install'
+  New-Item -ItemType Directory -Path $stageRoot -Force | Out-Null
+  $legacy = Join-Path $stageRoot 'machine-fabric.exe'
+  $candidate = Join-Path $fixture 'candidate.exe'
+  [IO.File]::WriteAllText($legacy, 'old binary fixture')
+  [IO.File]::WriteAllText($candidate, 'new binary fixture')
+  $heldLegacy = [IO.File]::Open($legacy, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+  try {
+    $staged = Stage-ImmutableBinary -Source $candidate -Root $stageRoot
+    if ($staged -eq $legacy -or [IO.File]::ReadAllText($legacy) -ne 'old binary fixture') { throw 'held legacy binary was modified' }
+    if ([IO.File]::ReadAllText($staged) -ne 'new binary fixture') { throw 'candidate binary was not staged' }
+    $heldCandidate = [IO.File]::Open($staged, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+    try {
+      if ((Stage-ImmutableBinary -Source $candidate -Root $stageRoot) -ne $staged) { throw 'identical held candidate was not reused' }
+    } finally { $heldCandidate.Dispose() }
+    [IO.File]::WriteAllText($staged, 'corrupted fixture')
+    $rejected = $false
+    try { Stage-ImmutableBinary -Source $candidate -Root $stageRoot | Out-Null } catch { $rejected = $true }
+    if (-not $rejected -or [IO.File]::ReadAllText($staged) -ne 'corrupted fixture') { throw 'corrupt immutable candidate was overwritten or accepted' }
+  } finally { $heldLegacy.Dispose() }
   & $Binary executor validate-path-policy --policy-home $homePath
   if ($LASTEXITCODE -ne 0) { throw 'valid empty mapping policy rejected' }
   $env:ProgramFiles = Join-Path $fixture 'program-files'
