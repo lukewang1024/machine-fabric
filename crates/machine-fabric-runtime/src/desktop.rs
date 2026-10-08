@@ -15,6 +15,11 @@ pub(crate) struct DesktopQueue {
     // Persist before dispatch: an interrupted action is never replayed on restart.
     in_flight: bool,
     blocked: bool,
+    // Stable across Executor/helper restarts, different after an OS restart.
+    #[serde(default)]
+    boot_id: Option<String>,
+    #[serde(default)]
+    last_recovery: Option<Value>,
     #[serde(default)]
     maintenance_owner: Option<String>,
     // An in-memory barrier for the narrow read-only inspection allowed while
@@ -81,8 +86,44 @@ pub(crate) fn protected(action: &str) -> bool {
         || action.starts_with("ui.")
         || action == "clipboard.write"
 }
+// Boot identifiers are kernel evidence, not process uptime or connectivity.
+fn current_boot_id() -> Option<String> {
+    #[cfg(target_os = "linux")]
+    let value = fs::read_to_string("/proc/sys/kernel/random/boot_id").ok()?;
+    #[cfg(target_os = "macos")]
+    let value = {
+        let mut bytes = [0u8; 128];
+        let mut size = bytes.len();
+        let result = unsafe {
+            libc::sysctlbyname(
+                c"kern.bootsessionuuid".as_ptr(),
+                bytes.as_mut_ptr().cast(),
+                &mut size,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if result != 0 || size == 0 || size > bytes.len() {
+            return None;
+        }
+        std::str::from_utf8(&bytes[..size])
+            .ok()?
+            .trim_end_matches('\0')
+            .to_owned()
+    };
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    return None;
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    uuid::Uuid::parse_str(value.trim())
+        .ok()
+        .map(|id| id.to_string())
+}
+
 impl DesktopQueue {
     pub(crate) fn open(path: PathBuf) -> Result<Self, RpcError> {
+        Self::open_with_boot_id(path, current_boot_id())
+    }
+    fn open_with_boot_id(path: PathBuf, boot_id: Option<String>) -> Result<Self, RpcError> {
         let mut queue: Self = if path.exists() {
             serde_json::from_slice(&fs::read(&path).map_err(|e| error("DESKTOP_STATE_FAILED", e))?)
                 .map_err(|e| error("DESKTOP_STATE_FAILED", e))?
@@ -90,16 +131,39 @@ impl DesktopQueue {
             Self::default()
         };
         queue.path = Some(path);
-        // Native helpers may outlive a crashed process. Fail closed until an operator
-        // confirms the desktop has been reset; never turn a crash into a new grant.
-        if queue.in_flight
+        let restarted =
+            matches!((&queue.boot_id, &boot_id), (Some(old), Some(current)) if old != current);
+        let interrupted = queue.in_flight
             || queue
                 .jobs
                 .iter()
-                .any(|j| j.state == "active" || j.state == "draining")
-        {
+                .any(|j| matches!(j.state.as_str(), "active" | "draining"));
+        if restarted {
+            // A real OS restart ends every old helper and clears native key state.
+            // Retire old grants; never replay their actions or reuse active tokens.
+            let mut retired = 0;
+            for job in &mut queue.jobs {
+                if matches!(job.state.as_str(), "active" | "draining") {
+                    job.state = "interrupted".into();
+                    retired += 1;
+                }
+            }
+            if queue.blocked || interrupted {
+                queue.last_recovery = Some(
+                    json!({"reason":"os_restart", "observedAt":now_ms(), "interruptedSessions":retired, "inputReplayed":false}),
+                );
+            }
+            queue.blocked = false;
+            queue.in_flight = false;
+        } else if interrupted {
+            // A helper may survive an Executor restart. Missing boot evidence is
+            // never evidence of a reset (including legacy queue files).
             queue.blocked = true;
             queue.in_flight = false;
+        }
+        // Preserve known evidence if the OS query temporarily fails.
+        if boot_id.is_some() {
+            queue.boot_id = boot_id;
         }
         queue.save()?;
         Ok(queue)
@@ -268,7 +332,7 @@ impl DesktopQueue {
                     })
                     .collect();
                 Ok(
-                    json!({"jobs":jobs,"historyCount":history_count,"totalCount":self.jobs.len(),"historyIncluded":include_terminal,"blocked":self.blocked,"inFlight":self.in_flight,"maintenanceOwner":self.maintenance_owner,"safePoint":self.maintenance_owner.is_some() && !self.blocked && !self.in_flight && self.active().is_none()}),
+                    json!({"jobs":jobs,"historyCount":history_count,"totalCount":self.jobs.len(),"historyIncluded":include_terminal,"blocked":self.blocked,"inFlight":self.in_flight,"lastRecovery":self.last_recovery,"recoveryPolicy":"verified-os-restart-or-explicit-desktop-reset","maintenanceOwner":self.maintenance_owner,"safePoint":self.maintenance_owner.is_some() && !self.blocked && !self.in_flight && self.active().is_none()}),
                 )
             }
             "desktop.get" | "desktop.renew" | "desktop.finish" | "desktop.cancel" => {
@@ -412,6 +476,119 @@ mod tests {
     fn credentials(job: &Value) -> Value {
         json!({"owner":job["owner"],"token":job["token"]})
     }
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn kernel_boot_identity_is_a_stable_uuid() {
+        let first = current_boot_id().expect("kernel boot identity must be readable");
+        assert!(uuid::Uuid::parse_str(&first).is_ok());
+        assert_eq!(current_boot_id().as_deref(), Some(first.as_str()));
+    }
+
+    #[test]
+    fn verified_os_restart_retires_old_input_grant_without_replay() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("queue.json");
+        let mut queue =
+            DesktopQueue::open_with_boot_id(path.clone(), Some("boot-a".into())).unwrap();
+        let job = submit(&mut queue, "old");
+        let mut input = json!({"_desktop":credentials(&job)});
+        queue.begin("computer-use.call", &mut input).unwrap();
+        // Simulate a process interrupted while native input was in flight.
+        drop(queue);
+        let mut reopened =
+            DesktopQueue::open_with_boot_id(path.clone(), Some("boot-b".into())).unwrap();
+        assert!(!reopened.blocked);
+        assert!(!reopened.in_flight);
+        assert_eq!(
+            reopened.command("desktop.get", &credentials(&job)).unwrap()["state"],
+            "interrupted"
+        );
+        assert_eq!(
+            reopened.last_recovery.as_ref().unwrap()["reason"],
+            "os_restart"
+        );
+        assert_eq!(
+            reopened.last_recovery.as_ref().unwrap()["inputReplayed"],
+            false
+        );
+        assert_eq!(
+            reopened
+                .begin("computer-use.call", &mut input)
+                .unwrap_err()
+                .code,
+            "DESKTOP_SESSION_REQUIRED"
+        );
+        let fresh = submit(&mut reopened, "fresh");
+        assert_eq!(fresh["state"], "active");
+        assert_ne!(fresh["token"], job["token"]);
+        assert!(fresh["epoch"].as_u64().unwrap() > job["epoch"].as_u64().unwrap());
+        assert_eq!(
+            reopened
+                .begin("computer-use.call", &mut input)
+                .unwrap_err()
+                .code,
+            "DESKTOP_BUSY"
+        );
+        // Recovery evidence and terminal old grants survive another restart.
+        drop(reopened);
+        let reopened = DesktopQueue::open_with_boot_id(path, Some("boot-b".into())).unwrap();
+        assert!(reopened.blocked); // fresh active session interrupted in same boot
+        assert_eq!(
+            reopened.last_recovery.as_ref().unwrap()["interruptedSessions"],
+            1
+        );
+    }
+
+    #[test]
+    fn same_boot_or_missing_evidence_never_unlocks_uncertain_input() {
+        for (old, current) in [
+            (Some("boot-a"), Some("boot-a")),
+            (Some("boot-a"), None),
+            (None, Some("boot-b")),
+            (None, None),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("queue.json");
+            let mut queue =
+                DesktopQueue::open_with_boot_id(path.clone(), old.map(str::to_owned)).unwrap();
+            queue.blocked = true;
+            queue.save().unwrap();
+            let reopened =
+                DesktopQueue::open_with_boot_id(path, current.map(str::to_owned)).unwrap();
+            assert!(reopened.blocked, "old={old:?}, current={current:?}");
+            assert!(reopened.last_recovery.is_none());
+        }
+    }
+
+    #[test]
+    fn reboot_recovery_preserves_maintenance_and_does_not_promote_work() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("queue.json");
+        let mut queue =
+            DesktopQueue::open_with_boot_id(path.clone(), Some("boot-a".into())).unwrap();
+        queue
+            .command(
+                "desktop.maintenance",
+                &json!({"owner":"installer","enabled":true}),
+            )
+            .unwrap();
+        let job = submit(&mut queue, "waiting");
+        queue.blocked = true;
+        queue.save().unwrap();
+        let mut reopened = DesktopQueue::open_with_boot_id(path, Some("boot-b".into())).unwrap();
+        assert!(!reopened.blocked);
+        assert_eq!(reopened.maintenance_owner.as_deref(), Some("installer"));
+        reopened.promote().unwrap();
+        assert_eq!(
+            reopened.command("desktop.get", &credentials(&job)).unwrap()["state"],
+            "queued"
+        );
+        let receipt = reopened
+            .command("desktop.list", &json!({"includeTerminal":false}))
+            .unwrap();
+        assert_eq!(receipt["lastRecovery"]["reason"], "os_restart");
+    }
+
     #[test]
     fn live_listing_keeps_contention_and_recovery_without_historical_payload() {
         let mut q = DesktopQueue::default();
