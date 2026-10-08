@@ -81,7 +81,7 @@ try {
   # any service or installation mutation, even when the policy is valid.
   $probe = Join-Path $fixture 'preflight-probe.ps1'
   $env:FABRIC_POLICY_TEST_ARGS = Join-Path $fixture 'arguments.json'
-  '$args | ConvertTo-Json -Compress | Set-Content -LiteralPath $env:FABRIC_POLICY_TEST_ARGS; $global:LASTEXITCODE=47' | Set-Content -LiteralPath $probe -Encoding UTF8
+  '@{arguments=@($args)} | ConvertTo-Json -Compress | Set-Content -LiteralPath $env:FABRIC_POLICY_TEST_ARGS; $global:LASTEXITCODE=47' | Set-Content -LiteralPath $probe -Encoding UTF8
   foreach ($explicitEmpty in @($false, $true)) {
     $options = @{}
     if ($explicitEmpty) { $options.ManagedPathMapping = @() }
@@ -90,7 +90,8 @@ try {
     try { & $installer -Binary $probe -PolicyHome $homePath @options } catch { $rejected = $true; $failure = $_.Exception.Message }
     if (-not $rejected) { throw 'probe did not stop installation before service mutations' }
     if ($failure -ne 'managed path policy preflight failed; services were not stopped') { throw "unexpected installer rejection: $failure" }
-    $recorded = @(Get-Content -LiteralPath $env:FABRIC_POLICY_TEST_ARGS -Raw | ConvertFrom-Json)
+    $record = Get-Content -LiteralPath $env:FABRIC_POLICY_TEST_ARGS -Raw | ConvertFrom-Json
+    $recorded = @($record.arguments)
     if (($recorded -contains $mapping) -eq $explicitEmpty) {
       throw ("upgrade mapping inheritance or explicit clearing failed: explicitEmpty={0}; expected={1}; recorded={2}" -f $explicitEmpty, $mapping, ($recorded | ConvertTo-Json -Compress))
     }
