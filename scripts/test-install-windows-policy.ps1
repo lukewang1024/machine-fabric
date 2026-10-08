@@ -2,7 +2,9 @@ param([Parameter(Mandatory = $true)][string]$Binary)
 $ErrorActionPreference = 'Stop'
 # A PowerShell 7 parent can leave incompatible modules on PSModulePath.
 # Load the native 5.1 security module before changing fixture environment.
-Import-Module (Join-Path $PSHOME 'Modules\Microsoft.PowerShell.Security\Microsoft.PowerShell.Security.psd1') -ErrorAction Stop
+foreach ($module in @('Microsoft.PowerShell.Utility', 'Microsoft.PowerShell.Management', 'Microsoft.PowerShell.Security', 'CimCmdlets')) {
+  Import-Module (Join-Path $PSHOME ("Modules\$module\$module.psd1")) -Force -ErrorAction Stop
+}
 $Binary = (Resolve-Path -LiteralPath $Binary).Path
 $installer = Join-Path $PSScriptRoot 'install-windows.ps1'
 $tokens = $null
