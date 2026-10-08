@@ -113,6 +113,32 @@ user `AppData/Local` and `AppData/Roaming`. The Windows installer can resolve
 profile. `allowRoots` remains the legacy Linux path gate and provides an
 internal relay root; it does not expand the desktop write allow list.
 
+Administrators may explicitly register relocated desktop directories with the
+repeatable Executor startup option `--managed-path-mapping LOGICAL=PHYSICAL`.
+The Windows installers accept the corresponding `-ManagedPathMapping` string
+array. Both directories must exist and resolve to the same location, and the
+logical directory must be inside an existing desktop write root. Overlapping
+registrations are rejected. Configuration is verified before serving RPCs;
+`status.pathPolicy.managedPathMappings` reports the active registrations.
+This is startup configuration, not an RPC permission grant. Do not infer a
+trusted mapping from a junction's presence or from `allowRoots`.
+The installer validates the candidate policy before stopping services and
+persists the intended mappings in an administrator-owned configuration beside
+the installed binary. Upgrades inherit that configuration when the mapping
+parameter is omitted; an explicitly empty array clears it. Redirected
+configuration, or configuration writable by non-administrators, is rejected. The standalone
+`executor validate-path-policy` command performs the same policy validation
+without starting services or creating runtime state.
+
+Writes through a registration must still resolve to the exact registered
+target plus the logical suffix. A changed mapping or an additional redirect
+inside it is rejected; credential deny rules apply to logical and resolved
+paths. Unregistered paths retain the existing physical write-root checks.
+Desktop path normalization collapses parent components without crossing a
+filesystem root and rejects Windows device paths, alternate data streams,
+and ambiguous trailing spaces or dots. File operations use the checked
+resolved destination rather than following the logical alias a second time.
+
 This is admission control for Executor path arguments. Commands and launched
 applications run with their normal OS privileges and are not filesystem
 sandboxed by this policy. macOS TCC and Windows ACL checks still apply.

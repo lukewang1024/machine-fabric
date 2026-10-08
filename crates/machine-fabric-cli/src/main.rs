@@ -132,6 +132,13 @@ enum ControllerCommand {
 
 #[derive(Debug, Subcommand)]
 enum ExecutorCommand {
+    /// Validate administrator path mappings without starting or changing services.
+    ValidatePathPolicy {
+        #[arg(long)]
+        policy_home: PathBuf,
+        #[arg(long = "managed-path-mapping")]
+        managed_path_mappings: Vec<String>,
+    },
     Serve {
         #[arg(long)]
         id: String,
@@ -141,6 +148,9 @@ enum ExecutorCommand {
         path_policy: String,
         #[arg(long = "policy-home")]
         policy_home: Option<PathBuf>,
+        /// Administrator-approved LOGICAL=PHYSICAL directory mapping (repeatable).
+        #[arg(long = "managed-path-mapping")]
+        managed_path_mappings: Vec<String>,
         #[arg(long)]
         state: Option<PathBuf>,
     },
@@ -371,11 +381,33 @@ fn run_cli() -> Result<()> {
         }
         Command::Executor {
             command:
+                ExecutorCommand::ValidatePathPolicy {
+                    policy_home,
+                    managed_path_mappings,
+                },
+        } => {
+            let mappings = managed_path_mappings
+                .iter()
+                .map(|value| {
+                    let (logical, physical) = value.split_once('=').ok_or_else(|| {
+                        anyhow::anyhow!("managed mapping must be LOGICAL=PHYSICAL")
+                    })?;
+                    Ok((PathBuf::from(logical), PathBuf::from(physical)))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            ExecutorRuntime::validate_managed_path_mappings(&policy_home, mappings)
+                .map_err(|error| anyhow::anyhow!("{}: {}", error.code, error.message))?;
+            println!("{{\"valid\":true}}");
+            Ok(())
+        }
+        Command::Executor {
+            command:
                 ExecutorCommand::Serve {
                     id,
                     allow_roots,
                     path_policy,
                     policy_home,
+                    managed_path_mappings,
                     state,
                 },
         } => {
@@ -389,11 +421,28 @@ fn run_cli() -> Result<()> {
                     let home = policy_home.ok_or_else(|| {
                         anyhow::anyhow!("--policy-home is required for desktop path policy")
                     })?;
-                    ExecutorRuntime::open_with_desktop_policy(id, allow_roots, state, &home)
+                    let mut runtime =
+                        ExecutorRuntime::open_with_desktop_policy(id, allow_roots, state, &home)
+                            .map_err(|error| {
+                                anyhow::anyhow!("{}: {}", error.code, error.message)
+                            })?;
+                    let mappings = managed_path_mappings
+                        .iter()
+                        .map(|value| {
+                            let (logical, physical) = value.split_once('=').ok_or_else(|| {
+                                anyhow::anyhow!("managed mapping must be LOGICAL=PHYSICAL")
+                            })?;
+                            Ok((PathBuf::from(logical), PathBuf::from(physical)))
+                        })
+                        .collect::<Result<Vec<_>>>()?;
+                    runtime
+                        .register_managed_path_mappings(mappings)
+                        .map_err(|error| anyhow::anyhow!("{}: {}", error.code, error.message))?;
+                    Ok(runtime)
                 } else {
                     anyhow::ensure!(
-                        policy_home.is_none(),
-                        "--policy-home requires desktop path policy"
+                        policy_home.is_none() && managed_path_mappings.is_empty(),
+                        "--policy-home and --managed-path-mapping require desktop path policy"
                     );
                     ExecutorRuntime::open(id, allow_roots, state)
                 }

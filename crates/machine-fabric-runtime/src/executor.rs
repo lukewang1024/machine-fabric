@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 
 use crate::datapack::{DataPackResourceTree, pack_chromium_datapack};
 use crate::generation::{Overlay, activate, apply_overlays, materialize, record_state};
-use crate::path_policy::{DesktopPathPolicy, PathAccess, resolve_path};
+use crate::path_policy::{DesktopPathPolicy, PathAccess, logical_path, resolve_path};
 use crate::process::ProcessTable;
 use crate::telemetry::{event_fields, request_event};
 
@@ -322,6 +322,30 @@ impl ExecutorRuntime {
         Self::open_with_policy(id, allowed_roots, state_path, Some(home))
     }
 
+    /// Administrator startup configuration; never exposed as an RPC mutation.
+    pub fn validate_managed_path_mappings(
+        home: &Path,
+        mappings: Vec<(PathBuf, PathBuf)>,
+    ) -> Result<(), RpcError> {
+        DesktopPathPolicy::new(home)?.register_mappings(mappings)
+    }
+
+    /// Administrator startup configuration; never exposed as an RPC mutation.
+    pub fn register_managed_path_mappings(
+        &mut self,
+        mappings: Vec<(PathBuf, PathBuf)>,
+    ) -> Result<(), RpcError> {
+        self.desktop_policy
+            .as_mut()
+            .ok_or_else(|| {
+                RpcError::new(
+                    "INVALID_ROOT",
+                    "managed mappings require desktop path policy",
+                )
+            })?
+            .register_mappings(mappings)
+    }
+
     fn open_with_policy(
         id: impl Into<String>,
         allowed_roots: Vec<PathBuf>,
@@ -618,6 +642,7 @@ impl ExecutorRuntime {
                     "mode": "desktop",
                     "readDenyRoots": policy.read_denied(),
                     "writeAllowRoots": policy.write_allowed(),
+                    "managedPathMappings": policy.managed_mappings().iter().map(|(logical, physical)| json!({"logicalRoot": logical, "physicalRoot": physical})).collect::<Vec<_>>(),
                 })).unwrap_or_else(|| json!({"mode": "legacy"})),
                 "capabilities": capability_catalog(),
                 "execution": self.execution_summary(),
@@ -1906,6 +1931,11 @@ impl ExecutorRuntime {
         if let Some(policy) = &self.desktop_policy {
             policy.check(&path, PathAccess::Read)?;
         }
+        let path = if self.desktop_policy.is_some() {
+            logical_path(&path)?
+        } else {
+            path
+        };
         if must_exist && !path.exists() {
             return Err(io_error(
                 "PATH_INVALID",
@@ -1915,7 +1945,7 @@ impl ExecutorRuntime {
         }
         let checked = resolve_path(&path)?;
         if let Some(policy) = &self.desktop_policy {
-            policy.check(&checked, access)?;
+            policy.check_resolved(&path, &checked, access)?;
             return Ok(checked);
         }
         if !self
@@ -3757,6 +3787,44 @@ mod tests {
             }
         }
         assert!(super::render_execution_resource(debug, "ui.inspect", &params, None).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn desktop_mkdir_uses_registered_logical_mapping_without_authorizing_other_redirects() {
+        let directory = tempfile::tempdir().unwrap();
+        let home = directory.path().join("home");
+        let target = directory.path().join("relocated");
+        let outside = directory.path().join("outside");
+        fs::create_dir_all(home.join("Documents")).unwrap();
+        fs::create_dir_all(&target).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        let logical = home.join("Documents/managed");
+        std::os::unix::fs::symlink(&target, &logical).unwrap();
+        let mut runtime =
+            ExecutorRuntime::base("desktop", vec![home.clone()], Some(&home)).unwrap();
+        runtime
+            .register_managed_path_mappings(vec![(logical.clone(), target.clone())])
+            .unwrap();
+        runtime
+            .dispatch(
+                "filesystem.mkdir",
+                json!({"path": logical.join("unused/../baseline/user-data")}),
+            )
+            .unwrap();
+        assert!(target.join("baseline/user-data").is_dir());
+        std::os::unix::fs::symlink(&outside, target.join("escape")).unwrap();
+        assert_eq!(
+            runtime
+                .dispatch(
+                    "filesystem.mkdir",
+                    json!({"path": logical.join("escape/denied")})
+                )
+                .unwrap_err()
+                .code,
+            "PATH_WRITE_DENIED"
+        );
+        assert!(!outside.join("denied").exists());
     }
 
     #[test]
