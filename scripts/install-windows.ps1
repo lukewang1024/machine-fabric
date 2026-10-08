@@ -65,11 +65,18 @@ foreach ($trustedPath in @($installRoot, $mappingConfig)) {
   if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'managed mapping configuration must not be a redirect' }
   $acl = Get-Acl -LiteralPath $trustedPath
   $trustedSids = @('S-1-5-18', 'S-1-5-32-544')
+  # Program Files inherits an effective FullControl ACE for Windows Modules
+  # Installer. Trust that fixed OS service SID only on the installation root;
+  # persisted mapping configuration remains writable by SYSTEM/Admins only.
+  $trustedWriterSids = @($trustedSids)
+  if ($trustedPath -eq $installRoot) {
+    $trustedWriterSids += 'S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464'
+  }
   if ($acl.GetOwner([Security.Principal.SecurityIdentifier]).Value -notin $trustedSids) { throw 'managed mapping configuration owner is not an administrator' }
   $writeRights = [Security.AccessControl.FileSystemRights]::Write -bor [Security.AccessControl.FileSystemRights]::Delete -bor [Security.AccessControl.FileSystemRights]::ChangePermissions -bor [Security.AccessControl.FileSystemRights]::TakeOwnership
   foreach ($rule in $acl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier])) {
     if ($rule.AccessControlType -eq [Security.AccessControl.AccessControlType]::Allow -and
-        ($rule.FileSystemRights -band $writeRights) -and $rule.IdentityReference.Value -notin $trustedSids) {
+        ($rule.FileSystemRights -band $writeRights) -and $rule.IdentityReference.Value -notin $trustedWriterSids) {
       throw 'managed mapping configuration is writable by an untrusted identity'
     }
   }

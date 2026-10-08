@@ -126,7 +126,10 @@ The installer validates the candidate policy before stopping services and
 persists the intended mappings in an administrator-owned configuration beside
 the installed binary. Upgrades inherit that configuration when the mapping
 parameter is omitted; an explicitly empty array clears it. Redirected
-configuration, or configuration writable by non-administrators, is rejected. The standalone
+configuration, or configuration writable by non-administrators, is rejected.
+The installation directory accepts the fixed Windows Modules Installer
+(`TrustedInstaller`) service SID inherited from Program Files; this exception
+does not apply to the persisted mapping configuration. The standalone
 `executor validate-path-policy` command performs the same policy validation
 without starting services or creating runtime state.
 
