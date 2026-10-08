@@ -845,6 +845,58 @@ impl ExecutorRuntime {
                     .get("content")
                     .and_then(Value::as_str)
                     .ok_or_else(|| RpcError::new("INVALID_PARAMS", "content is required"))?;
+                let expected_absent = match params.get("expectedAbsent") {
+                    None | Some(Value::Bool(false)) => false,
+                    Some(Value::Bool(true)) => true,
+                    _ => {
+                        return Err(RpcError::new(
+                            "INVALID_PARAMS",
+                            "expectedAbsent must be a boolean",
+                        ));
+                    }
+                };
+                if expected_absent {
+                    if params.get("expectedDigest").is_some() {
+                        return Err(RpcError::new(
+                            "INVALID_PARAMS",
+                            "expectedAbsent and expectedDigest are mutually exclusive",
+                        ));
+                    }
+                    let logical = PathBuf::from(required_str(&params, "path")?);
+                    let temporary = self.write_path(&json!({"path": logical.with_extension(format!("fabric.{}.{}.tmp", std::process::id(), uuid::Uuid::new_v4().simple()))}), "path", false)?;
+                    if temporary.parent() != path.parent() {
+                        return Err(RpcError::new(
+                            "PATH_WRITE_DENIED",
+                            "creation temporary directory differs from checked destination",
+                        ));
+                    }
+                    if let Some(parent) = path.parent() {
+                        fs::create_dir_all(parent)
+                            .map_err(|error| io_error("FS_WRITE_FAILED", parent, error))?;
+                    }
+                    let mut staged = fs::OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .open(&temporary)
+                        .map_err(|error| io_error("FS_WRITE_FAILED", &temporary, error))?;
+                    let outcome = (|| {
+                        std::io::Write::write_all(&mut staged, content.as_bytes())
+                            .map_err(|error| io_error("FS_WRITE_FAILED", &temporary, error))?;
+                        drop(staged);
+                        // Linking publishes complete contents without replacing any
+                        // target created concurrently. Unsupported filesystems fail closed.
+                        fs::hard_link(&temporary, &path).map_err(|error| {
+                            if error.kind() == std::io::ErrorKind::AlreadyExists {
+                                RpcError::new("DIGEST_CONFLICT", "expected target to be absent")
+                            } else {
+                                io_error("FS_WRITE_FAILED", &path, error)
+                            }
+                        })
+                    })();
+                    let _ = fs::remove_file(&temporary);
+                    outcome?;
+                    return Ok(json!({"path": path, "digest": digest_file(&path)?}));
+                }
                 if let Some(expected) = params.get("expectedDigest").and_then(Value::as_str) {
                     let actual = if path.exists() {
                         Some(digest_file(&path)?)
@@ -915,17 +967,28 @@ impl ExecutorRuntime {
                         format!("expected {expected}, got {actual}"),
                     ));
                 }
-                let parent = path
+                let logical = PathBuf::from(required_str(&params, "path")?);
+                let logical_parent = logical
                     .parent()
                     .ok_or_else(|| RpcError::new("PATH_INVALID", "path has no parent"))?;
-                let trash = parent.join(".machine-fabric-trash");
-                fs::create_dir_all(&trash)
-                    .map_err(|error| io_error("FS_REMOVE_FAILED", &trash, error))?;
                 let token = format!("{}_{}", now_ms(), uuid::Uuid::new_v4().simple());
-                let destination = trash.join(&token);
+                let logical_token = logical_parent.join(".machine-fabric-trash").join(token);
+                let destination =
+                    self.write_path(&json!({"path": logical_token}), "path", false)?;
+                let trash = destination
+                    .parent()
+                    .ok_or_else(|| RpcError::new("PATH_INVALID", "trash has no parent"))?;
+                if trash.parent() != path.parent() {
+                    return Err(RpcError::new(
+                        "PATH_WRITE_DENIED",
+                        "trash directory differs from checked source directory",
+                    ));
+                }
+                fs::create_dir_all(trash)
+                    .map_err(|error| io_error("FS_REMOVE_FAILED", trash, error))?;
                 fs::rename(&path, &destination)
                     .map_err(|error| io_error("FS_REMOVE_FAILED", &path, error))?;
-                Ok(json!({"path": path, "removed": true, "restoreToken": destination}))
+                Ok(json!({"path": path, "removed": true, "restoreToken": logical_token}))
             }
             "fs.restore" | "filesystem.restore" => {
                 let destination = self.write_path(&params, "path", false)?;
@@ -2242,10 +2305,11 @@ fn contract(name: &str, effect: Effect) -> CapabilityDescriptor {
             json!({
                 "path": {"type": "string"},
                 "content": {"type": "string"},
-                "expectedDigest": {"type": "string"}
+                "expectedDigest": {"type": "string"},
+                "expectedAbsent": {"type": "boolean"}
             }),
             vec!["filesystem:${path}"],
-            vec!["path", "content", "expectedDigest"],
+            vec!["path", "content", "expectedDigest", "expectedAbsent"],
             30_000,
             RollbackStrategy::None,
             vec!["file-digest"],
@@ -2794,6 +2858,7 @@ fn contract(name: &str, effect: Effect) -> CapabilityDescriptor {
             "chromiumLocalStateSettleMs",
             "file",
         ],
+        "filesystem.write" => &["expectedDigest", "expectedAbsent"],
         "application.open-file" => &["handlerPath"],
         "ui.native-inspect" => &[
             "requestPermission",
@@ -2809,8 +2874,7 @@ fn contract(name: &str, effect: Effect) -> CapabilityDescriptor {
                 .keys()
                 .filter(|key| {
                     !(optional_fields.contains(&key.as_str())
-                        || capability_optional_fields.contains(&key.as_str())
-                        || name == "filesystem.write" && key.as_str() == "expectedDigest")
+                        || capability_optional_fields.contains(&key.as_str()))
                 })
                 .cloned()
                 .collect()
@@ -3840,6 +3904,27 @@ mod tests {
             )
             .unwrap();
         assert!(target.join("baseline/user-data").is_dir());
+        let created = logical.join("baseline/user-data/created.txt");
+        runtime
+            .dispatch(
+                "filesystem.write",
+                json!({"path": created, "content": "original", "expectedAbsent": true}),
+            )
+            .unwrap();
+        assert_eq!(
+            runtime
+                .dispatch(
+                    "filesystem.write",
+                    json!({"path": created, "content": "replacement", "expectedAbsent": true})
+                )
+                .unwrap_err()
+                .code,
+            "DIGEST_CONFLICT"
+        );
+        assert_eq!(
+            fs::read_to_string(target.join("baseline/user-data/created.txt")).unwrap(),
+            "original"
+        );
         let file = logical.join("baseline/user-data/document.txt");
         runtime
             .dispatch(
@@ -3857,6 +3942,30 @@ mod tests {
             "after"
         );
 
+        let removal = runtime
+            .dispatch(
+                "filesystem.remove",
+                json!({"path": file, "expectedDigest": digest_file(&file).unwrap()}),
+            )
+            .unwrap();
+        assert!(!file.exists());
+        runtime
+            .dispatch(
+                "filesystem.restore",
+                json!({"path": file, "restoreToken": removal["restoreToken"]}),
+            )
+            .unwrap();
+        assert_eq!(fs::read_to_string(&file).unwrap(), "after");
+        let redirected_file = logical.join("trash-redirect/source.txt");
+        fs::create_dir_all(target.join("trash-redirect")).unwrap();
+        fs::write(&redirected_file, "retained").unwrap();
+        redirect(
+            &outside,
+            &target.join("trash-redirect/.machine-fabric-trash"),
+        );
+        assert_eq!(runtime.dispatch("filesystem.remove", json!({"path": redirected_file, "expectedDigest": digest_file(&redirected_file).unwrap()})).unwrap_err().code, "PATH_WRITE_DENIED");
+        assert_eq!(fs::read_to_string(&redirected_file).unwrap(), "retained");
+        assert_eq!(fs::read_dir(&outside).unwrap().count(), 0);
         redirect(&outside, &target.join("escape"));
         assert_eq!(
             runtime
@@ -4413,6 +4522,67 @@ mod tests {
     use machine_fabric_protocol::Request;
 
     #[test]
+    fn expected_absent_creation_never_overwrites_concurrent_winner() {
+        let directory = tempfile::tempdir().unwrap();
+        let runtime = std::sync::Arc::new(
+            ExecutorRuntime::new("local", vec![directory.path().to_path_buf()]).unwrap(),
+        );
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+        let path = directory.path().join("created.txt");
+        let workers: Vec<_> = (0..8)
+            .map(|index| {
+                let runtime = runtime.clone();
+                let barrier = barrier.clone();
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    let content = format!("winner-{index}");
+                    (
+                        content.clone(),
+                        runtime.dispatch(
+                            "filesystem.write",
+                            json!({"path": path, "content": content, "expectedAbsent": true}),
+                        ),
+                    )
+                })
+            })
+            .collect();
+        let results: Vec<_> = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .collect();
+        let winners: Vec<_> = results
+            .iter()
+            .filter(|(_, result)| result.is_ok())
+            .collect();
+        assert_eq!(winners.len(), 1);
+        assert_eq!(fs::read_to_string(&path).unwrap(), winners[0].0);
+        for (_, result) in &results {
+            if let Err(error) = result {
+                assert_eq!(error.code, "DIGEST_CONFLICT");
+            }
+        }
+        assert_eq!(
+            fs::read_dir(directory.path()).unwrap().count(),
+            1,
+            "temporary files cleaned up"
+        );
+        for value in [json!("true"), json!(null), json!(1)] {
+            assert_eq!(
+                runtime
+                    .dispatch(
+                        "filesystem.write",
+                        json!({"path": path, "content": "denied", "expectedAbsent": value})
+                    )
+                    .unwrap_err()
+                    .code,
+                "INVALID_PARAMS"
+            );
+        }
+        assert_eq!(runtime.dispatch("filesystem.write", json!({"path": path, "content": "denied", "expectedAbsent": true, "expectedDigest": "sha256:conflict"})).unwrap_err().code, "INVALID_PARAMS");
+    }
+
+    #[test]
     fn guards_roots_and_detects_write_conflicts() {
         let directory = tempfile::tempdir().unwrap();
         let runtime = ExecutorRuntime::new("local", vec![directory.path().to_path_buf()]).unwrap();
@@ -4589,6 +4759,16 @@ mod tests {
             .into_iter()
             .find(|item| item.name == "filesystem.write")
             .unwrap();
+        assert_eq!(
+            write.input_schema["properties"]["expectedAbsent"]["type"],
+            "boolean"
+        );
+        assert!(
+            !write.input_schema["required"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("expectedAbsent"))
+        );
         assert!(
             !write.input_schema["required"]
                 .as_array()
