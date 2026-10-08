@@ -49,6 +49,10 @@ jobs:
             android_linker: aarch64-linux-android24-clang
           - runner: macos-14
             target: aarch64-apple-darwin
+          - runner: macos-14
+            target: x86_64-apple-darwin
+          - runner: windows-latest
+            target: aarch64-pc-windows-msvc
           - runner: windows-latest
             target: x86_64-pc-windows-msvc
     steps:
@@ -130,7 +134,7 @@ jobs:
         run: |
           version=${TAG#v}
           : > SHA256SUMS
-          for suffix in aarch64-apple-darwin.tar.gz aarch64-linux-android.tar.gz x86_64-unknown-linux-musl.tar.gz x86_64-pc-windows-msvc.zip; do
+          for suffix in x86_64-apple-darwin.tar.gz aarch64-pc-windows-msvc.zip aarch64-apple-darwin.tar.gz aarch64-linux-android.tar.gz x86_64-unknown-linux-musl.tar.gz x86_64-pc-windows-msvc.zip; do
             archive=machine-fabric-$version-$suffix
             test -s "$archive"
             test -s "$archive.sha256"

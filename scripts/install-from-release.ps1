@@ -34,7 +34,12 @@ if (-not $baseUrl -or $baseUrl -notmatch '^https://') {
   throw "set MACHINE_FABRIC_RELEASE_BASE_URL to the internal release CDN root"
 }
 
-$target = "x86_64-pc-windows-msvc"
+$nativeArchitecture = if ($env:PROCESSOR_ARCHITEW6432) { $env:PROCESSOR_ARCHITEW6432 } else { $env:PROCESSOR_ARCHITECTURE }
+$target = switch ($nativeArchitecture.ToUpperInvariant()) {
+  'AMD64' { 'x86_64-pc-windows-msvc' }
+  'ARM64' { 'aarch64-pc-windows-msvc' }
+  default { throw "unsupported Windows OS architecture: $nativeArchitecture" }
+}
 $archive = "machine-fabric-$Version-$target.zip"
 $base = $baseUrl.TrimEnd('/') + "/releases/v$Version"
 $headers = @{ "X-Tos-Access" = "internal" }

@@ -48,7 +48,7 @@ for host in "$@"; do
   printf 'preflight-fabric: %s: checking platform and release prerequisites\n' "$host"
   if [ "$(platform_of "$host")" = windows ]; then
     ssh -o BatchMode=yes -o ClearAllForwardings=yes "$host" \
-      "powershell.exe -NoProfile -NonInteractive -Command \"if (\$env:PROCESSOR_ARCHITECTURE -ne 'AMD64') { throw 'x86_64 Windows is required' }; Get-Command Invoke-WebRequest,Expand-Archive,ssh.exe | Out-Null; \$h=@{'X-Tos-Access'='internal'}; Invoke-WebRequest -Method Head -Headers \$h -UseBasicParsing '$base/machine-fabric-$version-x86_64-pc-windows-msvc.zip' | Out-Null; Invoke-WebRequest -Method Head -Headers \$h -UseBasicParsing '$base/SHA256SUMS' | Out-Null; Write-Output ready\"" \
+      "powershell.exe -NoProfile -NonInteractive -Command \"\$a=if (\$env:PROCESSOR_ARCHITEW6432) { \$env:PROCESSOR_ARCHITEW6432 } else { \$env:PROCESSOR_ARCHITECTURE }; \$t=switch (\$a.ToUpperInvariant()) { 'AMD64' { 'x86_64-pc-windows-msvc' }; 'ARM64' { 'aarch64-pc-windows-msvc' }; default { throw 'unsupported Windows OS architecture' } }; Get-Command Invoke-WebRequest,Expand-Archive,ssh.exe | Out-Null; \$h=@{'X-Tos-Access'='internal'}; Invoke-WebRequest -Method Head -Headers \$h -UseBasicParsing ('$base/machine-fabric-$version-' + \$t + '.zip') | Out-Null; Invoke-WebRequest -Method Head -Headers \$h -UseBasicParsing '$base/SHA256SUMS' | Out-Null; Write-Output ready\"" \
       >/dev/null
   else
     ssh -o BatchMode=yes -o ClearAllForwardings=yes "$host" \
