@@ -181,12 +181,7 @@ impl ComputerUseService {
                 ));
             }
             if response["ok"] != true {
-                return Err(RpcError::new(
-                    "COMPUTER_USE_TOOL_FAILED",
-                    response["error"]
-                        .as_str()
-                        .unwrap_or("extension tool failed"),
-                ));
+                return Err(host_tool_failure(&response, &id, method));
             }
             Ok(if tools_only {
                 json!({"tools":response["result"], "hostIdentity":host.identity})
@@ -223,6 +218,67 @@ impl ComputerUseService {
         }
         result
     }
+}
+
+// A matching response proves that the Host returned, not that the browser or
+// desktop mutation completed. Preserve bounded diagnostics without granting
+// replay or desktop recovery authority.
+fn host_tool_failure(response: &Value, request_id: &str, method: &str) -> RpcError {
+    let mut error = RpcError::new(
+        "COMPUTER_USE_TOOL_FAILED",
+        response["error"]
+            .as_str()
+            .unwrap_or("extension tool failed"),
+    );
+    error.details = json!({
+        "hostResponseReceived": true,
+        "hostRequestId": request_id,
+        "tool": method,
+        "operationOutcome": "unknown",
+    });
+    if let Some(diagnostics) = response.get("errorDetails").and_then(Value::as_object) {
+        let mut bounded = serde_json::Map::new();
+        for key in ["messageBytes", "causeCount", "diagnosticMessageBytes"] {
+            if let Some(number) = diagnostics.get(key).and_then(Value::as_u64) {
+                bounded.insert(key.into(), json!(number));
+            }
+        }
+        for key in ["causeChainTruncated", "diagnosticWritten"] {
+            if let Some(flag) = diagnostics.get(key).and_then(Value::as_bool) {
+                bounded.insert(key.into(), json!(flag));
+            }
+        }
+        for key in ["code", "name"] {
+            if let Some(label) = diagnostics.get(key).and_then(Value::as_str)
+                && !label.is_empty()
+                && label.len() <= 80
+                && label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || b"_.-".contains(&byte))
+            {
+                bounded.insert(key.into(), json!(label));
+            }
+        }
+        let indicators: Vec<_> = ["timeout", "timed out", "abort"]
+            .into_iter()
+            .filter(|word| {
+                diagnostics
+                    .get("indicators")
+                    .and_then(Value::as_array)
+                    .is_some_and(|values| values.iter().any(|value| value.as_str() == Some(*word)))
+            })
+            .collect();
+        bounded.insert("indicators".into(), json!(indicators));
+        let navigation = json!({"version": 1, "mechanism": "cdp",
+            "command": "Page.navigate", "phase": "navigation",
+            "physicalInputDispatched": false, "navigationOutcome": "unknown", "retrySafe": false});
+        if method == "navigate_browser" && diagnostics.get("navigationFailure") == Some(&navigation)
+        {
+            bounded.insert("navigationFailure".into(), navigation);
+        }
+        error.details["hostDiagnostics"] = Value::Object(bounded);
+    }
+    error
 }
 
 fn selected_state_root(state_root: &Path) -> PathBuf {
@@ -494,5 +550,67 @@ mod tests {
         assert!(frame(b"not json\n").is_err());
         assert!(frame(b"").is_err());
         assert_eq!(frame(b"{\"ok\":true}\n").unwrap()["ok"], true);
+    }
+
+    #[test]
+    fn returned_tool_failure_retains_bounded_evidence_without_recovery_authority() {
+        let response = json!({"error": "Page.navigate timed out", "errorDetails": {
+            "code": "CDP_TIMEOUT", "name": "Error", "messageBytes": 123,
+            "causeCount": 2, "diagnosticMessageBytes": 456,
+            "causeChainTruncated": false, "diagnosticWritten": true,
+            "indicators": ["timed out", "timed out", "untrusted"],
+            "retrySafe": true, "recoveryRequired": false,
+            "payload": "private payload", "diagnosticRelativePath": "../../credentials"
+        }});
+        let error = host_tool_failure(&response, "owned-request", "navigate_browser");
+        assert_eq!(error.code, "COMPUTER_USE_TOOL_FAILED");
+        assert!(!error.retryable);
+        assert_eq!(error.details["hostResponseReceived"], true);
+        assert_eq!(error.details["operationOutcome"], "unknown");
+        assert_eq!(error.details["hostRequestId"], "owned-request");
+        assert_eq!(
+            error.details["hostDiagnostics"]["indicators"],
+            json!(["timed out"])
+        );
+        assert_eq!(error.details["hostDiagnostics"]["messageBytes"], 123);
+        let wire = serde_json::to_string(&error).unwrap();
+        assert!(!wire.contains("private payload"));
+        assert!(!wire.contains("credentials"));
+        assert!(!wire.contains("retrySafe"));
+        assert!(!wire.contains("recoveryRequired"));
+        let malformed = host_tool_failure(
+            &json!({"errorDetails": {
+                "code": "x".repeat(10000), "name": "bad label", "messageBytes": -1,
+                "diagnosticWritten": 1, "indicators": "timeout"
+            }}),
+            "owned-request",
+            "navigate_browser",
+        );
+        assert_eq!(
+            malformed.details["hostDiagnostics"],
+            json!({"indicators": []})
+        );
+        let navigation = json!({"version": 1, "mechanism": "cdp",
+            "command": "Page.navigate", "phase": "navigation",
+            "physicalInputDispatched": false, "navigationOutcome": "unknown", "retrySafe": false});
+        let mut response = json!({"errorDetails": {"navigationFailure": navigation}});
+        let accepted = host_tool_failure(&response, "owned", "navigate_browser");
+        assert_eq!(
+            accepted.details["hostDiagnostics"]["navigationFailure"],
+            navigation
+        );
+        let wrong_tool = host_tool_failure(&response, "owned", "act_ui");
+        assert!(
+            wrong_tool.details["hostDiagnostics"]
+                .get("navigationFailure")
+                .is_none()
+        );
+        response["errorDetails"]["navigationFailure"]["retrySafe"] = json!(true);
+        let rejected = host_tool_failure(&response, "owned", "navigate_browser");
+        assert!(
+            rejected.details["hostDiagnostics"]
+                .get("navigationFailure")
+                .is_none()
+        );
     }
 }
