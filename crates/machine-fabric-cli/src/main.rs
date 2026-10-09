@@ -672,6 +672,8 @@ fn load_fabric_manifest(path: &Path) -> Result<FabricManifest> {
         if !matches!(
             (node.platform, node.architecture),
             (FabricPlatform::Macos, FabricArchitecture::Aarch64)
+                | (FabricPlatform::Macos, FabricArchitecture::X86_64)
+                | (FabricPlatform::Windows, FabricArchitecture::Aarch64)
                 | (FabricPlatform::Linux, FabricArchitecture::X86_64)
                 | (FabricPlatform::Windows, FabricArchitecture::X86_64)
         ) {
@@ -934,6 +936,41 @@ domains: []
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn released_fabric_platform_architectures_are_accepted() {
+        for (platform, architecture, supported) in [
+            ("macos", "aarch64", true),
+            ("macos", "x86_64", true),
+            ("windows", "aarch64", true),
+            ("windows", "x86_64", true),
+            ("linux", "x86_64", true),
+            ("linux", "aarch64", false),
+        ] {
+            let unique = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let path = std::env::temp_dir().join(format!(
+                "machine-fabric-platform-{}-{unique}.yaml",
+                std::process::id()
+            ));
+            std::fs::write(
+                &path,
+                format!(
+                    "apiVersion: machine-fabric.dev/v1\nkind: Fabric\ninitiatorNode: laptop\nnodes:\n  - id: laptop\n    platform: {platform}\n    architecture: {architecture}\n    allowRoots: [\"${{user.home}}/Workspace\"]\ntopology: {{mode: full-mesh}}\n"
+                ),
+            )
+            .unwrap();
+            let result = validate_fabric_manifest(&path);
+            std::fs::remove_file(&path).unwrap();
+            assert_eq!(
+                result.is_ok(),
+                supported,
+                "{platform}/{architecture}: {result:?}"
+            );
+        }
     }
 
     #[test]
