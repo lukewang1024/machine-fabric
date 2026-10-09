@@ -3687,8 +3687,10 @@ fn search_tree(
     Ok(())
 }
 
-// A failed observation poll cannot have posted desktop input. Keep arbitrary
-// JavaScript, navigation, input and structured unknown dispatches fail-closed.
+// A failed observation poll cannot have posted desktop input. A matched Host
+// receipt for the SDK's inner pure-CDP navigation failure also cannot leave HID
+// pressed. Navigation remains unknown and old refs remain invalid; this does
+// not grant permission to replay. Unproven failures stay fail-closed.
 fn desktop_dispatch_uncertain(
     action: &str,
     tool: Option<&str>,
@@ -3700,6 +3702,7 @@ fn desktop_dispatch_uncertain(
         Err(error) => {
             let message = error.message.to_ascii_lowercase();
             !read_only_poll
+                && !returned_cdp_navigation_failure(action, tool, error)
                 && (error.code == "COMPUTER_USE_UNAVAILABLE"
                     || error.code.contains("TIMEOUT")
                     || (error.code == "COMPUTER_USE_TOOL_FAILED"
@@ -3709,6 +3712,25 @@ fn desktop_dispatch_uncertain(
         }
         Ok(value) => action == "computer-use.call" && has_structured_computer_use_unknown(value),
     }
+}
+
+fn returned_cdp_navigation_failure(action: &str, tool: Option<&str>, error: &RpcError) -> bool {
+    action == "computer-use.call"
+        && tool == Some("navigate_browser")
+        && error.code == "COMPUTER_USE_TOOL_FAILED"
+        && error.details.get("hostResponseReceived") == Some(&json!(true))
+        && error.details.get("tool") == Some(&json!("navigate_browser"))
+        && error.details.get("operationOutcome") == Some(&json!("unknown"))
+        && error
+            .details
+            .get("hostRequestId")
+            .and_then(Value::as_str)
+            .is_some_and(|id| uuid::Uuid::parse_str(id).is_ok())
+        && error.details.pointer("/hostDiagnostics/navigationFailure")
+            == Some(&json!({
+                "version": 1, "mechanism": "cdp", "command": "Page.navigate", "phase": "navigation",
+                "physicalInputDispatched": false, "navigationOutcome": "unknown", "retrySafe": false
+            }))
 }
 
 fn has_structured_computer_use_unknown(value: &Value) -> bool {
@@ -4322,6 +4344,68 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn only_matched_inner_cdp_navigation_receipts_avoid_desktop_quarantine() {
+        let mut error = RpcError::new("COMPUTER_USE_TOOL_FAILED", "Page.navigate timed out");
+        error.details = json!({"hostResponseReceived": true,
+        "hostRequestId": uuid::Uuid::new_v4().to_string(), "tool": "navigate_browser",
+        "operationOutcome": "unknown", "hostDiagnostics": {"navigationFailure": {
+            "version": 1, "mechanism": "cdp", "command": "Page.navigate", "phase": "navigation",
+            "physicalInputDispatched": false, "navigationOutcome": "unknown", "retrySafe": false
+        }}});
+        assert!(!desktop_dispatch_uncertain(
+            "computer-use.call",
+            Some("navigate_browser"),
+            &Err(error.clone())
+        ));
+        assert!(!error.retryable);
+        for (pointer, wrong) in [
+            ("/hostResponseReceived", json!(false)),
+            ("/hostRequestId", json!("invalid")),
+            ("/tool", json!("act_ui")),
+            ("/operationOutcome", json!("worked")),
+            ("/hostDiagnostics/navigationFailure/version", json!(2)),
+            ("/hostDiagnostics/navigationFailure/phase", json!("setup")),
+            (
+                "/hostDiagnostics/navigationFailure/physicalInputDispatched",
+                json!(0),
+            ),
+            (
+                "/hostDiagnostics/navigationFailure/physicalInputDispatched",
+                json!(true),
+            ),
+            ("/hostDiagnostics/navigationFailure/retrySafe", json!(true)),
+            (
+                "/hostDiagnostics/navigationFailure/command",
+                json!("Input.dispatchMouseEvent"),
+            ),
+        ] {
+            let mut invalid = error.clone();
+            *invalid.details.pointer_mut(pointer).unwrap() = wrong;
+            assert!(
+                desktop_dispatch_uncertain(
+                    "computer-use.call",
+                    Some("navigate_browser"),
+                    &Err(invalid)
+                ),
+                "{pointer}"
+            );
+        }
+        for tool in ["act_ui", "launch_browser", "evaluate_browser"] {
+            assert!(desktop_dispatch_uncertain(
+                "computer-use.call",
+                Some(tool),
+                &Err(error.clone())
+            ));
+        }
+        error.code = "COMPUTER_USE_UNAVAILABLE".into();
+        assert!(desktop_dispatch_uncertain(
+            "computer-use.call",
+            Some("navigate_browser"),
+            &Err(error)
+        ));
+    }
 
     #[test]
     fn observation_poll_errors_do_not_quarantine_but_mutation_errors_do() {
@@ -4974,6 +5058,7 @@ mod tests {
             "semantic_mutation",
             "capture_read_error",
             "wait_read_error",
+            "pure_navigation_error",
             "capture_read_result",
             "effect_unverified",
         ] {
@@ -5027,9 +5112,20 @@ while True:
         continue
     if mode == 'wait_read_error' and request.get('method') == 'wait_for':
         stream.write((json.dumps({'id': request['id'], 'ok': False,
-            'error': "CDP command Runtime.enable timed out after 5000ms"}) + '\n').encode())
+            'error': "CDP command Runtime.enable timed out after 5000ms",
+            'errorDetails': {'name': 'Error', 'indicators': ['timed out'],
+                'diagnosticWritten': True, 'causeCount': 1}}) + '\n').encode())
         continue
-    if mode == 'wait_read_error':
+    if mode == 'pure_navigation_error' and request.get('method') == 'navigate_browser':
+        stream.write((json.dumps({'id': request['id'], 'ok': False,
+            'error': "CDP command Page.navigate timed out",
+            'errorDetails': {'navigationFailure': {'version': 1, 'mechanism': 'cdp',
+                'command': 'Page.navigate', 'phase': 'navigation', 'physicalInputDispatched': False,
+                'navigationOutcome': 'unknown', 'retrySafe': False}}}) + '\n').encode())
+        continue
+    if mode == 'pure_navigation_error':
+        result = {'details': {'tool': request.get('method'), 'execution': {'outcome': 'worked', 'dispatchCompletion': 'returned'}}}
+    elif mode == 'wait_read_error':
         result = {'details': {'tool': request.get('method'), 'execution': {'outcome': 'worked', 'dispatchCompletion': 'returned'}}}
     elif mode in ('capture_read_result', 'capture_read_error'):
         result = {'details': {'tool': 'observe_ui', 'observation': {'status': 'semantic_only',
@@ -5095,7 +5191,7 @@ sock.close()
             let call_params = || {
                 json!({
                     "sessionId": "discovery",
-                    "tool": if mode.starts_with("capture_read") { "observe_ui" } else if mode == "wait_read_error" { "wait_for" } else { "act_ui" },
+                    "tool": if mode.starts_with("capture_read") { "observe_ui" } else if mode == "wait_read_error" { "wait_for" } else if mode == "pure_navigation_error" { "navigate_browser" } else { "act_ui" },
                     "arguments": {"stateId": "cu-state", "actions": [{"action": "click", "ref": "@e1"}]},
                     "_desktop": {"owner": "fake-host-test", "token": job["token"]}
                 })
@@ -5105,16 +5201,33 @@ sock.close()
             if mode.starts_with("capture_read")
                 || mode == "wait_read_error"
                 || mode == "effect_unverified"
+                || mode == "pure_navigation_error"
             {
                 assert_eq!(
                     first.ok,
-                    !matches!(mode, "capture_read_error" | "wait_read_error"),
+                    !matches!(
+                        mode,
+                        "capture_read_error" | "wait_read_error" | "pure_navigation_error"
+                    ),
                     "{first:?}"
                 );
                 if mode == "wait_read_error" {
                     let error = first.error.as_ref().expect("wait error must be returned");
                     assert_eq!(error.code, "COMPUTER_USE_TOOL_FAILED");
                     assert!(error.message.contains("Runtime.enable timed out"));
+                    assert_eq!(error.details["hostResponseReceived"], true);
+                    assert_eq!(error.details["tool"], "wait_for");
+                    assert_eq!(error.details["operationOutcome"], "unknown");
+                    assert_eq!(error.details["hostDiagnostics"]["causeCount"], 1);
+                    assert_eq!(
+                        error.details["hostDiagnostics"]["indicators"],
+                        json!(["timed out"])
+                    );
+                    assert!(
+                        uuid::Uuid::parse_str(error.details["hostRequestId"].as_str().unwrap())
+                            .is_ok()
+                    );
+                    assert!(!error.retryable);
                 }
                 let desktop = runtime.handle(Request::new("desktop.list", json!({})));
                 assert_eq!(desktop.result.unwrap()["blocked"], false, "{mode}");
