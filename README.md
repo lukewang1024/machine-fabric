@@ -231,6 +231,12 @@ Machine Fabric releases are exact-version packages. There is no mutable
 root, then pass the exact version to the installer. Each installer verifies
 the archive against the release's `SHA256SUMS` before extraction.
 
+Windows ARM64 and x64 release binaries statically link the MSVC runtime, so a
+clean Windows installation does not need a separately installed Visual C++
+redistributable. CI checks the executable imports inside each Windows archive
+before uploading it; normal and delay imports of external MSVC runtimes are
+rejected.
+
 ```sh
 MACHINE_FABRIC_RELEASE_BASE_URL=https://<internal-cdn-root> \
   scripts/install-from-release.sh 0.1.12

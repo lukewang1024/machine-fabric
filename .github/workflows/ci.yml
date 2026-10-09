@@ -41,6 +41,8 @@ jobs:
           }
           if ($errors.Count) { $errors | Format-List; exit 1 }
           ./scripts/test-release-windows-architecture.ps1
+      - name: Windows release runtime regression
+        run: python -m unittest discover -s tests -p 'test_windows_release_runtime.py'
 
   android:
     runs-on: ubuntu-latest
@@ -72,6 +74,8 @@ jobs:
             target: x86_64-apple-darwin
           - runner: windows-latest
             target: aarch64-pc-windows-msvc
+          - runner: windows-latest
+            target: x86_64-pc-windows-msvc
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v7
@@ -81,4 +85,16 @@ jobs:
       - uses: Swatinem/rust-cache@v2.9.2
         with:
           key: ${{ matrix.target }}
-      - run: cargo build --locked --target ${{ matrix.target }} --bins
+      - name: Build desktop release binaries
+        shell: bash
+        run: |
+          if [[ '${{ matrix.target }}' == *-windows-msvc ]]; then
+            export RUSTFLAGS='-C target-feature=+crt-static'
+          fi
+          cargo build --locked --target '${{ matrix.target }}' --bins
+      - name: Package and verify Windows release runtime
+        if: endsWith(matrix.target, '-windows-msvc')
+        shell: bash
+        run: |
+          scripts/package-release.sh ci '${{ matrix.target }}' 'target/${{ matrix.target }}/debug' dist
+          python scripts/verify-windows-release.py 'dist/machine-fabric-ci-${{ matrix.target }}.zip' --target '${{ matrix.target }}'

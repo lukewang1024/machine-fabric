@@ -93,6 +93,9 @@ jobs:
       - name: Build release binaries
         shell: bash
         run: |
+          if [[ '${{ matrix.target }}' == *-windows-msvc ]]; then
+            export RUSTFLAGS='-C target-feature=+crt-static'
+          fi
           if [[ '${{ matrix.target }}' == *-linux-android ]]; then
             cargo build --release --locked --target '${{ matrix.target }}' --bin machine-fabric
           else
@@ -106,6 +109,13 @@ jobs:
           '${{ matrix.target }}'
           'target/${{ matrix.target }}/release'
           dist
+      - name: Verify Windows runtime dependencies in packaged binaries
+        if: endsWith(matrix.target, '-windows-msvc')
+        shell: bash
+        run: >-
+          python scripts/verify-windows-release.py
+          'dist/machine-fabric-${{ steps.version.outputs.version }}-${{ matrix.target }}.zip'
+          --target '${{ matrix.target }}'
       - name: Upload archive to draft release
         shell: bash
         working-directory: dist
