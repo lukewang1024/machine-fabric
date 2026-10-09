@@ -3746,7 +3746,26 @@ fn has_structured_computer_use_unknown(value: &Value) -> bool {
         && value.pointer("/details/error/code").and_then(Value::as_str)
             == Some("foreground_interrupted_after_partial_hid");
 
-    transport_unknown || partial_hid_unknown
+    let semantic_unknown = value
+        .pointer("/details/execution/semanticDispatch/outcome")
+        .and_then(Value::as_str)
+        == Some("unknown")
+        && value
+            .pointer("/details/execution/semanticDispatch/mechanism")
+            .and_then(Value::as_str)
+            == Some("atspi")
+        && value
+            .pointer("/details/execution/semanticDispatch/recoveryRequired")
+            .and_then(Value::as_bool)
+            == Some(true)
+        && value
+            .pointer("/details/execution/semanticDispatch/retrySafe")
+            .and_then(Value::as_bool)
+            == Some(false)
+        && value.pointer("/details/error/code").and_then(Value::as_str)
+            == Some("semantic_dispatch_unknown");
+
+    transport_unknown || partial_hid_unknown || semantic_unknown
 }
 
 fn io_error(code: &str, path: &Path, error: std::io::Error) -> RpcError {
@@ -4369,6 +4388,38 @@ mod tests {
     }
 
     #[test]
+    fn semantic_mutation_unknown_quarantines_desktop_without_a_hid_ledger() {
+        let value = json!({"details": {"tool": "act_ui", "status": "dispatch_outcome_unknown",
+            "execution": {"semanticDispatch": {"outcome": "unknown", "mechanism": "atspi",
+                "recoveryRequired": true, "retrySafe": false}},
+            "error": {"code": "semantic_dispatch_unknown"}}});
+        assert!(has_structured_computer_use_unknown(&value));
+        for tool in ["act_ui", "observe_ui", "wait_for"] {
+            assert!(desktop_dispatch_uncertain(
+                "computer-use.call",
+                Some(tool),
+                &Ok(value.clone())
+            ));
+        }
+        for pointer in [
+            "/details/tool",
+            "/details/status",
+            "/details/error/code",
+            "/details/execution/semanticDispatch/outcome",
+            "/details/execution/semanticDispatch/mechanism",
+            "/details/execution/semanticDispatch/recoveryRequired",
+            "/details/execution/semanticDispatch/retrySafe",
+        ] {
+            let mut malformed = value.clone();
+            *malformed.pointer_mut(pointer).unwrap() = Value::Null;
+            assert!(
+                !has_structured_computer_use_unknown(&malformed),
+                "{pointer}"
+            );
+        }
+    }
+
+    #[test]
     fn application_launch_contract_requires_explicit_conflict_policy() {
         let descriptor = contract("application.launch", Effect::Mutating);
         assert_eq!(
@@ -4920,6 +4971,7 @@ mod tests {
         for mode in [
             "transport",
             "partial_hid",
+            "semantic_mutation",
             "capture_read_error",
             "wait_read_error",
             "capture_read_result",
@@ -4985,6 +5037,12 @@ while True:
     elif mode == 'effect_unverified':
         result = {'details': {'tool': 'act_ui', 'execution': {'outcome': 'unknown',
             'dispatchCompletion': 'returned', 'effectVerification': 'unverified'}}}
+    elif mode == 'semantic_mutation':
+        result = {'content': [{'type': 'text', 'text': 'semantic mutation outcome unknown; do not retry'}],
+            'details': {'tool': 'act_ui', 'status': 'dispatch_outcome_unknown',
+                'execution': {'semanticDispatch': {'outcome': 'unknown', 'mechanism': 'atspi',
+                    'requestId': 'semantic-fake-request-01', 'recoveryRequired': True, 'retrySafe': False}},
+                'error': {'code': 'semantic_dispatch_unknown', 'message': 'mutation may have taken effect'}}}
     elif mode == 'partial_hid':
         result = {'content': [{'type': 'text', 'text': 'partial HID input; do not retry'}],
             'details': {'tool': 'act_ui', 'status': 'dispatch_outcome_unknown',
@@ -5083,7 +5141,22 @@ sock.close()
             );
             let returned = first.result.unwrap();
             assert_eq!(returned["details"]["status"], "dispatch_outcome_unknown");
-            if mode == "partial_hid" {
+            if mode == "semantic_mutation" {
+                assert_eq!(
+                    returned["details"]["error"]["code"],
+                    "semantic_dispatch_unknown"
+                );
+                assert_eq!(
+                    returned["details"]["execution"]["semanticDispatch"]["requestId"],
+                    "semantic-fake-request-01"
+                );
+                assert!(returned["details"]["execution"].get("transport").is_none());
+                assert!(
+                    returned["details"]["execution"]
+                        .get("inputDispatch")
+                        .is_none()
+                );
+            } else if mode == "partial_hid" {
                 assert_eq!(
                     returned["details"]["error"]["code"],
                     "foreground_interrupted_after_partial_hid"
