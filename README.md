@@ -133,19 +133,22 @@ does not apply to the persisted mapping configuration. The standalone
 `executor validate-path-policy` command performs the same policy validation
 without starting services or creating runtime state.
 
-Windows upgrades can use `-SideBySide` on either installer when unrelated
-peer processes still hold the legacy executable. This opt-in mode requires
-an existing installation, verifies a candidate in an immutable SHA-256
+Windows upgrades automatically use side-by-side installation when a legacy
+installation exists. `-SideBySide` remains available on both installers.
+The installer verifies a candidate in an immutable SHA-256
 directory before stopping services, and points the Controller and Executor
 services at that candidate. Existing identical candidates are reused without
 overwriting an open file; mismatched files or redirects are rejected.
 Only processes captured as belonging to these two services are awaited.
 Other peer processes and their legacy executable are retained. The installer
 returns the active service binary path and records it, its digest, and retained
-process IDs in `installation.json` beside the legacy binary. The legacy CLI
-and peer executable are not upgraded in this mode; their owners must refresh
-their launch paths separately. Without this option, a foreign holder causes
-failure before services are stopped rather than an attempted overwrite.
+process IDs in `installation.json` beside the legacy binary.
+`resolve-windows-binary.ps1` validates that receipt's managed path and digest.
+The Fabric bootstrap and Windows peer service installer use the resolved path,
+so new peer acceptors, connectors and health probes use the installed candidate.
+Existing unrelated processes keep their original executable and lifetime.
+Integrations that previously invoked the legacy executable directly should
+resolve the installed path before starting a new process.
 
 Writes through a registration must still resolve to the exact registered
 target plus the logical suffix. A changed mapping or an additional redirect

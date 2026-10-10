@@ -41,6 +41,7 @@ jobs:
           }
           if ($errors.Count) { $errors | Format-List; exit 1 }
           ./scripts/test-release-windows-architecture.ps1
+          ./scripts/test-resolve-windows-binary.ps1
       - name: Windows release runtime regression
         run: python -m unittest discover -s tests -p 'test_windows_release_runtime.py'
 
