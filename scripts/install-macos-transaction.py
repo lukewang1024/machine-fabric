@@ -87,19 +87,46 @@ class Installer:
     def terminate(self, pid):
         os.kill(pid, signal.SIGTERM)
 
+    def peer_plists(self):
+        peers = {}
+        directory = self.home / 'Library/LaunchAgents'
+        for path in sorted(directory.glob('dev.machine-fabric.peer.*.plist')):
+            document = plistlib.loads(path.read_bytes())
+            arguments = document.get('ProgramArguments')
+            if not isinstance(arguments, list) or not arguments or not isinstance(arguments[0], str):
+                raise RuntimeError('unknown peer executable configuration: ' + path.name)
+            if Path(arguments[0]).resolve() != self.agent.resolve():
+                continue
+            label = document.get('Label')
+            if (not isinstance(label, str)
+                    or not re.fullmatch(r'dev\.machine-fabric\.peer\.[A-Za-z0-9._-]+', label)
+                    or path.name != label + '.plist'
+                    or arguments[1:3] != ['peer', 'connect']):
+                raise RuntimeError('unknown peer job configuration: ' + path.name)
+            peers[label] = path
+        return peers
+
+    def verify_owners(self, peer_labels):
+        # The bundle executable is shared by the Executor and peer jobs. A
+        # path match alone never grants permission to terminate a process.
+        for executable, labels in ((self.controller, (LABELS[0],)),
+                                   (self.agent, (LABELS[1], *peer_labels))):
+            owners = {pid for label in labels if (pid := self.job(label))}
+            if owners != set(self.processes(executable)):
+                raise RuntimeError('executable has unknown launchd ownership: ' + str(executable))
+
     def stop(self, label, executable):
         pid = self.job(label)
-        pids = set(self.processes(executable))
-        if pid:
-            pids.add(pid)
+        pids = {pid} if pid else set()
+        if pid and pid not in self.processes(executable):
+            raise RuntimeError('launchd owner/executable mismatch: ' + label)
         self.stopping_pids[label] = pids
         if pid is not None:
             self.launch('bootout', self.domain + '/' + label)
-        # launchd may leave a legacy LaunchServices child. Graceful TERM only.
-        for orphan in self.processes(executable):
-            if self.alive(orphan):
-                self.terminate(orphan)
-                pids.add(orphan)
+        # Graceful TERM is restricted to the exact previously verified owner.
+        # Other jobs using this executable are stopped by their own labels.
+        if pid and self.alive(pid) and pid in self.processes(executable):
+            self.terminate(pid)
         end = time.monotonic() + self.timeout
         while any(self.alive(p) for p in pids) or self.job(label) is not None:
             if time.monotonic() >= end:
@@ -309,11 +336,22 @@ class Installer:
                 if record['kind'] == 'link': target.symlink_to(record['link'])
 
     def start(self, labels):
-        for label, path in zip(LABELS, self.plists):
+        paths = dict(zip(LABELS, self.plists)) | self.peer_plists()
+        for label, path in paths.items():
             if label in labels:
                 if any(self.alive(p) for p in self.stopping_pids.get(label, set())):
                     raise RuntimeError('previous process has not exited: ' + label)
                 self.launch('bootstrap', self.domain, path)
+
+    def wait_peers(self, labels):
+        deadline = time.monotonic() + self.timeout
+        while True:
+            processes = set(self.processes(self.agent))
+            if all((pid := self.job(label)) and pid in processes for label in labels):
+                return
+            if time.monotonic() >= deadline:
+                raise RuntimeError('peer launchd owner/executable readiness deadline')
+            time.sleep(.1)
 
     def rollback_payload_probe(self):
         """Test the actual old binary on an isolated CURRENT state copy.
@@ -407,15 +445,21 @@ class Installer:
         shutil.rmtree(probe)
 
     def transaction(self, staged):
-        was_loaded = [label for label in LABELS if self.job(label) is not None]
+        peers = self.peer_plists()
+        peer_labels = [label for label in peers if self.job(label) is not None]
+        was_loaded = [label for label in (*LABELS, *peer_labels) if self.job(label) is not None]
         self.quiescent()
+        self.verify_owners(peer_labels)
         records = None
         stopping = False
         try:
             stopping = True
+            for label in peer_labels:
+                self.stop(label, self.agent)
             self.stop(LABELS[1], self.agent)
             self.stop(LABELS[0], self.controller)
             self.quiescent()
+            self.verify_owners(())
             records = self.capture()
             for source, target in zip(staged, self.targets()[:4]): self.replace(source, target)
             self.bins.mkdir(parents=True, exist_ok=True)
@@ -427,9 +471,13 @@ class Installer:
             self.wait_health()
             self.rpc(self.sockets[0], 'executor.register', {'executorId': self.node + '-rust',
                      'endpoint': {'transport': 'local', 'socket': str(self.sockets[1])}})
+            self.start(peer_labels)
+            self.wait_peers(peer_labels)
         except BaseException as original:
             try:
                 if records is not None:
+                    for label in peer_labels:
+                        self.stop(label, self.agent)
                     self.stop(LABELS[1], self.agent)
                     self.stop(LABELS[0], self.controller)
                     self.restore(records)
@@ -437,7 +485,8 @@ class Installer:
                 # Partial stop failure: never replace live files; start only missing old jobs.
                 if stopping:
                     self.start([label for label in was_loaded if self.job(label) is None])
-                    if len(was_loaded) == 2: self.wait_health()
+                    if all(label in was_loaded for label in LABELS): self.wait_health()
+                    self.wait_peers(peer_labels)
             except BaseException as recovery:
                 raise RuntimeError('install failed: %s; recovery failed against CURRENT state: %s; retained rollback=%s (state not rewound)' %
                                    (original, recovery, self.backup)) from recovery
