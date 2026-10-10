@@ -403,7 +403,7 @@ windows_call() {
   call_json=$4
   encoded=$(printf '%s' "$call_json" | base64 | tr -d '\n')
   ssh -o BatchMode=yes -o ClearAllForwardings=yes "$call_host" \
-    "powershell.exe -NoProfile -NonInteractive -Command \"\$j=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('$encoded')); \$p=Join-Path \$env:TEMP ('machine-fabric-call-'+[guid]::NewGuid().ToString('N')+'.json'); \$code=1; try { [IO.File]::WriteAllText(\$p,\$j,(New-Object System.Text.UTF8Encoding \$false)); & (& 'C:\Program Files\machine-fabric\resolve-windows-binary.ps1') --socket '$call_socket' call '$call_action' --params-file \$p; \$code=\$LASTEXITCODE } finally { Remove-Item -LiteralPath \$p -Force -ErrorAction SilentlyContinue }; exit \$code\""
+    "powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command \"\$j=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('$encoded')); \$p=Join-Path \$env:TEMP ('machine-fabric-call-'+[guid]::NewGuid().ToString('N')+'.json'); \$code=1; try { [IO.File]::WriteAllText(\$p,\$j,(New-Object System.Text.UTF8Encoding \$false)); & (& 'C:\Program Files\machine-fabric\resolve-windows-binary.ps1') --socket '$call_socket' call '$call_action' --params-file \$p; \$code=\$LASTEXITCODE } finally { Remove-Item -LiteralPath \$p -Force -ErrorAction SilentlyContinue }; exit \$code\""
 }
 
 remote_call() {
@@ -530,7 +530,7 @@ wait_remote_peer_ready() {
   while [ "$attempt" -lt 200 ]; do
     if [ "$dialer_platform" = windows ]; then
       output=$(ssh -o BatchMode=yes -o ClearAllForwardings=yes "$dialer" \
-        "powershell.exe -NoProfile -NonInteractive -Command \"& (& 'C:\Program Files\machine-fabric\resolve-windows-binary.ps1') peer status --state 'C:\ProgramData\machine-fabric\peers\$peer\status.json'\"" 2>/dev/null || true)
+        "powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command \"& (& 'C:\Program Files\machine-fabric\resolve-windows-binary.ps1') peer status --state 'C:\ProgramData\machine-fabric\peers\$peer\status.json'\"" 2>/dev/null || true)
     else
       output=$(ssh -o BatchMode=yes -o ClearAllForwardings=yes "$dialer" \
         "\"\$HOME/.local/bin/machine-fabric\" peer status --state '$dialer_home/.local/state/machine-fabric/peers/$peer/status.json'" 2>/dev/null || true)
@@ -552,7 +552,7 @@ remote_peer_status() {
   status_peer=$4
   if [ "$status_platform" = windows ]; then
     ssh -o BatchMode=yes -o ClearAllForwardings=yes "$status_dialer" \
-      "powershell.exe -NoProfile -NonInteractive -Command \"& (& 'C:\Program Files\machine-fabric\resolve-windows-binary.ps1') peer status --state 'C:\ProgramData\machine-fabric\peers\$status_peer\status.json'\""
+      "powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command \"& (& 'C:\Program Files\machine-fabric\resolve-windows-binary.ps1') peer status --state 'C:\ProgramData\machine-fabric\peers\$status_peer\status.json'\""
   else
     ssh -o BatchMode=yes -o ClearAllForwardings=yes "$status_dialer" \
       "\"\$HOME/.local/bin/machine-fabric\" peer status --state '$status_home/.local/state/machine-fabric/peers/$status_peer/status.json'"
@@ -638,7 +638,7 @@ for host in "$@"; do
 
   if [ "$host_platform" = windows ]; then
     ssh -o BatchMode=yes -o ClearAllForwardings=yes "$host" \
-      "powershell.exe -NoProfile -NonInteractive -Command \"& (& 'C:\Program Files\machine-fabric\resolve-windows-binary.ps1') --socket 'C:\ProgramData\machine-fabric\executor.sock' status\"" \
+      "powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command \"& (& 'C:\Program Files\machine-fabric\resolve-windows-binary.ps1') --socket 'C:\ProgramData\machine-fabric\executor.sock' status\"" \
       >/dev/null
   else
     ssh -o BatchMode=yes -o ClearAllForwardings=yes "$host" \
