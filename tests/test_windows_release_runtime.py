@@ -34,6 +34,15 @@ def pe(dll='KERNEL32.dll', machine=0xAA64, delay=False):
 
 
 class WindowsReleaseRuntimeTests(unittest.TestCase):
+    def test_every_bootstrap_resolver_call_sets_process_execution_policy(self):
+        source = (Path(__file__).parents[1] / 'scripts/bootstrap-fabric.sh').read_text()
+        calls = [line for line in source.splitlines()
+                 if 'powershell.exe' in line and 'resolve-windows-binary.ps1' in line]
+        self.assertEqual(len(calls), 5)
+        for line in calls:
+            with self.subTest(call=line):
+                self.assertIn('-ExecutionPolicy Bypass', line)
+
     def verify(self, data, target='aarch64-pc-windows-msvc'):
         with tempfile.TemporaryDirectory() as root:
             archive = Path(root) / 'release.zip'

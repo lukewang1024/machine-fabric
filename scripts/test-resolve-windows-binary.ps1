@@ -17,6 +17,25 @@ try {
   $receipt = Join-Path $root 'installation.json'
   @{installedBinary=$immutable; installedSha256=$hash} | ConvertTo-Json -Compress | Set-Content -LiteralPath $receipt -Encoding UTF8
   if ((& $resolver) -cne $immutable) { throw 'immutable resolution failed' }
+  # SSH starts Windows PowerShell with the ordinary machine execution policy.
+  # Verify the process-scoped bootstrap invocation without changing that policy.
+  $beforePolicy = Get-ExecutionPolicy -Scope CurrentUser
+  $quotedResolver = $resolver.Replace("'", "''")
+  $quotedFixture = $fixture.Replace("'", "''")
+  $resolveCommand = "`$ErrorActionPreference='Stop'; `$env:ProgramFiles='$quotedFixture'; & '$quotedResolver'"
+  $resolveEncoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($resolveCommand))
+  $savedErrorPreference = $ErrorActionPreference
+  try {
+    $ErrorActionPreference = 'Continue'
+    $blocked = & powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Restricted -EncodedCommand $resolveEncoded 2>&1
+    $blockedCode = $LASTEXITCODE
+  } finally { $ErrorActionPreference = $savedErrorPreference }
+  if ($blockedCode -eq 0) { throw 'restricted policy did not reject the script fixture' }
+  $outerCommand = "& powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand '$resolveEncoded'; exit `$LASTEXITCODE"
+  $outerEncoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($outerCommand))
+  $resolved = & powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Restricted -EncodedCommand $outerEncoded
+  if ($LASTEXITCODE -ne 0 -or ($resolved -join '').Trim() -cne $immutable) { throw 'bootstrap resolution under restricted policy failed' }
+  if ((Get-ExecutionPolicy -Scope CurrentUser) -cne $beforePolicy) { throw 'persistent execution policy changed' }
   foreach ($path in @((Join-Path $fixture 'outside.exe'), (Join-Path $root 'versions\..\machine-fabric.exe'))) {
     @{installedBinary=$path; installedSha256=$hash} | ConvertTo-Json -Compress | Set-Content -LiteralPath $receipt -Encoding UTF8
     $rejected = $false
