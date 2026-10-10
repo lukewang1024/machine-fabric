@@ -53,6 +53,10 @@ $installRoot = Join-Path $env:ProgramFiles "machine-fabric"
 $stateRoot = Join-Path $env:ProgramData "machine-fabric"
 $installedBinary = Join-Path $installRoot "machine-fabric.exe"
 $legacyBinary = $installedBinary
+# Existing executables may be held by peer acceptors or user-owned clients.
+# Stage by content identity instead of overwriting or stopping those processes.
+# Reapplying the same content reuses the immutable binary, even while it is live.
+if (Test-Path -LiteralPath $legacyBinary) { $SideBySide = $true }
 $controllerSocket = Join-Path $stateRoot "controller.sock"
 $executorSocket = Join-Path $stateRoot "executor.sock"
 $controllerState = Join-Path $stateRoot "controller.json"
@@ -118,6 +122,7 @@ if ($SideBySide -and -not (Test-Path -LiteralPath $legacyBinary)) {
 
 New-Item -ItemType Directory -Force -Path $installRoot, $stateRoot | Out-Null
 if ($SideBySide) { $installedBinary = Stage-ImmutableBinary -Source $Binary -Root $installRoot }
+Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'resolve-windows-binary.ps1') -Destination (Join-Path $installRoot 'resolve-windows-binary.ps1') -Force
 $mappingTemporary = Join-Path $installRoot ("managed-path-mappings-" + [guid]::NewGuid().ToString('N') + '.tmp')
 try {
   $mappingJson = @{ version = 1; mappings = @($ManagedPathMapping) } | ConvertTo-Json -Compress

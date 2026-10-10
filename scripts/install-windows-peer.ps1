@@ -9,7 +9,7 @@ param(
 
 $ErrorActionPreference = "Stop"
 if ($PeerId -notmatch '^[0-9A-Za-z._-]+$') { throw "invalid peer id: $PeerId" }
-$binary = Join-Path $env:ProgramFiles "machine-fabric\machine-fabric.exe"
+$binary = & (Join-Path $env:ProgramFiles 'machine-fabric\resolve-windows-binary.ps1')
 $stateRoot = Join-Path $env:ProgramData "machine-fabric"
 $peerRoot = Join-Path $stateRoot ("peers\" + $PeerId)
 New-Item -ItemType Directory -Force -Path $peerRoot | Out-Null
