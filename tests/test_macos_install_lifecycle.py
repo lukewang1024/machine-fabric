@@ -32,6 +32,8 @@ class Fake(m.Installer):
         self.timeout = .03
         self.jobs = dict(zip(m.LABELS, (800001, 800002)))
         self.live = set(self.jobs.values())
+        self.extra_agent_pids = set()
+        self.terminated = []
         self.next_pid = 800003
         self.calls = []
         self.fail_boot = None
@@ -79,9 +81,14 @@ class Fake(m.Installer):
                     self.jobs[label] = self.next_pid; self.live.add(self.next_pid); self.next_pid += 1
             else: raise AssertionError('unexpected launchctl action ' + action)
         elif argv[0] == '/bin/ps':
-            for label, executable in zip(m.LABELS, (self.controller, self.agent)):
-                pid = self.jobs.get(label)
-                if pid: output += '%s %s\n' % (pid, executable)
+            for label, pid in self.jobs.items():
+                executable = self.controller if label == m.LABELS[0] else self.agent
+                if label not in m.LABELS:
+                    path = self.home / 'Library/LaunchAgents' / (label + '.plist')
+                    executable = plistlib.loads(path.read_bytes())['ProgramArguments'][0]
+                output += '%s %s\n' % (pid, executable)
+            for pid in self.extra_agent_pids & self.live:
+                output += '%s %s\n' % (pid, self.agent)
         elif argv[-1] == '--version': output = 'machine-fabric 0.1.28\n'
         elif argv[0] == '/usr/bin/dwarfdump':
             output = 'UUID: ' + ('AAAAAAAA' if Path(argv[-1]).read_text() == 'new' else 'BBBBBBBB')
@@ -94,6 +101,7 @@ class Fake(m.Installer):
 
     def alive(self, pid): return pid in self.live
     def terminate(self, pid):
+        self.terminated.append(pid)
         if not self.stubborn: self.live.discard(pid)
 
     def rpc(self, endpoint, action, params=None, max_bytes=2 * 1024 * 1024):
@@ -117,6 +125,85 @@ class LifecycleTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.x = Fake(self.tmp.name)
+
+    def managed_peers(self):
+        peers = {}
+        for index, name in enumerate(('linux', 'windows')):
+            label = 'dev.machine-fabric.peer.' + name
+            path = self.x.home / 'Library/LaunchAgents' / (label + '.plist')
+            path.write_bytes(plistlib.dumps({'Label': label, 'KeepAlive': True,
+                'ProgramArguments': [str(self.x.agent), 'peer', 'connect', '--id', name]}))
+            pid = 800010 + index
+            self.x.jobs[label] = pid
+            self.x.live.add(pid)
+            peers[label] = (path, path.read_bytes(), pid)
+        return peers
+
+    def test_stopping_executor_does_not_terminate_shared_executable_peers(self):
+        peers = self.managed_peers()
+        self.x.stop(m.LABELS[1], self.x.agent)
+        for label, (_, _, pid) in peers.items():
+            self.assertEqual(self.x.jobs[label], pid)
+            self.assertIn(pid, self.x.live)
+            self.assertNotIn(pid, self.x.terminated)
+
+    def test_install_restarts_two_peer_owners_once_and_preserves_topology(self):
+        peers = self.managed_peers()
+        self.x.install()
+        boot = [a for a in self.x.calls if a[:2] == ['/bin/launchctl', 'bootstrap']]
+        self.assertEqual(len(boot), 4)
+        for label, (path, content, old_pid) in peers.items():
+            self.assertEqual(path.read_bytes(), content)
+            self.assertNotEqual(self.x.jobs[label], old_pid)
+            self.assertNotIn(old_pid, self.x.live)
+            self.assertNotIn(old_pid, self.x.terminated)
+        bootout_labels = [a[2].split('/', 2)[-1] for a in self.x.calls
+                          if a[:2] == ['/bin/launchctl', 'bootout']]
+        self.assertEqual(set(bootout_labels[:2]), set(peers))
+
+    def test_peer_start_failure_restores_all_old_roles_against_current_state(self):
+        peers = self.managed_peers()
+        self.x.fail_boot = next(iter(peers))
+        self.x.new_state = True
+        with self.assertRaisesRegex(RuntimeError, 'previous service restored'):
+            self.x.install()
+        self.assertEqual(self.x.agent.read_text(), 'old')
+        self.assertEqual(self.x.controller.read_text(), 'old')
+        self.assertEqual(set(self.x.jobs), set(m.LABELS) | set(peers))
+        self.assertEqual(json.loads((self.x.state / 'controller.json').read_text())['epoch'], 2)
+        for path, content, _ in peers.values():
+            self.assertEqual(path.read_bytes(), content)
+
+    def test_previously_unloaded_peer_stays_unloaded(self):
+        peers = self.managed_peers()
+        label = next(iter(peers))
+        _, _, pid = peers[label]
+        del self.x.jobs[label]
+        self.x.live.remove(pid)
+        self.x.install()
+        self.assertNotIn(label, self.x.jobs)
+        self.assertTrue(peers[label][0].exists())
+
+    def test_unknown_shared_executable_owner_refuses_before_any_stop(self):
+        self.managed_peers()
+        self.x.extra_agent_pids.add(800099)
+        self.x.live.add(800099)
+        with self.assertRaisesRegex(RuntimeError, 'unknown launchd ownership'):
+            self.x.install()
+        self.assertEqual(self.x.agent.read_text(), 'old')
+        self.assertEqual(self.x.controller.read_text(), 'old')
+        self.assertEqual(self.x.terminated, [])
+        self.assertFalse(any(a[:2] == ['/bin/launchctl', 'bootout'] for a in self.x.calls))
+
+    def test_wrong_peer_role_refuses_before_any_stop(self):
+        peers = self.managed_peers()
+        path = next(iter(peers.values()))[0]
+        value = plistlib.loads(path.read_bytes())
+        value['ProgramArguments'][1:3] = ['executor', 'serve']
+        path.write_bytes(plistlib.dumps(value))
+        with self.assertRaisesRegex(RuntimeError, 'unknown peer job configuration'):
+            self.x.install()
+        self.assertFalse(any(a[:2] == ['/bin/launchctl', 'bootout'] for a in self.x.calls))
 
     def old_snapshot(self):
         old = self.x.state / 'installer-rollbacks' / ('20260101T000000-' + 'a' * 32)
