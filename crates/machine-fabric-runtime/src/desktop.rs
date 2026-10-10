@@ -540,6 +540,23 @@ mod tests {
     }
 
     #[test]
+    fn known_read_failure_does_not_clear_prior_input_quarantine() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("queue.json");
+        let mut queue =
+            DesktopQueue::open_with_boot_id(path.clone(), Some("boot-a".into())).unwrap();
+        queue.begin("computer-use.tools", &mut json!({})).unwrap();
+        queue.end(false).unwrap();
+        assert!(!queue.blocked);
+        queue.end(true).unwrap();
+        queue.end(false).unwrap();
+        assert!(queue.blocked);
+        assert!(queue.begin("computer-use.tools", &mut json!({})).is_err());
+        let reopened = DesktopQueue::open_with_boot_id(path, Some("boot-a".into())).unwrap();
+        assert!(reopened.blocked);
+    }
+
+    #[test]
     fn same_boot_or_missing_evidence_never_unlocks_uncertain_input() {
         for (old, current) in [
             (Some("boot-a"), Some("boot-a")),

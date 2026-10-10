@@ -3696,8 +3696,11 @@ fn desktop_dispatch_uncertain(
     tool: Option<&str>,
     result: &Result<Value, RpcError>,
 ) -> bool {
-    let read_only_poll =
-        action == "computer-use.call" && matches!(tool, Some("observe_ui" | "wait_for"));
+    // Tool discovery only requests schemas. A failed host bootstrap or schema
+    // read cannot dispatch input; keep the readiness error without introducing
+    // a new input quarantine. This never clears an already blocked queue.
+    let read_only_poll = action == "computer-use.tools"
+        || (action == "computer-use.call" && matches!(tool, Some("observe_ui" | "wait_for")));
     match result {
         Err(error) => {
             let message = error.message.to_ascii_lowercase();
@@ -4405,6 +4408,38 @@ mod tests {
             Some("navigate_browser"),
             &Err(error)
         ));
+    }
+
+    #[test]
+    fn schema_discovery_failure_does_not_claim_unknown_input() {
+        for code in [
+            "COMPUTER_USE_UNAVAILABLE",
+            "RPC_TIMEOUT",
+            "COMPUTER_USE_TOOL_FAILED",
+        ] {
+            let result = Err(RpcError::new(
+                code,
+                "Host bootstrap timed out before schema discovery",
+            ));
+            assert!(!desktop_dispatch_uncertain(
+                "computer-use.tools",
+                None,
+                &result
+            ));
+            // A supplied tool name does not turn schema discovery into input.
+            assert!(!desktop_dispatch_uncertain(
+                "computer-use.tools",
+                Some("act_ui"),
+                &result
+            ));
+            for action in [
+                "computer-use.tools ",
+                "computer-use.call",
+                "application.open-file",
+            ] {
+                assert!(desktop_dispatch_uncertain(action, Some("act_ui"), &result));
+            }
+        }
     }
 
     #[test]
