@@ -133,8 +133,9 @@ does not apply to the persisted mapping configuration. The standalone
 `executor validate-path-policy` command performs the same policy validation
 without starting services or creating runtime state.
 
-Windows upgrades automatically use side-by-side installation when a legacy
-installation exists. `-SideBySide` remains available on both installers.
+Windows fresh installations and upgrades both use immutable executable paths.
+The first reapply retains the same service paths as the initial installation.
+`-SideBySide` remains accepted for compatibility with earlier callers.
 The installer verifies a candidate in an immutable SHA-256
 directory before stopping services, and points the Controller and Executor
 services at that candidate. Existing identical candidates are reused without
