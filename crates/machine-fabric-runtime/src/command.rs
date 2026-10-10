@@ -324,7 +324,11 @@ mod tests {
         let raw = vec![b'x'; 200_000];
         std::fs::write(directory.path().join("stream"), &raw).unwrap();
         #[cfg(unix)]
-        let script = "cat stream; cat stream >&2; sleep 30";
+        // Replace the shell after writing both payloads. On macOS, killing a
+        // shell and its sleep child together can race with the shell printing
+        // an extra "Killed" diagnostic, which is valid captured output but
+        // makes a payload-only byte-count fixture nondeterministic.
+        let script = "cat stream; cat stream >&2; exec sleep 30";
         #[cfg(windows)]
         let script = "type stream & type stream 1>&2 & ping -n 30 127.0.0.1 >NUL";
         let error = run(&shell(script), directory.path(), &BTreeMap::new(), 2_000).unwrap_err();

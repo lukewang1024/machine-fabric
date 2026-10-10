@@ -53,10 +53,11 @@ $installRoot = Join-Path $env:ProgramFiles "machine-fabric"
 $stateRoot = Join-Path $env:ProgramData "machine-fabric"
 $installedBinary = Join-Path $installRoot "machine-fabric.exe"
 $legacyBinary = $installedBinary
-# Existing executables may be held by peer acceptors or user-owned clients.
-# Stage by content identity instead of overwriting or stopping those processes.
-# Reapplying the same content reuses the immutable binary, even while it is live.
-if (Test-Path -LiteralPath $legacyBinary) { $SideBySide = $true }
+# Use the content-addressed path on the first installation as well as upgrades.
+# Otherwise the first reapply would migrate service definitions from the legacy
+# path to the immutable path despite using exactly the same release content.
+# The switch remains accepted for callers of the previous installer contract.
+$SideBySide = $true
 $controllerSocket = Join-Path $stateRoot "controller.sock"
 $executorSocket = Join-Path $stateRoot "executor.sock"
 $controllerState = Join-Path $stateRoot "controller.json"
@@ -113,15 +114,8 @@ $ownedProcesses = @($initialFabricProcesses | Where-Object { $_.ProcessId -in $o
 $foreignHolders = @($initialFabricProcesses | Where-Object {
   $_.ExecutablePath -and $_.ExecutablePath.Equals($legacyBinary, [StringComparison]::OrdinalIgnoreCase) -and $_.ProcessId -notin $ownedProcessIds
 })
-if ($foreignHolders.Count -and -not $SideBySide) {
-  throw 'unowned processes hold the legacy binary; use -SideBySide or arrange an owner-controlled stop; services were not stopped'
-}
-if ($SideBySide -and -not (Test-Path -LiteralPath $legacyBinary)) {
-  throw 'side-by-side upgrade requires an existing legacy installation'
-}
-
 New-Item -ItemType Directory -Force -Path $installRoot, $stateRoot | Out-Null
-if ($SideBySide) { $installedBinary = Stage-ImmutableBinary -Source $Binary -Root $installRoot }
+$installedBinary = Stage-ImmutableBinary -Source $Binary -Root $installRoot
 Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'resolve-windows-binary.ps1') -Destination (Join-Path $installRoot 'resolve-windows-binary.ps1') -Force
 $mappingTemporary = Join-Path $installRoot ("managed-path-mappings-" + [guid]::NewGuid().ToString('N') + '.tmp')
 try {
@@ -193,8 +187,6 @@ do {
   }
   Start-Sleep -Milliseconds 200
 } while ($true)
-if (-not $SideBySide) { Copy-Item -Force -LiteralPath $Binary -Destination $installedBinary }
-
 function Quote-Arg([string]$Value) {
   if ($Value -match '[\r\n\x00]') { throw 'service argument contains a control character' }
   # CommandLineToArgvW/CRT quoting: double backslashes before a quote and
@@ -280,7 +272,7 @@ $receipt = @{
   installedSha256 = (Get-FileHash -LiteralPath $installedBinary -Algorithm SHA256).Hash.ToLowerInvariant()
   sideBySide = [bool]$SideBySide
   legacyBinary = $legacyBinary
-  legacyBinaryUpdated = (-not $SideBySide)
+  legacyBinaryUpdated = $false
   retainedForeignProcessIds = @($foreignHolders | Select-Object -ExpandProperty ProcessId)
   completedAt = (Get-Date).ToUniversalTime().ToString('o')
 } | ConvertTo-Json -Depth 5
