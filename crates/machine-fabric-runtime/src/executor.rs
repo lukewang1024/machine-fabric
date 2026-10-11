@@ -3718,11 +3718,24 @@ fn desktop_dispatch_uncertain(
 }
 
 fn returned_cdp_navigation_failure(action: &str, tool: Option<&str>, error: &RpcError) -> bool {
+    let matched_scope = match tool {
+        Some("navigate_browser") => true,
+        Some("launch_browser") => {
+            error.details.pointer("/hostDiagnostics/launchFailure")
+                == Some(&json!({
+                    "version": 1, "tool": "launch_browser", "phase": "navigation",
+                    "physicalInputDispatched": false, "navigationOutcome": "unknown",
+                    "ownedBrowserClosed": true, "ownedProfileRemoved": true,
+                    "ownershipReleased": true, "retrySafe": false
+                }))
+        }
+        _ => false,
+    };
     action == "computer-use.call"
-        && tool == Some("navigate_browser")
+        && matched_scope
         && error.code == "COMPUTER_USE_TOOL_FAILED"
         && error.details.get("hostResponseReceived") == Some(&json!(true))
-        && error.details.get("tool") == Some(&json!("navigate_browser"))
+        && error.details.get("tool").and_then(Value::as_str) == tool
         && error.details.get("operationOutcome") == Some(&json!("unknown"))
         && error
             .details
@@ -4347,6 +4360,104 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn only_completed_owned_launch_cleanup_avoids_desktop_quarantine() {
+        let mut error = RpcError::new("COMPUTER_USE_TOOL_FAILED", "Page.navigate timed out");
+        error.details = json!({"hostResponseReceived": true,
+        "hostRequestId": uuid::Uuid::new_v4().to_string(), "tool": "launch_browser",
+        "operationOutcome": "unknown", "hostDiagnostics": {
+            "navigationFailure": {
+                "version": 1, "mechanism": "cdp", "command": "Page.navigate", "phase": "navigation",
+                "physicalInputDispatched": false, "navigationOutcome": "unknown", "retrySafe": false
+            },
+            "launchFailure": {
+                "version": 1, "tool": "launch_browser", "phase": "navigation",
+                "physicalInputDispatched": false, "navigationOutcome": "unknown",
+                "ownedBrowserClosed": true, "ownedProfileRemoved": true,
+                "ownershipReleased": true, "retrySafe": false
+            }
+        }});
+        assert!(!desktop_dispatch_uncertain(
+            "computer-use.call",
+            Some("launch_browser"),
+            &Err(error.clone())
+        ));
+        assert!(
+            !error.retryable,
+            "A cleaned launch failure does not authorize replay"
+        );
+        for (key, value) in error.details["hostDiagnostics"]["launchFailure"]
+            .as_object()
+            .unwrap()
+        {
+            for wrong in [
+                Value::Null,
+                json!(0),
+                if value.is_boolean() {
+                    json!(!value.as_bool().unwrap())
+                } else {
+                    json!("wrong")
+                },
+            ] {
+                let mut invalid = error.clone();
+                invalid.details["hostDiagnostics"]["launchFailure"][key] = wrong;
+                assert!(
+                    desktop_dispatch_uncertain(
+                        "computer-use.call",
+                        Some("launch_browser"),
+                        &Err(invalid)
+                    ),
+                    "{key}"
+                );
+            }
+            let mut absent = error.clone();
+            absent.details["hostDiagnostics"]["launchFailure"]
+                .as_object_mut()
+                .unwrap()
+                .remove(key);
+            assert!(
+                desktop_dispatch_uncertain(
+                    "computer-use.call",
+                    Some("launch_browser"),
+                    &Err(absent)
+                ),
+                "missing {key}"
+            );
+        }
+        for pointer in [
+            "/hostResponseReceived",
+            "/hostRequestId",
+            "/tool",
+            "/operationOutcome",
+            "/hostDiagnostics/navigationFailure",
+            "/hostDiagnostics/launchFailure",
+        ] {
+            let mut invalid = error.clone();
+            *invalid.details.pointer_mut(pointer).unwrap() = Value::Null;
+            assert!(
+                desktop_dispatch_uncertain(
+                    "computer-use.call",
+                    Some("launch_browser"),
+                    &Err(invalid)
+                ),
+                "{pointer}"
+            );
+        }
+        for tool in ["act_ui", "navigate_browser", "evaluate_browser"] {
+            assert!(desktop_dispatch_uncertain(
+                "computer-use.call",
+                Some(tool),
+                &Err(error.clone())
+            ));
+        }
+        error.code = "COMPUTER_USE_UNAVAILABLE".into();
+        assert!(desktop_dispatch_uncertain(
+            "computer-use.call",
+            Some("launch_browser"),
+            &Err(error)
+        ));
+    }
 
     #[test]
     fn only_matched_inner_cdp_navigation_receipts_avoid_desktop_quarantine() {
@@ -5094,6 +5205,8 @@ mod tests {
             "capture_read_error",
             "wait_read_error",
             "pure_navigation_error",
+            "launch_cleaned_error",
+            "launch_cleanup_unknown_error",
             "capture_read_result",
             "effect_unverified",
         ] {
@@ -5158,7 +5271,20 @@ while True:
                 'command': 'Page.navigate', 'phase': 'navigation', 'physicalInputDispatched': False,
                 'navigationOutcome': 'unknown', 'retrySafe': False}}}) + '\n').encode())
         continue
-    if mode == 'pure_navigation_error':
+    if mode.startswith('launch_') and request.get('method') == 'launch_browser':
+        stream.write((json.dumps({'id': request['id'], 'ok': False,
+            'error': 'CDP command Page.navigate timed out',
+            'errorDetails': {
+                'navigationFailure': {'version': 1, 'mechanism': 'cdp', 'command': 'Page.navigate',
+                    'phase': 'navigation', 'physicalInputDispatched': False, 'navigationOutcome': 'unknown', 'retrySafe': False},
+                'launchFailure': {'version': 1, 'tool': 'launch_browser', 'phase': 'navigation',
+                    'physicalInputDispatched': False, 'navigationOutcome': 'unknown',
+                    'ownedBrowserClosed': mode == 'launch_cleaned_error', 'ownedProfileRemoved': True,
+                    'ownershipReleased': True, 'retrySafe': False}}}) + '\n').encode())
+        continue
+    if mode.startswith('launch_'):
+        result = {'details': {'tool': request.get('method'), 'execution': {'outcome': 'worked', 'dispatchCompletion': 'returned'}}}
+    elif mode == 'pure_navigation_error':
         result = {'details': {'tool': request.get('method'), 'execution': {'outcome': 'worked', 'dispatchCompletion': 'returned'}}}
     elif mode == 'wait_read_error':
         result = {'details': {'tool': request.get('method'), 'execution': {'outcome': 'worked', 'dispatchCompletion': 'returned'}}}
@@ -5226,23 +5352,38 @@ sock.close()
             let call_params = || {
                 json!({
                     "sessionId": "discovery",
-                    "tool": if mode.starts_with("capture_read") { "observe_ui" } else if mode == "wait_read_error" { "wait_for" } else if mode == "pure_navigation_error" { "navigate_browser" } else { "act_ui" },
+                    "tool": if mode.starts_with("capture_read") { "observe_ui" } else if mode == "wait_read_error" { "wait_for" } else if mode == "pure_navigation_error" { "navigate_browser" } else if mode.starts_with("launch_") { "launch_browser" } else { "act_ui" },
                     "arguments": {"stateId": "cu-state", "actions": [{"action": "click", "ref": "@e1"}]},
                     "_desktop": {"owner": "fake-host-test", "token": job["token"]}
                 })
             };
 
             let first = runtime.handle(Request::new("computer-use.call", call_params()));
+            if mode == "launch_cleanup_unknown_error" {
+                assert!(!first.ok, "The launch remains a returned failure");
+                let desktop = runtime.handle(Request::new("desktop.list", json!({})));
+                assert_eq!(desktop.result.unwrap()["blocked"], true);
+                let mut next_input = call_params();
+                next_input["tool"] = json!("act_ui");
+                let second = runtime.handle(Request::new("computer-use.call", next_input));
+                assert_eq!(second.error.unwrap().code, "DESKTOP_RECOVERY_REQUIRED");
+                assert_eq!(fs::read_to_string(&calls_path).unwrap().lines().count(), 1);
+                continue;
+            }
             if mode.starts_with("capture_read")
                 || mode == "wait_read_error"
                 || mode == "effect_unverified"
                 || mode == "pure_navigation_error"
+                || mode == "launch_cleaned_error"
             {
                 assert_eq!(
                     first.ok,
                     !matches!(
                         mode,
-                        "capture_read_error" | "wait_read_error" | "pure_navigation_error"
+                        "capture_read_error"
+                            | "wait_read_error"
+                            | "pure_navigation_error"
+                            | "launch_cleaned_error"
                     ),
                     "{first:?}"
                 );

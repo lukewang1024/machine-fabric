@@ -272,9 +272,19 @@ fn host_tool_failure(response: &Value, request_id: &str, method: &str) -> RpcErr
         let navigation = json!({"version": 1, "mechanism": "cdp",
             "command": "Page.navigate", "phase": "navigation",
             "physicalInputDispatched": false, "navigationOutcome": "unknown", "retrySafe": false});
-        if method == "navigate_browser" && diagnostics.get("navigationFailure") == Some(&navigation)
+        let launch = json!({"version": 1, "tool": "launch_browser", "phase": "navigation",
+            "physicalInputDispatched": false, "navigationOutcome": "unknown",
+            "ownedBrowserClosed": true, "ownedProfileRemoved": true,
+            "ownershipReleased": true, "retrySafe": false});
+        let launch_complete =
+            method == "launch_browser" && diagnostics.get("launchFailure") == Some(&launch);
+        if (method == "navigate_browser" || launch_complete)
+            && diagnostics.get("navigationFailure") == Some(&navigation)
         {
             bounded.insert("navigationFailure".into(), navigation);
+            if launch_complete {
+                bounded.insert("launchFailure".into(), launch);
+            }
         }
         error.details["hostDiagnostics"] = Value::Object(bounded);
     }
