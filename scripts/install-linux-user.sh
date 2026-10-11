@@ -19,6 +19,12 @@ if ! command -v systemctl >/dev/null 2>&1; then
   exit 2
 fi
 
+script_root=$(CDPATH= cd -- "$(dirname "$0")" && pwd)
+package_root=$(dirname "$script_root")/packaging
+for template in machine-fabric-controller.service.in machine-fabric-executor.service.in; do
+  [ -r "$package_root/$template" ] || { echo "install-linux-user: template unavailable: $template" >&2; exit 2; }
+done
+
 state_home=${XDG_STATE_HOME:-"$HOME/.local/state"}
 config_home=${XDG_CONFIG_HOME:-"$HOME/.config"}
 installed_binary=$HOME/.local/bin/machine-fabric
@@ -43,24 +49,12 @@ if [ -n "$clipboard_display" ]; then
   xvfb=$(command -v Xvfb 2>/dev/null || true)
   [ -n "$xvfb" ] || { echo "install-linux-user: Xvfb is required for clipboard support" >&2; exit 2; }
   command -v xauth >/dev/null 2>&1 || { echo "install-linux-user: xauth is required for clipboard support" >&2; exit 2; }
+  [ -r "$package_root/machine-fabric-clipboard-x11.service.in" ] || { echo "install-linux-user: clipboard template unavailable" >&2; exit 2; }
 fi
-
-mkdir -p "$(dirname "$installed_binary")" "$unit_root" "$state_root"
-if [ -f "$controller_state" ] || [ -f "$state_root/executor-fences.json" ] || [ -f "$installed_binary" ]; then
-  mkdir -p "$backup_root"
-  for state_file in "$controller_state" "$state_root/executor-fences.json"; do
-    if [ -f "$state_file" ]; then cp -p "$state_file" "$backup_root/"; fi
-  done
-  if [ -f "$installed_binary" ]; then cp -p "$installed_binary" "$backup_root/machine-fabric"; fi
-fi
-temporary=$installed_binary.$$.tmp
-cp "$binary" "$temporary"
-chmod 755 "$temporary"
-mv "$temporary" "$installed_binary"
 
 allow_args=
 if [ "$#" -eq 0 ]; then
-  mkdir -p "$HOME/Code" "$HOME/Workspace"
+  mkdir -p "$HOME/Code" "$HOME/Workspace" "$state_home"
   set -- "$HOME/Code" "$HOME/Workspace" "$state_home"
 fi
 for root in "$@"; do
@@ -74,6 +68,19 @@ for root in "$@"; do
   fi
   allow_args="$allow_args --allow-root $root"
 done
+
+mkdir -p "$(dirname "$installed_binary")" "$unit_root" "$state_root"
+if [ -f "$controller_state" ] || [ -f "$state_root/executor-fences.json" ] || [ -f "$installed_binary" ]; then
+  mkdir -p "$backup_root"
+  for state_file in "$controller_state" "$state_root/executor-fences.json"; do
+    if [ -f "$state_file" ]; then cp -p "$state_file" "$backup_root/"; fi
+  done
+  if [ -f "$installed_binary" ]; then cp -p "$installed_binary" "$backup_root/machine-fabric"; fi
+fi
+temporary=$installed_binary.$$.tmp
+cp "$binary" "$temporary"
+chmod 755 "$temporary"
+mv "$temporary" "$installed_binary"
 
 controller_unit=$unit_root/machine-fabric-controller.service
 executor_unit=$unit_root/machine-fabric-executor.service
@@ -95,7 +102,8 @@ After=$clipboard_service"
 Environment=XAUTHORITY=$clipboard_auth"
   sed -e "s|@XVFB@|$xvfb|g" -e "s|@DISPLAY@|$clipboard_display|g" \
     -e "s|@XAUTHORITY@|$clipboard_auth|g" -e "s|@EXECUTOR_SERVICE@|machine-fabric-executor.service|g" \
-    packaging/machine-fabric-clipboard-x11.service.in >"$unit_root/$clipboard_service"
+    "$package_root/machine-fabric-clipboard-x11.service.in" >"$unit_root/$clipboard_service.$$.tmp"
+  mv "$unit_root/$clipboard_service.$$.tmp" "$unit_root/$clipboard_service"
 fi
 
 controller_tmp=$controller_unit.$$.tmp
@@ -104,7 +112,7 @@ sed \
   -e "s|@SOCKET@|$controller_socket|g" \
   -e "s|@STATE@|$controller_state|g" \
   -e "s|@CONTROLLER_ID@|$controller_id|g" \
-  packaging/machine-fabric-controller.service.in >"$controller_tmp"
+  "$package_root/machine-fabric-controller.service.in" >"$controller_tmp"
 mv "$controller_tmp" "$controller_unit"
 
 executor_tmp=$executor_unit.$$.tmp
@@ -113,7 +121,7 @@ sed \
   -e "s|@SOCKET@|$executor_socket|g" \
   -e "s|@EXECUTOR_ID@|$executor_id|g" \
   -e "s|@ALLOW_ROOTS@|$allow_args|g" \
-  packaging/machine-fabric-executor.service.in |
+  "$package_root/machine-fabric-executor.service.in" |
   MF_CLIPBOARD_AFTER="$clipboard_after" MF_CLIPBOARD_ENV="$clipboard_env" awk '
     $0 == "@CLIPBOARD_AFTER@" { print ENVIRON["MF_CLIPBOARD_AFTER"]; next }
     $0 == "@CLIPBOARD_ENV@" { print ENVIRON["MF_CLIPBOARD_ENV"]; next }
