@@ -103,6 +103,13 @@ directories and sensitive OS data, while leaving application locations such as
 deny also overrides a write allow. Directory listings and searches omit denied
 children; artifact tree operations refuse a tree containing one.
 
+On macOS upgrades, the installer preserves the existing owned Executor's
+`--allow-root` paths by default. `MACHINE_FABRIC_LOCAL_ALLOW_ROOTS` explicitly
+replaces that list with newline-separated absolute paths. A first installation
+uses `Code`, `Workspace`, and the state directory; malformed or foreign existing
+Executor configurations stop staging before any service is stopped. This does
+not change the desktop write policy or credential deny list.
+
 Writes are admitted only below the selected user's `Code`, `Workspace`,
 `Downloads`, `Documents`, `Desktop`, `Pictures`, `.cache`, `.config`,
 `.local/state`, and `.local/share`, plus absolute XDG cache, state, and config

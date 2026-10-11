@@ -48,7 +48,13 @@ class Fake(m.Installer):
         self.controller.write_text('old'); self.controller.chmod(0o755)
         for p, label in zip(self.plists, m.LABELS):
             p.parent.mkdir(parents=True, exist_ok=True)
-            p.write_bytes(plistlib.dumps({'Label': label, 'old': True}))
+            document = {'Label': label, 'old': True}
+            if label == m.LABELS[1]:
+                document['ProgramArguments'] = [str(self.agent), '--socket', str(self.sockets[1]),
+                    'executor', 'serve', '--id', self.node + '-rust']
+                for root in (self.home / 'Code', self.home / 'Workspace', self.state.parent):
+                    document['ProgramArguments'] += ['--allow-root', str(root)]
+            p.write_bytes(plistlib.dumps(document))
         self.bins.mkdir()
         for p in self.links: p.symlink_to(self.agent)
         (self.state / 'controller.json').write_text('{"tasks":[],"leases":[],"epoch":1}')
@@ -125,6 +131,47 @@ class LifecycleTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.x = Fake(self.tmp.name)
+
+    def test_upgrade_inherits_custom_roots_from_the_owned_executor(self):
+        document = plistlib.loads(self.x.plists[1].read_bytes())
+        roots = [str(self.x.home / 'Downloads'), '/Applications/Test & Review.app', '/tmp/space root']
+        document['ProgramArguments'] = document['ProgramArguments'][:7]
+        for root in roots:
+            document['ProgramArguments'] += ['--allow-root', root]
+        self.x.plists[1].write_bytes(plistlib.dumps(document))
+        with patch.dict(os.environ, {}, clear=True):
+            self.x.install()
+        argv = plistlib.loads(self.x.plists[1].read_bytes())['ProgramArguments']
+        self.assertEqual([argv[i + 1] for i, arg in enumerate(argv) if arg == '--allow-root'], roots)
+
+    def test_explicit_roots_override_existing_configuration(self):
+        with patch.dict(os.environ, {'MACHINE_FABRIC_LOCAL_ALLOW_ROOTS': '/tmp/explicit\n/Applications/Other.app'}, clear=True):
+            self.assertEqual(self.x.configured_roots(), ['/tmp/explicit', '/Applications/Other.app'])
+
+    def test_first_install_uses_default_roots(self):
+        self.x.plists[1].unlink()
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(self.x.configured_roots(), list(map(str,
+                (self.x.home / 'Code', self.x.home / 'Workspace', self.x.state.parent))))
+
+    def test_invalid_existing_roots_stop_before_launchd_operations(self):
+        original = plistlib.loads(self.x.plists[1].read_bytes())
+        for suffix in ([], ['--allow-root'], ['--allow-root', 'relative'], ['--allow-root', '/tmp/a\nb']):
+            with self.subTest(suffix=suffix):
+                document = dict(original, ProgramArguments=original['ProgramArguments'][:7] + suffix)
+                self.x.plists[1].write_bytes(plistlib.dumps(document))
+                with patch.dict(os.environ, {}, clear=True), self.assertRaises(RuntimeError):
+                    self.x.install()
+                self.assertEqual(self.x.jobs, dict(zip(m.LABELS, (800001, 800002))))
+                self.assertFalse(any(call[0] == '/bin/launchctl' for call in self.x.calls))
+
+    def test_foreign_executor_roots_are_not_inherited(self):
+        document = plistlib.loads(self.x.plists[1].read_bytes())
+        document['ProgramArguments'][6] = 'foreign-rust'
+        self.x.plists[1].write_bytes(plistlib.dumps(document))
+        with patch.dict(os.environ, {}, clear=True), self.assertRaises(RuntimeError):
+            self.x.install()
+        self.assertFalse(any(call[0] == '/bin/launchctl' for call in self.x.calls))
 
     def managed_peers(self):
         peers = {}

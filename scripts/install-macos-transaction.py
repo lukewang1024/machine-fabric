@@ -203,7 +203,34 @@ class Installer:
                 if expiry > now:
                     raise RuntimeError('controller has active driver leases')
 
+    def configured_roots(self):
+        override = os.environ.get('MACHINE_FABRIC_LOCAL_ALLOW_ROOTS')
+        if override is not None:
+            roots = override.splitlines()
+        elif self.plists[1].exists():
+            document = plistlib.loads(self.plists[1].read_bytes())
+            arguments = document.get('ProgramArguments')
+            prefix = [str(self.agent), '--socket', str(self.sockets[1]),
+                      'executor', 'serve', '--id', self.node + '-rust']
+            if (document.get('Label') != LABELS[1] or not isinstance(arguments, list)
+                    or any(not isinstance(arg, str) for arg in arguments)
+                    or arguments[:len(prefix)] != prefix):
+                raise RuntimeError('cannot inherit roots from an unknown executor configuration')
+            roots = []
+            for index, argument in enumerate(arguments):
+                if argument == '--allow-root':
+                    if index + 1 == len(arguments):
+                        raise RuntimeError('existing allow-root has no value')
+                    roots.append(arguments[index + 1])
+        else:
+            roots = list(map(str, (self.home / 'Code', self.home / 'Workspace', self.state.parent)))
+        if (not roots or any(not root or not Path(root).is_absolute()
+                             or any(c in root for c in ('\x00', '\r', '\n')) for root in roots)):
+            raise RuntimeError('allowed roots must be nonempty absolute paths')
+        return roots
+
     def stage(self, directory):
+        roots = self.configured_roots()
         if not self.source.is_file() or not os.access(self.source, os.X_OK):
             raise RuntimeError('candidate executable missing')
         self.version = self.run([self.source, '--version']).stdout.split()[1]
@@ -233,9 +260,6 @@ class Installer:
         self.run(['/usr/bin/codesign', '--verify', '--deep', '--strict', stage_app])
         shutil.copy2(self.source, directory / 'controller')
         (directory / 'controller').chmod(0o755)
-        roots = os.environ.get('MACHINE_FABRIC_LOCAL_ALLOW_ROOTS', '\n'.join(map(str, (self.home / 'Code', self.home / 'Workspace', self.state.parent)))).splitlines()
-        if not roots or any(not Path(root).is_absolute() or not root for root in roots):
-            raise RuntimeError('allowed roots must be nonempty absolute paths')
         arguments = [[str(self.controller), '--socket', str(self.sockets[0]), 'controller', 'serve', '--state',
                       str(self.state / 'controller.json'), '--id', self.node],
                      [str(self.agent), '--socket', str(self.sockets[1]), 'executor', 'serve', '--id', self.node + '-rust']]
