@@ -7,6 +7,8 @@ param(
   [string]$PolicyUser,
   [string]$PolicyHome = $env:USERPROFILE,
   [string[]]$ManagedPathMapping = @(),
+  [string]$ArchivePath,
+  [string]$ExpectedSha256,
   [switch]$SideBySide
 )
 
@@ -30,7 +32,13 @@ if ($PolicyUserFile) {
 $Version = $Version.TrimStart("v")
 if ($Version -notmatch '^[0-9]+\.[0-9]+\.[0-9]+$') { throw "version must be exact semver: $Version" }
 $baseUrl = $env:MACHINE_FABRIC_RELEASE_BASE_URL
-if (-not $baseUrl -or $baseUrl -notmatch '^https://') {
+if ([bool]$ArchivePath -ne [bool]$ExpectedSha256) {
+  throw 'ArchivePath and ExpectedSha256 must be supplied together'
+}
+if ($ArchivePath -and $ExpectedSha256 -notmatch '^[a-fA-F0-9]{64}$') {
+  throw 'ExpectedSha256 must be an exact SHA-256'
+}
+if (-not $ArchivePath -and (-not $baseUrl -or $baseUrl -notmatch '^https://')) {
   throw "set MACHINE_FABRIC_RELEASE_BASE_URL to the internal release CDN root"
 }
 
@@ -41,16 +49,24 @@ $target = switch ($nativeArchitecture.ToUpperInvariant()) {
   default { throw "unsupported Windows OS architecture: $nativeArchitecture" }
 }
 $archive = "machine-fabric-$Version-$target.zip"
-$base = $baseUrl.TrimEnd('/') + "/releases/v$Version"
+$base = if ($baseUrl) { $baseUrl.TrimEnd('/') + "/releases/v$Version" } else { '' }
 $headers = @{ "X-Tos-Access" = "internal" }
 $temporary = Join-Path ([System.IO.Path]::GetTempPath()) ("machine-fabric-" + [guid]::NewGuid())
 New-Item -ItemType Directory -Path $temporary | Out-Null
 try {
-  Invoke-WebRequest "$base/$archive" -Headers $headers -OutFile (Join-Path $temporary $archive)
-  Invoke-WebRequest "$base/SHA256SUMS" -Headers $headers -OutFile (Join-Path $temporary "SHA256SUMS")
-  $sumLines = @(Get-Content (Join-Path $temporary "SHA256SUMS") | Where-Object { $_ -match ('^[a-fA-F0-9]{64} [ *]' + [regex]::Escape($archive) + '$') })
-  if ($sumLines.Count -ne 1) { throw "expected one checksum for $archive" }
-  $expected = ($sumLines[0] -split '\s+')[0].ToLowerInvariant()
+  if ($ArchivePath) {
+    if ([IO.Path]::GetFileName($ArchivePath) -ne $archive) { throw 'staged archive does not match native architecture and exact version' }
+    $source = Get-Item -LiteralPath $ArchivePath -ErrorAction Stop
+    if ($source.PSIsContainer -or ($source.Attributes -band [IO.FileAttributes]::ReparsePoint)) { throw 'staged archive must be a regular file' }
+    Copy-Item -LiteralPath $source.FullName -Destination (Join-Path $temporary $archive)
+    $expected = $ExpectedSha256.ToLowerInvariant()
+  } else {
+    Invoke-WebRequest "$base/$archive" -Headers $headers -OutFile (Join-Path $temporary $archive)
+    Invoke-WebRequest "$base/SHA256SUMS" -Headers $headers -OutFile (Join-Path $temporary "SHA256SUMS")
+    $sumLines = @(Get-Content (Join-Path $temporary "SHA256SUMS") | Where-Object { $_ -match ('^[a-fA-F0-9]{64} [ *]' + [regex]::Escape($archive) + '$') })
+    if ($sumLines.Count -ne 1) { throw "expected one checksum for $archive" }
+    $expected = ($sumLines[0] -split '\s+')[0].ToLowerInvariant()
+  }
   $actual = (Get-FileHash -Algorithm SHA256 (Join-Path $temporary $archive)).Hash.ToLowerInvariant()
   if ($actual -ne $expected) { throw "checksum mismatch" }
   Expand-Archive -Path (Join-Path $temporary $archive) -DestinationPath $temporary

@@ -304,3 +304,18 @@ bridge returns. Cleanup removes only the socket inode owned by that generation;
 an older generation cannot remove a replacement endpoint. Persistent `.lock`
 files are intentional and must not be removed while a listener is running.
 Disconnected bridges reject new requests and do not replay pending requests.
+
+### Windows release transport
+
+Fabric bootstrap downloads the exact native Windows release archive on the
+initiator, verifies its SHA-256 from the HTTPS release source, and transfers it
+through the selected SSH connection before pausing peer connectors. Windows
+verifies the transferred bytes again before extracting or installing them.
+Bootstrap therefore does not require the Windows node to reach the release CDN
+or have a working local HTTP proxy. It does not alter proxy configuration.
+
+For an explicitly staged manual installation, `install-from-release.ps1`
+accepts `-ArchivePath` and `-ExpectedSha256` together. The filename must match the
+exact requested version and native OS architecture. The checksum must come from
+a trusted release source; checksum mismatch fails before invoking the installer.
+The normal direct-download entrypoint remains available without these options.
