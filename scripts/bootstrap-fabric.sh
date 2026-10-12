@@ -124,6 +124,15 @@ mkdir -p "$pause_state_dir"
 paused_peer_connections=$pause_state_dir/bootstrap-paused-peers-$local_id-$$.txt
 : >"$paused_peer_connections"
 setup_succeeded=false
+remote_release_stages=$release_cache/remote-stages
+: >"$remote_release_stages"
+
+remove_remote_release_stage() {
+  stage_host=$1
+  stage_path=$2
+  ssh -o BatchMode=yes -o ClearAllForwardings=yes "$stage_host" \
+    "powershell.exe -NoProfile -NonInteractive -Command \"\$ErrorActionPreference='Stop'; if (Test-Path -LiteralPath '$stage_path') { \$d=Get-Item -LiteralPath '$stage_path'; if (\$d.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'refusing redirected release stage' }; if ((Get-Content -Raw -LiteralPath '$stage_path/.owner') -ne 'machine-fabric-bootstrap-stage-$version') { throw 'refusing unowned release stage' }; Remove-Item -LiteralPath '$stage_path' -Recurse -Force }\"" >/dev/null
+}
 
 remove_paused_peer_connection() {
   record="$1 $2 $3"
@@ -185,6 +194,10 @@ cleanup() {
   if [ "$setup_succeeded" != true ]; then
     restore_paused_peer_connections || true
   fi
+  while IFS="$(printf '\t')" read -r stage_host stage_path; do
+    remove_remote_release_stage "$stage_host" "$stage_path" || \
+      printf 'bootstrap-fabric: could not clean owned release stage on %s\n' "$stage_host" >&2
+  done <"$remote_release_stages"
   rm -rf "$release_cache"
   if [ ! -s "$paused_peer_connections" ]; then rm -f "$paused_peer_connections"; fi
 }
@@ -606,8 +619,31 @@ for host in "$@"; do
   if [ "$verify_only" = false ] && [ "$skip_release_install" = false ]; then
     printf 'bootstrap-fabric: %s: installing %s\n' "$host" "$version"
     if [ "$host_platform" = windows ]; then
+      windows_arch=$(ssh -o BatchMode=yes -o ClearAllForwardings=yes "$host" \
+        'powershell.exe -NoProfile -NonInteractive -Command "if ($env:PROCESSOR_ARCHITEW6432) { $env:PROCESSOR_ARCHITEW6432 } else { $env:PROCESSOR_ARCHITECTURE }"' | tr -d '\r\n')
+      case $windows_arch in
+        AMD64) windows_target=x86_64-pc-windows-msvc ;;
+        ARM64) windows_target=aarch64-pc-windows-msvc ;;
+        *) printf 'bootstrap-fabric: unsupported Windows architecture: %s\n' "$windows_arch" >&2; exit 2 ;;
+      esac
+      # Download and authenticate before pausing working peer connections.
+      # Windows uses SSH transport, so no guest CDN/proxy access is required.
+      printf 'bootstrap-fabric: %s: preparing verified Windows archive on initiator\n' "$host"
+      windows_sum=$(MACHINE_FABRIC_RELEASE_BASE_URL=$release_base_url \
+        sh "$script_dir/prepare-windows-release.sh" "$version" "$windows_target" "$release_cache")
+      windows_archive=machine-fabric-$version-$windows_target.zip
+      windows_temp=$(ssh -o BatchMode=yes -o ClearAllForwardings=yes "$host" \
+        'powershell.exe -NoProfile -NonInteractive -Command "[IO.Path]::GetTempPath()"' | tr -d '\r' | tr '\\' '/')
+      case $windows_temp in
+        *"'"*|*'"'*|*'`'*|*'$'*|'') printf '%s\n' 'bootstrap-fabric: unsafe Windows temporary path' >&2; exit 2 ;;
+      esac
+      windows_stage=${windows_temp%/}/machine-fabric-bootstrap-stage-$version-$$-$host
+      ssh -o BatchMode=yes -o ClearAllForwardings=yes "$host" \
+        "powershell.exe -NoProfile -NonInteractive -Command \"\$ErrorActionPreference='Stop'; New-Item -ItemType Directory -Path '$windows_stage' | Out-Null; [IO.File]::WriteAllText((Join-Path (Resolve-Path '$windows_stage') '.owner'), 'machine-fabric-bootstrap-stage-$version')\"" >/dev/null
+      printf '%s\t%s\n' "$host" "$windows_stage" >>"$remote_release_stages"
+      scp -q "$release_cache/$windows_archive" "$host:$windows_stage/$windows_archive"
+      scp -q "$script_dir/install-from-release.ps1" "$host:$windows_stage/install-machine-fabric.ps1"
       pause_peer_connectors_to_windows "$host"
-      scp -q "$script_dir/install-from-release.ps1" "$host:install-machine-fabric.ps1"
       windows_policy_args=
       if [ -n "${MACHINE_FABRIC_NODE_ALLOW_ROOTS_DIR:-}" ]; then
         policy_file=$MACHINE_FABRIC_NODE_ALLOW_ROOTS_DIR/$host.txt
@@ -624,8 +660,9 @@ for host in "$@"; do
         fi
       fi
       ssh -o BatchMode=yes -o ClearAllForwardings=yes "$host" \
-        "powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command \"\$env:MACHINE_FABRIC_RELEASE_BASE_URL='$release_base_url'; & './install-machine-fabric.ps1' -Version '$version' -NodeId '$host' $windows_policy_args; if (-not \$?) { exit 1 }; Remove-Item './install-machine-fabric.ps1'; Remove-Item 'bootstrap-machine-fabric-allow-roots.txt' -ErrorAction SilentlyContinue; Remove-Item 'bootstrap-machine-fabric-policy-user.txt' -ErrorAction SilentlyContinue; exit 0\"" \
+        "powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command \"& '$windows_stage/install-machine-fabric.ps1' -Version '$version' -NodeId '$host' -ArchivePath '$windows_stage/$windows_archive' -ExpectedSha256 '$windows_sum' $windows_policy_args; if (-not \$?) { exit 1 }; Remove-Item 'bootstrap-machine-fabric-allow-roots.txt' -ErrorAction SilentlyContinue; Remove-Item 'bootstrap-machine-fabric-policy-user.txt' -ErrorAction SilentlyContinue; exit 0\"" \
         >/dev/null
+      remove_remote_release_stage "$host" "$windows_stage"
       resume_paused_peer_connection local "$local_id" "$host"
     else
       install_linux_release "$host" "$host" "$executor_id"
