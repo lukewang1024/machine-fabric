@@ -918,7 +918,7 @@ impl ExecutorRuntime {
                         .map_err(|error| io_error("FS_WRITE_FAILED", parent, error))?;
                 }
                 let temporary = self.atomic_temporary_path(&params, &path)?;
-                fs::write(&temporary, content)
+                write_atomic_payload(&path, &temporary, content.as_bytes())
                     .map_err(|error| io_error("FS_WRITE_FAILED", &temporary, error))?;
                 atomic_replace(&temporary, &path)
                     .map_err(|error| io_error("FS_WRITE_FAILED", &path, error))?;
@@ -947,7 +947,7 @@ impl ExecutorRuntime {
                 }
                 let patched = content.replacen(before, after, 1);
                 let temporary = self.atomic_temporary_path(&params, &path)?;
-                fs::write(&temporary, patched)
+                write_atomic_payload(&path, &temporary, patched.as_bytes())
                     .map_err(|error| io_error("FS_PATCH_FAILED", &temporary, error))?;
                 atomic_replace(&temporary, &path)
                     .map_err(|error| io_error("FS_PATCH_FAILED", &path, error))?;
@@ -3424,6 +3424,36 @@ fn validate_command(
     Ok(())
 }
 
+// Atomic replacement must not turn a private configuration into a public file.
+// Set the existing Unix access mode on the exclusively created temporary inode
+// before writing any content. New files continue to use the process umask.
+fn write_atomic_payload(
+    _destination: &Path,
+    temporary: &Path,
+    content: &[u8],
+) -> std::io::Result<()> {
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    let existing_mode = {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        let mode = match fs::metadata(_destination) {
+            Ok(metadata) => Some(metadata.permissions().mode() & 0o777),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error),
+        };
+        options.mode(mode.unwrap_or(0o666));
+        mode
+    };
+    let mut file = options.open(temporary)?;
+    #[cfg(unix)]
+    if let Some(mode) = existing_mode {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(fs::Permissions::from_mode(mode))?;
+    }
+    file.write_all(content)
+}
+
 fn digest_file(path: &Path) -> Result<String, RpcError> {
     let bytes = fs::read(path).map_err(|error| io_error("FS_READ_FAILED", path, error))?;
     Ok(sha256_bytes(&bytes))
@@ -4861,6 +4891,55 @@ mod tests {
             );
         }
         assert_eq!(runtime.dispatch("filesystem.write", json!({"path": path, "content": "denied", "expectedAbsent": true, "expectedDigest": "sha256:conflict"})).unwrap_err().code, "INVALID_PARAMS");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_and_patch_preserve_private_and_executable_access_modes() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        let runtime = ExecutorRuntime::new("local", vec![directory.path().to_path_buf()]).unwrap();
+        for mode in [0o600, 0o640, 0o750, 0o770] {
+            let path = directory.path().join(format!("mode-{mode:o}"));
+            fs::write(&path, "before").unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(mode)).unwrap();
+            for action in ["filesystem.write", "fs.write"] {
+                let reply = runtime.handle(Request::new(action, json!({
+                    "path": path, "content": "needle", "expectedDigest": digest_file(&path).unwrap()
+                })));
+                assert!(reply.ok, "{reply:?}");
+                assert_eq!(
+                    fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                    mode
+                );
+            }
+            let reply = runtime.handle(Request::new(
+                "filesystem.patch",
+                json!({
+                    "path": path, "before": "needle", "after": "changed",
+                    "expectedDigest": digest_file(&path).unwrap()
+                }),
+            ));
+            assert!(reply.ok, "{reply:?}");
+            assert_eq!(fs::read_to_string(&path).unwrap(), "changed");
+            assert_eq!(
+                fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                mode
+            );
+        }
+    }
+
+    #[test]
+    fn atomic_payload_never_overwrites_a_preexisting_temporary_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let destination = directory.path().join("destination");
+        let temporary = directory.path().join("temporary");
+        fs::write(&destination, "original").unwrap();
+        fs::write(&temporary, "unrelated").unwrap();
+        let error = write_atomic_payload(&destination, &temporary, b"replacement").unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(fs::read_to_string(destination).unwrap(), "original");
+        assert_eq!(fs::read_to_string(temporary).unwrap(), "unrelated");
     }
 
     #[test]
