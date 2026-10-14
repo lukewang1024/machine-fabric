@@ -674,6 +674,7 @@ fn load_fabric_manifest(path: &Path) -> Result<FabricManifest> {
             (FabricPlatform::Macos, FabricArchitecture::Aarch64)
                 | (FabricPlatform::Macos, FabricArchitecture::X86_64)
                 | (FabricPlatform::Windows, FabricArchitecture::Aarch64)
+                | (FabricPlatform::Linux, FabricArchitecture::Aarch64)
                 | (FabricPlatform::Linux, FabricArchitecture::X86_64)
                 | (FabricPlatform::Windows, FabricArchitecture::X86_64)
         ) {
@@ -946,7 +947,7 @@ domains: []
             ("windows", "aarch64", true),
             ("windows", "x86_64", true),
             ("linux", "x86_64", true),
-            ("linux", "aarch64", false),
+            ("linux", "aarch64", true),
         ] {
             let unique = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
