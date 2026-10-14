@@ -242,7 +242,12 @@ install_linux_release() {
   install_host=$1
   install_node_id=$2
   install_executor_id=$3
-  target=x86_64-unknown-linux-musl
+  machine=$(ssh -o BatchMode=yes -o ClearAllForwardings=yes "$install_host" uname -m)
+  case $machine in
+    x86_64|amd64) target=x86_64-unknown-linux-musl ;;
+    aarch64|arm64) target=aarch64-unknown-linux-musl ;;
+    *) printf 'bootstrap-fabric: unsupported Linux architecture: %s\n' "$machine" >&2; return 1 ;;
+  esac
   archive=machine-fabric-$version-$target.tar.gz
   base=${release_base_url%/}/releases/v$version
   if [ ! -f "$release_cache/$archive" ]; then
