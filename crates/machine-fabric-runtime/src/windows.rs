@@ -555,7 +555,7 @@ fn spawn_in_active_session_with_env(
     let mut command_line = std::iter::once(executable.to_string_lossy().into_owned())
         .chain(args.iter().cloned())
         .map(|value| native_process_argument(&value))
-        .map(|value| format!("\"{}\"", value.replace('"', "\\\"")))
+        .map(|value| crate::process::windows_command_line_argument(&value))
         .collect::<Vec<_>>()
         .join(" ")
         .encode_utf16()
