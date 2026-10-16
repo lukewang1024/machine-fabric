@@ -688,6 +688,35 @@ mod tests {
     }
 }
 
+// Preserve bare switches for applications such as Office whose legacy parser
+// ignores a quoted "/safe". Quote only when needed, using Windows argv escaping
+// so embedded quotes and trailing backslashes do not consume the next argument.
+#[cfg(any(windows, test))]
+pub(crate) fn windows_command_line_argument(value: &str) -> String {
+    if !value.is_empty() && !value.chars().any(|c| c == '"' || c.is_ascii_whitespace()) {
+        return value.to_owned();
+    }
+    let mut result = String::from("\"");
+    let mut backslashes = 0;
+    for ch in value.chars() {
+        if ch == '\\' {
+            backslashes += 1;
+            continue;
+        }
+        let count = if ch == '"' {
+            backslashes * 2 + 1
+        } else {
+            backslashes
+        };
+        result.extend(std::iter::repeat_n('\\', count));
+        result.push(ch);
+        backslashes = 0;
+    }
+    result.extend(std::iter::repeat_n('\\', backslashes * 2));
+    result.push('"');
+    result
+}
+
 #[cfg(any(windows, test))]
 pub(crate) fn merge_windows_environment(
     inherited: &[u16],
@@ -749,5 +778,72 @@ mod application_environment_tests {
         assert!(text.contains("=C:=drive\0"));
         assert!(text.ends_with("\0\0"));
         assert_eq!(merge_windows_environment(&[], &BTreeMap::new()), vec![0, 0]);
+    }
+}
+
+#[cfg(test)]
+mod windows_command_line_tests {
+    use super::windows_command_line_argument;
+
+    #[test]
+    fn office_switches_remain_bare_and_paths_remain_separate_arguments() {
+        for flag in ["/safe", "/n", "--remote-debugging-port=9222"] {
+            assert_eq!(windows_command_line_argument(flag), flag);
+        }
+        assert_eq!(windows_command_line_argument(""), "\"\"");
+        assert_eq!(
+            windows_command_line_argument("中文 文件.pptx"),
+            "\"中文 文件.pptx\""
+        );
+        assert_eq!(
+            windows_command_line_argument("C:\\a path\\"),
+            "\"C:\\a path\\\\\""
+        );
+        assert_eq!(windows_command_line_argument("a\\\"b"), "\"a\\\\\\\"b\"");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn native_windows_parser_roundtrips_quotes_unicode_and_trailing_slashes() {
+        use windows_sys::Win32::{Foundation::LocalFree, UI::Shell::CommandLineToArgvW};
+        let arguments = [
+            "",
+            "/safe",
+            "/n",
+            "plain",
+            "C:\\a path\\",
+            "中文 文件.pptx",
+            "literal\"quote",
+            "a\\\"b",
+            "tab\tvalue",
+            "\\\\server\\share\\file.docx",
+        ];
+        let command = std::iter::once("probe.exe".to_owned())
+            .chain(
+                arguments
+                    .iter()
+                    .map(|arg| windows_command_line_argument(arg)),
+            )
+            .collect::<Vec<_>>()
+            .join(" ");
+        let encoded: Vec<u16> = command.encode_utf16().chain([0]).collect();
+        unsafe {
+            let mut count = 0;
+            let argv = CommandLineToArgvW(encoded.as_ptr(), &mut count);
+            assert!(!argv.is_null());
+            let decoded: Vec<String> = std::slice::from_raw_parts(argv, count as usize)
+                .iter()
+                .map(|arg| {
+                    let mut length = 0;
+                    while *arg.add(length) != 0 {
+                        length += 1;
+                    }
+                    String::from_utf16(std::slice::from_raw_parts(*arg, length)).unwrap()
+                })
+                .collect();
+            LocalFree(argv.cast());
+            assert_eq!(decoded[0], "probe.exe");
+            assert_eq!(decoded[1..], arguments);
+        }
     }
 }
