@@ -1,5 +1,6 @@
-//! Node-local queue wakeup. A notification never grants permission: promotion
-//! always rereads the short-lived provider snapshot under the desktop mutex.
+//! Worker-owned admission. Wakeups are hints: every reconciliation rereads the
+//! short-lived local snapshot. Darwin file-descriptor delivery works without a
+//! main-thread Cocoa runloop; periodic checks cover lost events/provider death.
 use crate::desktop::DesktopQueue;
 use machine_fabric_protocol::RpcError;
 use std::sync::{Mutex, Weak};
@@ -10,11 +11,10 @@ fn reconcile(queue: &Queue, notification: bool) -> bool {
     let Some(queue) = queue.upgrade() else {
         return false;
     };
-    if let Ok(mut queue) = queue.lock() {
-        // A failed persistence operation must not authorize desktop input.
-        if queue.worker_reconcile(notification).is_err() {
-            return true;
-        }
+    if let Ok(mut queue) = queue.lock()
+        && queue.worker_reconcile(notification).is_err()
+    {
+        return true;
     }
     true
 }
@@ -23,13 +23,24 @@ pub(crate) fn start(queue: Queue) -> Result<(), RpcError> {
         .name("desktop-queue".into())
         .spawn(move || {
             #[cfg(target_os = "macos")]
-            let _notifications = macos::Notifications::new(queue.clone());
-            while reconcile(&queue, false) {
-                // Reconcile even when notifications were lost or the provider died.
+            let mut notifications =
+                macos::Notifications::new(c"dev.machine-fabric.desktop-availability-changed");
+            let mut notified = false;
+            while reconcile(&queue, notified) {
                 #[cfg(target_os = "macos")]
-                macos::wait(Duration::from_millis(500));
+                {
+                    notified = if let Some(source) = &mut notifications {
+                        source.wait(Duration::from_millis(500))
+                    } else {
+                        std::thread::sleep(Duration::from_millis(500));
+                        false
+                    };
+                }
                 #[cfg(not(target_os = "macos"))]
-                std::thread::sleep(Duration::from_millis(500));
+                {
+                    std::thread::sleep(Duration::from_millis(500));
+                    notified = false;
+                }
             }
         })
         .map_err(|e| RpcError::new("DESKTOP_WORKER_FAILED", e.to_string()))?;
@@ -39,89 +50,88 @@ pub(crate) fn start(queue: Queue) -> Result<(), RpcError> {
 #[cfg(target_os = "macos")]
 mod macos {
     use super::*;
-    use std::ffi::c_void;
-    type Ref = *const c_void;
-    type Callback = unsafe extern "C" fn(Ref, *mut c_void, Ref, Ref, Ref);
-    #[link(name = "CoreFoundation", kind = "framework")]
+    use std::ffi::{CStr, c_char};
     unsafe extern "C" {
-        fn CFNotificationCenterGetDistributedCenter() -> Ref;
-        fn CFNotificationCenterAddObserver(
-            center: Ref,
-            observer: *const c_void,
-            callback: Callback,
-            name: Ref,
-            object: Ref,
-            behavior: isize,
-        );
-        fn CFNotificationCenterRemoveObserver(
-            center: Ref,
-            observer: *const c_void,
-            name: Ref,
-            object: Ref,
-        );
-        fn CFStringCreateWithCString(
-            allocator: Ref,
-            string: *const std::ffi::c_char,
-            encoding: u32,
-        ) -> Ref;
-        fn CFRelease(object: Ref);
-        fn CFRunLoopRunInMode(mode: Ref, seconds: f64, return_after_source: bool) -> i32;
-        static kCFRunLoopDefaultMode: Ref;
-    }
-    unsafe extern "C" fn changed(_: Ref, observer: *mut c_void, _: Ref, _: Ref, _: Ref) {
-        // The Box is stable until the observer is removed on this runloop thread.
-        let queue = unsafe { &*observer.cast::<Queue>() };
-        reconcile(queue, true);
+        fn notify_register_file_descriptor(
+            name: *const c_char,
+            fd: *mut i32,
+            flags: i32,
+            token: *mut i32,
+        ) -> u32;
+        fn notify_cancel(token: i32) -> u32;
+        #[cfg(test)]
+        fn notify_post(name: *const c_char) -> u32;
     }
     pub(super) struct Notifications {
-        queue: Box<Queue>,
-        name: Ref,
-        center: Ref,
+        fd: i32,
+        token: i32,
     }
     impl Notifications {
-        pub(super) fn new(queue: Queue) -> Self {
-            let queue = Box::new(queue);
-            unsafe {
-                let center = CFNotificationCenterGetDistributedCenter();
-                let name = CFStringCreateWithCString(
-                    std::ptr::null(),
-                    c"dev.machine-fabric.desktop-availability-changed".as_ptr(),
-                    0x08000100,
-                );
-                CFNotificationCenterAddObserver(
-                    center,
-                    (&*queue as *const Queue).cast(),
-                    changed,
-                    name,
-                    std::ptr::null(),
-                    4,
-                );
-                Self {
-                    queue,
-                    name,
-                    center,
-                }
+        pub(super) fn new(name: &CStr) -> Option<Self> {
+            let (mut fd, mut token) = (-1, -1);
+            let status =
+                unsafe { notify_register_file_descriptor(name.as_ptr(), &mut fd, 0, &mut token) };
+            if status == 0 && fd >= 0 {
+                Some(Self { fd, token })
+            } else {
+                None
             }
+        }
+        pub(super) fn wait(&mut self, duration: Duration) -> bool {
+            let mut descriptor = libc::pollfd {
+                fd: self.fd,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let ready = unsafe {
+                libc::poll(
+                    &mut descriptor,
+                    1,
+                    duration.as_millis().min(i32::MAX as u128) as i32,
+                )
+            };
+            if ready <= 0 {
+                return false;
+            }
+            if descriptor.revents & libc::POLLIN == 0 {
+                std::thread::sleep(duration);
+                return false;
+            }
+            let mut bytes = [0u8; 4];
+            let size = unsafe { libc::read(self.fd, bytes.as_mut_ptr().cast(), bytes.len()) };
+            size == 4 && u32::from_be_bytes(bytes) == self.token as u32
         }
     }
     impl Drop for Notifications {
         fn drop(&mut self) {
+            // notify_cancel closes this non-reused descriptor; no double close.
             unsafe {
-                CFNotificationCenterRemoveObserver(
-                    self.center,
-                    (&*self.queue as *const Queue).cast(),
-                    self.name,
-                    std::ptr::null(),
-                );
-                CFRelease(self.name);
+                notify_cancel(self.token);
             }
         }
     }
-    pub(super) fn wait(duration: Duration) {
-        unsafe {
-            if CFRunLoopRunInMode(kCFRunLoopDefaultMode, duration.as_secs_f64(), true) == 1 {
-                std::thread::sleep(duration);
-            }
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        #[test]
+        fn event_arrives_on_background_thread_without_main_runloop() {
+            let name =
+                std::ffi::CString::new(format!("dev.machine-fabric.test.{}", uuid::Uuid::new_v4()))
+                    .unwrap();
+            let (tx, rx) = std::sync::mpsc::channel();
+            let other = name.clone();
+            let worker = std::thread::spawn(move || {
+                let mut source =
+                    Notifications::new(&other).expect("Darwin descriptor registration");
+                tx.send(()).unwrap();
+                source.wait(Duration::from_secs(3))
+            });
+            rx.recv_timeout(Duration::from_secs(3)).unwrap();
+            assert_eq!(unsafe { notify_post(name.as_ptr()) }, 0);
+            assert!(
+                worker.join().unwrap(),
+                "actual native notification was not delivered"
+            );
         }
     }
 }

@@ -49,7 +49,7 @@ snapshots deny admission. Minimal version 1 snapshot:
 
 Both observation age and remaining validity must be at most 1500 milliseconds.
 The worker reconciles queued requests every 500 ms. On macOS it also listens for
-`dev.machine-fabric.desktop-availability-changed` distributed notifications;
+`dev.machine-fabric.desktop-availability-changed` Darwin notifications (the Away Guard adapter also broadcasts distributed notifications for UI consumers);
 notifications only wake reconciliation. A spoofed, duplicate or delayed event
 cannot grant permission without a fresh local snapshot. Periodic reconciliation
 covers missed notifications, reconnects and provider death without model calls.
