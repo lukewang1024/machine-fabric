@@ -3,7 +3,7 @@
 The destination Executor owns the durable FIFO. Controllers submit requests and
 wait for a worker grant; they cannot publish availability through RPC or choose
 a different provider path. All times of day are eligible when the local provider
-permits unattended use. No provider is required for ordinary interactive sessions.
+permits unattended use. No provider is required on unconfigured nodes. Once a local provider snapshot is installed, the worker durably enforces availability for all desktop sessions, including legacy callers; caller flags cannot opt out. A missing provider after configuration remains unavailable across Executor restarts.
 
 Submit an unattended session with `computer-use open --requires-availability`,
 optionally setting `--deadline-at` to an epoch-millisecond queue deadline. Keep
