@@ -76,6 +76,9 @@ through the normal SSH configuration.
 
 ## Desktop Executor paths
 
+For worker-owned unattended requests, Away Guard availability broadcasts, and
+model-free queued consumers, see [desktop availability](docs/desktop-availability.md).
+
 `machine-fabric computer-use queue --executor <id>` lists current sessions and
 history counts without returning completed sessions. Add `--history` when
 investigating past sessions. Active, queued, draining, and unknown states remain

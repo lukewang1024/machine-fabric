@@ -12,7 +12,7 @@ use std::fs;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::{Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::datapack::{DataPackResourceTree, pack_chromium_datapack};
@@ -31,7 +31,7 @@ pub struct ExecutorRuntime {
     relay_root: PathBuf,
     clipboard: crate::clipboard::ClipboardService,
     computer_use: crate::computer_use::ComputerUseService,
-    desktop: Mutex<crate::desktop::DesktopQueue>,
+    desktop: Arc<Mutex<crate::desktop::DesktopQueue>>,
     desktop_execution: Mutex<()>,
     tunnel_mutation: Mutex<()>,
 }
@@ -291,7 +291,7 @@ impl ExecutorRuntime {
             relay_root,
             clipboard: crate::clipboard::ClipboardService::default(),
             computer_use: crate::computer_use::ComputerUseService::default(),
-            desktop: Mutex::new(crate::desktop::DesktopQueue::default()),
+            desktop: Arc::new(Mutex::new(crate::desktop::DesktopQueue::default())),
             desktop_execution: Mutex::new(()),
             tunnel_mutation: Mutex::new(()),
         })
@@ -368,9 +368,10 @@ impl ExecutorRuntime {
         runtime.relay_root = state_path.with_file_name("artifact-relay");
         fences.path = state_path;
         runtime.processes = ProcessTable::open(process_state_path)?;
-        runtime.desktop = Mutex::new(crate::desktop::DesktopQueue::open(
+        runtime.desktop = Arc::new(Mutex::new(crate::desktop::DesktopQueue::open(
             runtime.relay_root.with_file_name("desktop-queue.json"),
-        )?);
+        )?));
+        crate::desktop_worker::start(Arc::downgrade(&runtime.desktop))?;
         runtime.fences = Some(Mutex::new(fences));
         Ok(runtime)
     }

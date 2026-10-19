@@ -26,6 +26,10 @@ pub(crate) struct DesktopQueue {
     // blocked. It is deliberately not persisted; the durable blocked state is.
     #[serde(skip)]
     recovery_inspection_active: bool,
+    #[serde(skip)]
+    notification_wakes: u64,
+    #[serde(skip)]
+    polling_wakes: u64,
 }
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -39,6 +43,12 @@ struct Job {
     ttl_ms: u64,
     submitted_at: u64,
     expires_at: u64,
+    #[serde(default)]
+    requires_availability: bool,
+    #[serde(default)]
+    deadline_at: Option<u64>,
+    #[serde(default)]
+    claimed_by: Option<String>,
 }
 fn error(code: &str, message: impl ToString) -> RpcError {
     RpcError::new(code, message.to_string())
@@ -197,7 +207,9 @@ impl DesktopQueue {
             return false;
         }
         if let Some(i) = self.active() {
-            if self.jobs[i].expires_at <= now_ms() {
+            if self.jobs[i].expires_at <= now_ms()
+                || self.jobs[i].deadline_at.is_some_and(|at| at <= now_ms())
+            {
                 self.jobs[i].state = "draining".into();
             }
             return self.jobs[i].state == "draining";
@@ -224,20 +236,87 @@ impl DesktopQueue {
         self.save()?;
         self.promote()
     }
+    pub(crate) fn worker_reconcile(&mut self, notification: bool) -> Result<(), RpcError> {
+        if notification {
+            self.notification_wakes = self.notification_wakes.saturating_add(1);
+        } else {
+            self.polling_wakes = self.polling_wakes.saturating_add(1);
+        }
+        self.promote()
+    }
+    // The provider is local to this Executor. RPC callers can request the gate,
+    // but cannot provide a snapshot or select a different file.
+    fn availability(&self) -> Value {
+        let snapshot = self
+            .path
+            .as_ref()
+            .and_then(|p| fs::read(p.with_file_name("desktop-availability.json")).ok())
+            .filter(|bytes| bytes.len() <= 4096)
+            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok());
+        let now = now_ms();
+        let available = snapshot.as_ref().is_some_and(|v| {
+            v["schemaVersion"] == 1
+                && v["available"] == true
+                && v["observedAtMs"]
+                    .as_u64()
+                    .is_some_and(|at| at <= now && now - at <= 1500)
+                && v["expiresAtMs"]
+                    .as_u64()
+                    .is_some_and(|at| at > now && at - now <= 1500)
+        });
+        json!({"available":available,"snapshot":snapshot})
+    }
     pub(crate) fn promote(&mut self) -> Result<(), RpcError> {
+        if self.recovery_inspection_active {
+            return Ok(());
+        }
+        let now = now_ms();
+        let mut expired = false;
+        for job in &mut self.jobs {
+            if job.state == "queued" && job.deadline_at.is_some_and(|at| at <= now) {
+                job.state = "expired".into();
+                expired = true;
+            }
+        }
+        if expired {
+            self.save()?;
+        }
+        let available = self.availability()["available"] == true;
         if self.maintenance_owner.is_none()
             && !self.blocked
             && !self.in_flight
             && self.active().is_none()
             && let Some(job) = self.jobs.iter_mut().find(|j| j.state == "queued")
+            && (!job.requires_availability || available)
         {
+            let old_job = job.clone();
             self.epoch += 1;
             job.epoch = self.epoch;
             job.state = "active".into();
             job.expires_at = now_ms().saturating_add(job.ttl_ms);
-            self.save()?;
+            let id = job.id.clone();
+            if let Err(error) = self.save() {
+                self.epoch -= 1;
+                if let Some(job) = self.jobs.iter_mut().find(|j| j.id == id) {
+                    *job = old_job;
+                }
+                return Err(error);
+            }
         }
         Ok(())
+    }
+    fn job_value(&self, job: &Job) -> Value {
+        let mut value = serde_json::to_value(job).unwrap();
+        if job.requires_availability {
+            value["inputAllowed"] = json!(
+                job.state == "active"
+                    && !self.blocked
+                    && job.expires_at > now_ms()
+                    && job.deadline_at.is_none_or(|at| at > now_ms())
+                    && self.availability()["available"] == true
+            );
+        }
+        value
     }
     pub(crate) fn command(&mut self, action: &str, params: &Value) -> Result<Value, RpcError> {
         if self.recovery_inspection_active && !matches!(action, "desktop.list" | "desktop.get") {
@@ -246,6 +325,8 @@ impl DesktopQueue {
                 "queue mutation is unavailable during recovery inspection",
             ));
         }
+        // Status reads also advance an eligible queue; no client-side grant.
+        self.promote()?;
         match action {
             "desktop.maintenance" => {
                 let owner = field(params, "owner")?;
@@ -277,7 +358,7 @@ impl DesktopQueue {
                     .iter()
                     .find(|j| j.owner == owner && j.request_key == key)
                 {
-                    return Ok(serde_json::to_value(job).unwrap());
+                    return Ok(self.job_value(job));
                 }
                 if self.jobs.len() >= 10000 {
                     return Err(error(
@@ -289,6 +370,27 @@ impl DesktopQueue {
                 if !(1000..=3600000).contains(&ttl) {
                     return Err(error("INVALID_PARAMS", "ttlMs must be 1000..3600000"));
                 }
+                let requires_availability = match params.get("requiresAvailability") {
+                    None => false,
+                    Some(Value::Bool(value)) => *value,
+                    _ => {
+                        return Err(error(
+                            "INVALID_PARAMS",
+                            "requiresAvailability must be boolean",
+                        ));
+                    }
+                };
+                let deadline_at = match params.get("deadlineAt") {
+                    None => None,
+                    Some(value) => {
+                        Some(value.as_u64().filter(|at| *at > now_ms()).ok_or_else(|| {
+                            error(
+                                "INVALID_PARAMS",
+                                "deadlineAt must be a future epoch millisecond",
+                            )
+                        })?)
+                    }
+                };
                 self.jobs.push(Job {
                     id: uuid::Uuid::new_v4().to_string(),
                     owner: owner.into(),
@@ -299,10 +401,13 @@ impl DesktopQueue {
                     ttl_ms: ttl,
                     submitted_at: now_ms(),
                     expires_at: 0,
+                    requires_availability,
+                    deadline_at,
+                    claimed_by: None,
                 });
                 self.save()?;
                 self.promote()?;
-                Ok(serde_json::to_value(self.jobs.last().unwrap()).unwrap())
+                Ok(self.job_value(self.jobs.last().unwrap()))
             }
             "desktop.list" => {
                 let include_terminal = match params.get("includeTerminal") {
@@ -332,8 +437,55 @@ impl DesktopQueue {
                     })
                     .collect();
                 Ok(
-                    json!({"jobs":jobs,"historyCount":history_count,"totalCount":self.jobs.len(),"historyIncluded":include_terminal,"blocked":self.blocked,"inFlight":self.in_flight,"lastRecovery":self.last_recovery,"recoveryPolicy":"verified-os-restart-or-explicit-desktop-reset","maintenanceOwner":self.maintenance_owner,"safePoint":self.maintenance_owner.is_some() && !self.blocked && !self.in_flight && self.active().is_none()}),
+                    json!({"jobs":jobs,"historyCount":history_count,"totalCount":self.jobs.len(),"historyIncluded":include_terminal,"worker":{"notificationWakes":self.notification_wakes,"pollingWakes":self.polling_wakes},"availability":self.availability(),"blocked":self.blocked,"inFlight":self.in_flight,"lastRecovery":self.last_recovery,"recoveryPolicy":"verified-os-restart-or-explicit-desktop-reset","maintenanceOwner":self.maintenance_owner,"safePoint":self.maintenance_owner.is_some() && !self.blocked && !self.in_flight && self.active().is_none()}),
                 )
+            }
+            "desktop.claim" => {
+                let owner = field(params, "owner")?;
+                let token = field(params, "token")?;
+                let consumer = field(params, "consumerId")?;
+                let available = self.availability()["available"] == true;
+                let i = self
+                    .jobs
+                    .iter()
+                    .position(|j| j.owner == owner && j.token == token)
+                    .ok_or_else(|| {
+                        error("DESKTOP_SESSION_INVALID", "unknown session credentials")
+                    })?;
+                let job = &mut self.jobs[i];
+                if self.blocked
+                    || job.state != "active"
+                    || job.expires_at <= now_ms()
+                    || job.deadline_at.is_some_and(|at| at <= now_ms())
+                {
+                    return Err(error(
+                        "DESKTOP_SESSION_INACTIVE",
+                        "consumer requires a live active session",
+                    ));
+                }
+                if job.requires_availability && !available {
+                    return Err(error(
+                        "DESKTOP_UNAVAILABLE",
+                        "local availability permission is absent or expired",
+                    ));
+                }
+                if job
+                    .claimed_by
+                    .as_deref()
+                    .is_some_and(|claimed| claimed != consumer)
+                {
+                    return Err(error(
+                        "DESKTOP_ALREADY_CLAIMED",
+                        "another consumer has claimed this request; no replay",
+                    ));
+                }
+                let old = job.claimed_by.clone();
+                job.claimed_by = Some(consumer.into());
+                if let Err(error) = self.save() {
+                    self.jobs[i].claimed_by = old;
+                    return Err(error);
+                }
+                Ok(json!({"claimed":true,"id":self.jobs[i].id}))
             }
             "desktop.get" | "desktop.renew" | "desktop.finish" | "desktop.cancel" => {
                 let token = field(params, "token")?;
@@ -348,7 +500,11 @@ impl DesktopQueue {
                 let job = &mut self.jobs[i];
                 match action {
                     "desktop.renew" => {
-                        if job.state != "active" || job.expires_at <= now_ms() || self.blocked {
+                        if job.state != "active"
+                            || job.expires_at <= now_ms()
+                            || job.deadline_at.is_some_and(|at| at <= now_ms())
+                            || self.blocked
+                        {
                             return Err(error(
                                 "DESKTOP_SESSION_INACTIVE",
                                 "only a live active session can renew",
@@ -365,7 +521,7 @@ impl DesktopQueue {
                     }
                     _ => {}
                 }
-                let value = serde_json::to_value(&self.jobs[i]).unwrap();
+                let value = self.job_value(&self.jobs[i]);
                 if action != "desktop.get" {
                     self.save()?;
                 }
@@ -429,7 +585,10 @@ impl DesktopQueue {
         }
         if let Some(i) = self.active() {
             let job = &self.jobs[i];
-            if job.state != "active" || job.expires_at <= now_ms() {
+            if job.state != "active"
+                || job.expires_at <= now_ms()
+                || job.deadline_at.is_some_and(|at| at <= now_ms())
+            {
                 return Err(error("DESKTOP_DRAINING", "previous session is draining"));
             }
             if params["_desktop"]["token"] != job.token || params["_desktop"]["owner"] != job.owner
@@ -437,6 +596,12 @@ impl DesktopQueue {
                 return Err(error(
                     "DESKTOP_BUSY",
                     "desktop belongs to another acceptance session",
+                ));
+            }
+            if job.requires_availability && self.availability()["available"] != true {
+                return Err(error(
+                    "DESKTOP_UNAVAILABLE",
+                    "local availability permission is absent or expired; no desktop action dispatched",
                 ));
             }
             if action == "computer-use.call" {
@@ -477,6 +642,123 @@ mod tests {
         json!({"owner":job["owner"],"token":job["token"]})
     }
     #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn publish_availability(dir: &std::path::Path, available: bool) {
+        let now = now_ms();
+        fs::write(
+            dir.join("desktop-availability.json"),
+            serde_json::to_vec(&json!({
+                "schemaVersion":1,"available":available,"observedAtMs":now,"expiresAtMs":now+1400
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    }
+    #[test]
+    fn one_request_cannot_be_consumed_by_two_waiters() {
+        let mut q = DesktopQueue::default();
+        let a = submit(&mut q, "a");
+        let mut claim = credentials(&a);
+        claim["consumerId"] = json!("first");
+        q.command("desktop.claim", &claim).unwrap();
+        q.command("desktop.claim", &claim).unwrap(); // Lost ack is safe.
+        claim["consumerId"] = json!("second");
+        assert_eq!(
+            q.command("desktop.claim", &claim).unwrap_err().code,
+            "DESKTOP_ALREADY_CLAIMED"
+        );
+    }
+    #[test]
+    fn failed_grant_persistence_rolls_back_the_in_memory_permission() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut q = DesktopQueue {
+            maintenance_owner: Some("operator".into()),
+            ..DesktopQueue::default()
+        };
+        let a = submit(&mut q, "a");
+        q.maintenance_owner = None;
+        let path = dir.path().join("not-a-file");
+        fs::create_dir(&path).unwrap();
+        q.path = Some(path);
+        assert!(q.promote().is_err());
+        assert_eq!(q.jobs[0].state, "queued");
+        assert_eq!(q.epoch, 0);
+        assert!(
+            q.begin(
+                "computer-use.call",
+                &mut json!({"_desktop":credentials(&a)})
+            )
+            .is_err()
+        );
+    }
+    #[test]
+    fn unattended_queue_is_fifo_and_revokes_before_dispatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut q = DesktopQueue::open(dir.path().join("queue.json")).unwrap();
+        let a = q
+            .command(
+                "desktop.submit",
+                &json!({"owner":"a","requestKey":"a","requiresAvailability":true}),
+            )
+            .unwrap();
+        let b = submit(&mut q, "b");
+        assert_eq!(a["state"], "queued");
+        assert_eq!(b["state"], "queued"); // No bypass of a waiting head.
+        let duplicate = q
+            .command(
+                "desktop.submit",
+                &json!({"owner":"a","requestKey":"a","requiresAvailability":true}),
+            )
+            .unwrap();
+        assert_eq!(duplicate["id"], a["id"]);
+        publish_availability(dir.path(), true);
+        assert_eq!(
+            q.command("desktop.get", &credentials(&a)).unwrap()["state"],
+            "active"
+        );
+        publish_availability(dir.path(), false);
+        let mut input = json!({"_desktop":credentials(&a)});
+        assert_eq!(
+            q.begin("computer-use.call", &mut input).unwrap_err().code,
+            "DESKTOP_UNAVAILABLE"
+        );
+        assert!(!q.in_flight);
+        assert_eq!(q.jobs[1].state, "queued");
+        q.command("desktop.finish", &credentials(&a)).unwrap();
+        q.cleanup_done(true).unwrap();
+        assert_eq!(q.jobs[1].state, "active");
+    }
+    #[test]
+    fn unattended_snapshots_fail_closed_and_queue_survives_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("queue.json");
+        let mut q = DesktopQueue::open(path.clone()).unwrap();
+        let a = q
+            .command(
+                "desktop.submit",
+                &json!({"owner":"a","requestKey":"a","requiresAvailability":true}),
+            )
+            .unwrap();
+        drop(q);
+        let mut q = DesktopQueue::open(path).unwrap();
+        for snapshot in [
+            json!({}),
+            json!({"schemaVersion":1,"available":true,"observedAtMs":0,"expiresAtMs":now_ms()+1000}),
+            json!({"schemaVersion":1,"available":true,"observedAtMs":now_ms()+10000,"expiresAtMs":now_ms()+11000}),
+        ] {
+            fs::write(
+                dir.path().join("desktop-availability.json"),
+                snapshot.to_string(),
+            )
+            .unwrap();
+            assert_eq!(
+                q.command("desktop.get", &credentials(&a)).unwrap()["state"],
+                "queued"
+            );
+        }
+        q.jobs[0].deadline_at = Some(now_ms() - 1);
+        q.promote().unwrap();
+        assert_eq!(q.jobs[0].state, "expired");
+    }
     #[test]
     fn kernel_boot_identity_is_a_stable_uuid() {
         let first = current_boot_id().expect("kernel boot identity must be readable");
@@ -948,6 +1230,9 @@ mod tests {
                 ttl_ms: 1000,
                 submitted_at: 10,
                 expires_at: 0,
+                requires_availability: false,
+                deadline_at: None,
+                claimed_by: None,
             }],
             blocked: true,
             ..DesktopQueue::default()
