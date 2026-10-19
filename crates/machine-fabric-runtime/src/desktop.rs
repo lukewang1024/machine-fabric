@@ -641,7 +641,6 @@ mod tests {
     fn credentials(job: &Value) -> Value {
         json!({"owner":job["owner"],"token":job["token"]})
     }
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn publish_availability(dir: &std::path::Path, available: bool) {
         let now = now_ms();
         fs::write(
@@ -759,6 +758,7 @@ mod tests {
         q.promote().unwrap();
         assert_eq!(q.jobs[0].state, "expired");
     }
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn kernel_boot_identity_is_a_stable_uuid() {
         let first = current_boot_id().expect("kernel boot identity must be readable");
