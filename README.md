@@ -161,8 +161,11 @@ Existing unrelated processes keep their original executable and lifetime.
 Integrations that previously invoked the legacy executable directly should
 resolve the installed path before starting a new process.
 
-Writes through a registration must still resolve to the exact registered
-target plus the logical suffix. A changed mapping or an additional redirect
+Writes may use either the registered logical root or its canonical physical
+root, including paths derived internally for artifact relay and temporary files.
+Both forms must still resolve to the exact registered target plus the suffix,
+and the original logical mapping must still resolve to that target.
+A changed mapping or an additional redirect
 inside it is rejected; credential deny rules apply to logical and resolved
 paths. Unregistered paths retain the existing physical write-root checks.
 Desktop path normalization collapses parent components without crossing a
