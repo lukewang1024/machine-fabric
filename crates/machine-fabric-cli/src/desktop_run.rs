@@ -126,14 +126,29 @@ impl Run<'_> {
             };
             match status["state"].as_str() {
                 Some("queued") => thread::sleep(Duration::from_secs(1)),
-                Some("active") if status["inputAllowed"] == true => break,
+                Some("active") if status["inputAllowed"] == true => {
+                    if status["claimedBy"]
+                        .as_str()
+                        .is_some_and(|id| Some(id) != record["consumerId"].as_str())
+                    {
+                        bail!(
+                            "another consumer has claimed this request; automatic replay refused"
+                        );
+                    }
+                    let mut claim = credentials.clone();
+                    claim["consumerId"] = record["consumerId"].clone();
+                    // A lost claim response or revocation between get/claim is
+                    // safe to retry with this SAME durable consumer ID. No child
+                    // has started and the worker claim is idempotent.
+                    if rpc(self.socket, "desktop.claim", claim).is_ok() {
+                        break;
+                    }
+                    thread::sleep(Duration::from_secs(1));
+                }
                 Some("active") => thread::sleep(Duration::from_secs(1)),
                 _ => bail!("desktop request is no longer runnable: {}", status["state"]),
             }
         }
-        let mut claim = credentials.clone();
-        claim["consumerId"] = record["consumerId"].clone();
-        rpc(self.socket, "desktop.claim", claim)?;
         // Persist before starting; a crash in this interval is unknown, never a
         // reason to run a consumer twice (even if the child PID was not saved).
         record["state"] = json!("starting");
