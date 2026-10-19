@@ -187,19 +187,28 @@ impl DesktopPathPolicy {
         self.check(&logical, PathAccess::Read)?;
         if access == PathAccess::Write {
             for (root, target) in &self.managed_mappings {
-                if within(&logical, root) {
-                    let mut expected = target.clone();
-                    for component in logical.components().skip(root.components().count()) {
-                        expected.push(component.as_os_str());
-                    }
-                    if !same_path(&resolve_path(root)?, target) || !same_path(resolved, &expected) {
-                        return Err(RpcError::new(
-                            "PATH_WRITE_DENIED",
-                            "managed mapping changed or contains an unregistered redirect",
-                        ));
-                    }
-                    return Ok(());
+                // Internal operations may derive another checked path from an
+                // already-resolved mapped destination (for example relay chunks).
+                // Both aliases name the same administrator-authorized subtree.
+                let physical_root = logical_path(target)?;
+                let matched_root = if within(&logical, root) {
+                    root
+                } else if within(&logical, &physical_root) {
+                    &physical_root
+                } else {
+                    continue;
+                };
+                let mut expected = target.clone();
+                for component in logical.components().skip(matched_root.components().count()) {
+                    expected.push(component.as_os_str());
                 }
+                if !same_path(&resolve_path(root)?, target) || !same_path(resolved, &expected) {
+                    return Err(RpcError::new(
+                        "PATH_WRITE_DENIED",
+                        "managed mapping changed or contains an unregistered redirect",
+                    ));
+                }
+                return Ok(());
             }
         }
         self.check(resolved, access)
@@ -476,6 +485,30 @@ mod tests {
                 )
                 .is_ok()
         );
+        // The canonical physical alias retains the mapping's authority too.
+        let physical = target.canonicalize().unwrap();
+        for alias in [&target, &physical] {
+            assert!(
+                policy
+                    .check_resolved(
+                        &alias.join("new/payload.tar.gz"),
+                        &resolve_path(&alias.join("new/payload.tar.gz")).unwrap(),
+                        PathAccess::Write,
+                    )
+                    .is_ok()
+            );
+        }
+        assert_eq!(
+            policy
+                .check_resolved(
+                    &outside.join("payload.tar.gz"),
+                    &resolve_path(&outside.join("payload.tar.gz")).unwrap(),
+                    PathAccess::Write,
+                )
+                .unwrap_err()
+                .code,
+            "PATH_WRITE_DENIED"
+        );
         redirect(&outside, &target.join("escape"));
         assert!(
             policy
@@ -486,6 +519,30 @@ mod tests {
                 )
                 .is_err()
         );
+        assert_eq!(
+            policy
+                .check_resolved(
+                    &physical.join("escape/new"),
+                    &resolve_path(&physical.join("escape/new")).unwrap(),
+                    PathAccess::Write,
+                )
+                .unwrap_err()
+                .code,
+            "PATH_WRITE_DENIED"
+        );
+        // Nested redirects stay forbidden even if their target is writable.
+        redirect(&home.join("Documents"), &target.join("writable-escape"));
+        assert_eq!(
+            policy
+                .check_resolved(
+                    &physical.join("writable-escape/new"),
+                    &resolve_path(&physical.join("writable-escape/new")).unwrap(),
+                    PathAccess::Write,
+                )
+                .unwrap_err()
+                .code,
+            "PATH_WRITE_DENIED"
+        );
         redirect(&home.join(".ssh"), &target.join("credentials"));
         assert_eq!(
             policy
@@ -493,6 +550,17 @@ mod tests {
                     &logical.join("credentials/key"),
                     &resolve_path(&logical.join("credentials/key")).unwrap(),
                     PathAccess::Write
+                )
+                .unwrap_err()
+                .code,
+            "PATH_READ_DENIED"
+        );
+        assert_eq!(
+            policy
+                .check_resolved(
+                    &physical.join("credentials/key"),
+                    &resolve_path(&physical.join("credentials/key")).unwrap(),
+                    PathAccess::Write,
                 )
                 .unwrap_err()
                 .code,
@@ -511,6 +579,17 @@ mod tests {
                     PathAccess::Write
                 )
                 .is_err()
+        );
+        assert_eq!(
+            policy
+                .check_resolved(
+                    &physical.join("new"),
+                    &resolve_path(&physical.join("new")).unwrap(),
+                    PathAccess::Write,
+                )
+                .unwrap_err()
+                .code,
+            "PATH_WRITE_DENIED"
         );
     }
 

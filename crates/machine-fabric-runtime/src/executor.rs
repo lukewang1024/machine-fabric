@@ -4968,13 +4968,53 @@ mod tests {
 
     #[test]
     fn archive_relay_round_trips_a_directory_and_replaces_destination() {
+        archive_relay_round_trip(false);
+    }
+
+    #[test]
+    fn archive_relay_round_trips_under_registered_desktop_mapping() {
+        archive_relay_round_trip(true);
+    }
+
+    fn archive_relay_round_trip(mapped: bool) {
         let directory = tempfile::tempdir().unwrap();
-        let runtime = ExecutorRuntime::new("local", vec![directory.path().to_path_buf()]).unwrap();
+        let home = directory.path().join("home");
+        fs::create_dir_all(home.join("Documents")).unwrap();
+        let logical = home.join("Documents/managed");
+        let physical = directory.path().join("relocated");
+        fs::create_dir_all(&physical).unwrap();
+        let mut runtime = if mapped {
+            #[cfg(unix)]
+            std::os::unix::fs::symlink(&physical, &logical).unwrap();
+            #[cfg(windows)]
+            {
+                let output = std::process::Command::new("cmd.exe")
+                    .args(["/D", "/C", "mklink", "/J"])
+                    .arg(logical.to_string_lossy().replace('/', "\\"))
+                    .arg(physical.to_string_lossy().replace('/', "\\"))
+                    .output()
+                    .unwrap();
+                assert!(output.status.success(), "{output:?}");
+            }
+            ExecutorRuntime::base("local", vec![home.clone()], Some(&home)).unwrap()
+        } else {
+            ExecutorRuntime::new("local", vec![directory.path().to_path_buf()]).unwrap()
+        };
+        if mapped {
+            runtime
+                .register_managed_path_mappings(vec![(logical.clone(), physical)])
+                .unwrap();
+        }
+        let transfer_root = if mapped {
+            logical
+        } else {
+            directory.path().to_path_buf()
+        };
         let source = directory.path().join("source");
         fs::create_dir_all(source.join("nested")).unwrap();
         fs::write(source.join("small.txt"), b"small").unwrap();
         fs::write(source.join("nested/data.bin"), vec![7_u8; 64 * 1024]).unwrap();
-        let destination = directory.path().join("destination");
+        let destination = transfer_root.join("destination");
         fs::create_dir(&destination).unwrap();
         fs::write(destination.join("stale.txt"), b"stale").unwrap();
 
@@ -4985,7 +5025,7 @@ mod tests {
         assert!(created.ok, "{created:?}");
         let archive = created.result.unwrap();
         let token = archive["token"].as_str().unwrap();
-        let staging = directory.path().join("staging");
+        let staging = transfer_root.join("destination.machine-fabric-relay-test");
         let prepared = runtime.handle(Request::new(
             "artifact.relay.archive.prepare",
             json!({"destination": destination, "staging": staging}),
