@@ -82,3 +82,20 @@ the desktop has been reset before `desktop.recover` with
 a stopped host, or a successful read-only probe with that reset. Never replay
 unknown or partial input or send blanket key releases. Retain exact process
 identity and complete, untruncated evidence when reconciling old helpers.
+
+## Unattended desktop requests
+
+Inspect `machine-fabric computer-use queue --executor ID` before desktop work.
+When `availabilityRequired` is true, all desktop calls require a worker-granted
+session and fresh local unattended availability. Legacy callers and
+`requiresAvailability=false` cannot opt out. Missing provider heartbeats do not
+make a configured desktop free, and availability never clears quarantine.
+
+Use `computer-use run --executor ID --owner OWNER --request-key STABLE_KEY
+--receipt PRIVATE_PATH --deadline-at EPOCH_MS -- COMMAND ARG...` for queued work.
+It waits without starting a model, then hands the consumer its original
+Controller socket and desktop credentials in `MACHINE_FABRIC_*` environment
+variables. Adopt that session instead of opening a second one behind yourself.
+The consumer must keep workspace driver/approval checks and the native exact
+window guards, use fresh observations, and save/close only its own resources.
+Never arm an away guard, unlock a machine or alter user screens to create a slot.

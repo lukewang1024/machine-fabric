@@ -22,6 +22,11 @@ pub(crate) struct DesktopQueue {
     last_recovery: Option<Value>,
     #[serde(default)]
     maintenance_owner: Option<String>,
+    // Once a local provider is configured, callers cannot opt out or turn a
+    // missing/dead provider into permission. Explicit node administration is
+    // required to remove the policy; no desktop RPC clears it.
+    #[serde(default)]
+    availability_required: bool,
     // An in-memory barrier for the narrow read-only inspection allowed while
     // blocked. It is deliberately not persisted; the durable blocked state is.
     #[serde(skip)]
@@ -266,10 +271,25 @@ impl DesktopQueue {
         });
         json!({"available":available,"snapshot":snapshot})
     }
+    fn refresh_availability_policy(&mut self) -> Result<(), RpcError> {
+        if !self.availability_required
+            && self.path.as_ref().is_some_and(|p| {
+                p.with_file_name("desktop-availability.json")
+                    .symlink_metadata()
+                    .is_ok()
+            })
+        {
+            self.availability_required = true;
+            // Keep the in-memory policy closed even if persistence fails.
+            self.save()?;
+        }
+        Ok(())
+    }
     pub(crate) fn promote(&mut self) -> Result<(), RpcError> {
         if self.recovery_inspection_active {
             return Ok(());
         }
+        self.refresh_availability_policy()?;
         let now = now_ms();
         let mut expired = false;
         for job in &mut self.jobs {
@@ -287,7 +307,7 @@ impl DesktopQueue {
             && !self.in_flight
             && self.active().is_none()
             && let Some(job) = self.jobs.iter_mut().find(|j| j.state == "queued")
-            && (!job.requires_availability || available)
+            && (!(job.requires_availability || self.availability_required) || available)
         {
             let old_job = job.clone();
             self.epoch += 1;
@@ -307,7 +327,8 @@ impl DesktopQueue {
     }
     fn job_value(&self, job: &Job) -> Value {
         let mut value = serde_json::to_value(job).unwrap();
-        if job.requires_availability {
+        if job.requires_availability || self.availability_required {
+            value["requiresAvailability"] = json!(true);
             value["inputAllowed"] = json!(
                 job.state == "active"
                     && !self.blocked
@@ -401,7 +422,7 @@ impl DesktopQueue {
                     ttl_ms: ttl,
                     submitted_at: now_ms(),
                     expires_at: 0,
-                    requires_availability,
+                    requires_availability: requires_availability || self.availability_required,
                     deadline_at,
                     claimed_by: None,
                 });
@@ -437,7 +458,7 @@ impl DesktopQueue {
                     })
                     .collect();
                 Ok(
-                    json!({"jobs":jobs,"historyCount":history_count,"totalCount":self.jobs.len(),"historyIncluded":include_terminal,"worker":{"notificationWakes":self.notification_wakes,"pollingWakes":self.polling_wakes},"availability":self.availability(),"blocked":self.blocked,"inFlight":self.in_flight,"lastRecovery":self.last_recovery,"recoveryPolicy":"verified-os-restart-or-explicit-desktop-reset","maintenanceOwner":self.maintenance_owner,"safePoint":self.maintenance_owner.is_some() && !self.blocked && !self.in_flight && self.active().is_none()}),
+                    json!({"jobs":jobs,"historyCount":history_count,"totalCount":self.jobs.len(),"historyIncluded":include_terminal,"availabilityRequired":self.availability_required,"worker":{"notificationWakes":self.notification_wakes,"pollingWakes":self.polling_wakes},"availability":self.availability(),"blocked":self.blocked,"inFlight":self.in_flight,"lastRecovery":self.last_recovery,"recoveryPolicy":"verified-os-restart-or-explicit-desktop-reset","maintenanceOwner":self.maintenance_owner,"safePoint":self.maintenance_owner.is_some() && !self.blocked && !self.in_flight && self.active().is_none()}),
                 )
             }
             "desktop.claim" => {
@@ -463,7 +484,7 @@ impl DesktopQueue {
                         "consumer requires a live active session",
                     ));
                 }
-                if job.requires_availability && !available {
+                if (job.requires_availability || self.availability_required) && !available {
                     return Err(error(
                         "DESKTOP_UNAVAILABLE",
                         "local availability permission is absent or expired",
@@ -583,6 +604,7 @@ impl DesktopQueue {
         if self.in_flight {
             return Err(error("DESKTOP_BUSY", "desktop action is already in flight"));
         }
+        self.refresh_availability_policy()?;
         if let Some(i) = self.active() {
             let job = &self.jobs[i];
             if job.state != "active"
@@ -598,7 +620,9 @@ impl DesktopQueue {
                     "desktop belongs to another acceptance session",
                 ));
             }
-            if job.requires_availability && self.availability()["available"] != true {
+            if (job.requires_availability || self.availability_required)
+                && self.availability()["available"] != true
+            {
                 return Err(error(
                     "DESKTOP_UNAVAILABLE",
                     "local availability permission is absent or expired; no desktop action dispatched",
@@ -612,7 +636,10 @@ impl DesktopQueue {
                 "DESKTOP_MAINTENANCE",
                 "desktop admission is paused for maintenance",
             ));
-        } else if action == "computer-use.call" || params.get("_desktop").is_some() {
+        } else if self.availability_required
+            || action == "computer-use.call"
+            || params.get("_desktop").is_some()
+        {
             return Err(error(
                 "DESKTOP_SESSION_REQUIRED",
                 "submit and await a desktop session first",
@@ -651,6 +678,41 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
+    }
+    #[test]
+    fn configured_worker_enforces_gate_for_legacy_callers_and_remembers_missing_provider() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("queue.json");
+        publish_availability(dir.path(), false);
+        let mut q = DesktopQueue::open(path.clone()).unwrap();
+        let a = q
+            .command(
+                "desktop.submit",
+                &json!({"owner":"old","requestKey":"old","requiresAvailability":false}),
+            )
+            .unwrap();
+        assert_eq!(a["state"], "queued");
+        assert_eq!(a["requiresAvailability"], true);
+        assert!(q.availability_required);
+        assert_eq!(
+            q.begin("application.__probe__", &mut json!({}))
+                .unwrap_err()
+                .code,
+            "DESKTOP_SESSION_REQUIRED"
+        );
+        fs::remove_file(dir.path().join("desktop-availability.json")).unwrap();
+        drop(q);
+        let mut reopened = DesktopQueue::open(path).unwrap();
+        assert!(reopened.availability_required);
+        assert_eq!(
+            reopened.command("desktop.get", &credentials(&a)).unwrap()["state"],
+            "queued"
+        );
+        publish_availability(dir.path(), true);
+        assert_eq!(
+            reopened.command("desktop.get", &credentials(&a)).unwrap()["inputAllowed"],
+            true
+        );
     }
     #[test]
     fn one_request_cannot_be_consumed_by_two_waiters() {
@@ -724,6 +786,9 @@ mod tests {
         assert_eq!(q.jobs[1].state, "queued");
         q.command("desktop.finish", &credentials(&a)).unwrap();
         q.cleanup_done(true).unwrap();
+        assert_eq!(q.jobs[1].state, "queued");
+        publish_availability(dir.path(), true);
+        q.promote().unwrap();
         assert_eq!(q.jobs[1].state, "active");
     }
     #[test]
