@@ -77,6 +77,10 @@ with (p/'events').open('a') as f:f.write('end '+name+'\\n')
                 second = start(runner('two'), 'two-runner')
                 await_value(lambda: (state / 'two.json').exists() and json.loads((state / 'two.json').read_text()).get('state') == 'queued')
                 self.assertFalse((state / 'events').exists())
+                if sys.platform == 'darwin':
+                    subprocess.run(['/usr/bin/notifyutil', '-p', 'dev.machine-fabric.desktop-availability-changed'], check=True, timeout=5)
+                    await_value(lambda: call('desktop.list', {'executorId': 'fixture-desktop', 'includeTerminal': False})['result']['worker']['notificationWakes'] > 0)
+                    self.assertFalse((state / 'events').exists())  # Event is not permission.
                 available.set()
                 await_value(lambda: (state / 'one.started').exists())
                 self.assertFalse((state / 'two.started').exists())
