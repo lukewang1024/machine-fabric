@@ -22,6 +22,7 @@ use std::time::Duration;
 
 mod clipboard_cli;
 mod computer_use_cli;
+mod desktop_run;
 
 #[derive(Debug, Parser)]
 #[command(

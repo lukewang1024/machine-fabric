@@ -8,6 +8,7 @@ mod computer_use;
 mod controller;
 mod datapack;
 mod desktop;
+mod desktop_worker;
 mod executor;
 mod filesystem_capacity;
 mod generation;

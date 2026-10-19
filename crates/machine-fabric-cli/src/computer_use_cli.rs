@@ -50,6 +50,28 @@ pub enum ComputerUseCommand {
         /// Stable per-submission key for safe retries after a lost response.
         #[arg(long)]
         request_key: Option<String>,
+        /// Wait for a fresh Executor-local unattended desktop availability signal.
+        #[arg(long)]
+        requires_availability: bool,
+        /// Queue deadline in Unix epoch milliseconds; expired requests never start.
+        #[arg(long)]
+        deadline_at: Option<u64>,
+    },
+    /// Queue a consumer without model tokens; execute it once after worker admission.
+    Run {
+        #[arg(long)]
+        executor: String,
+        #[arg(long)]
+        owner: String,
+        #[arg(long)]
+        request_key: String,
+        /// Private durable receipt; reuse it to resume waiting, never replay execution.
+        #[arg(long)]
+        receipt: std::path::PathBuf,
+        #[arg(long)]
+        deadline_at: u64,
+        #[arg(last = true, required = true)]
+        command: Vec<String>,
     },
     Renew {
         #[arg(long)]
@@ -117,7 +139,7 @@ fn format_rpc_error(error: &RpcError) -> String {
     }
 }
 
-fn rpc(socket: &Path, action: &str, params: Value) -> Result<Value> {
+pub(crate) fn rpc(socket: &Path, action: &str, params: Value) -> Result<Value> {
     let response = call_unix(socket, &Request::new(action, params))?;
     if !response.ok {
         let error = response
@@ -180,11 +202,34 @@ pub fn run(socket: &Path, command: ComputerUseCommand) -> Result<()> {
             owner,
             ttl_ms,
             request_key,
-        } => rpc(
+            requires_availability,
+            deadline_at,
+        } => {
+            let mut params = json!({"executorId":executor,
+                "requestKey":request_key.unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+                "owner":owner,"ttlMs":ttl_ms,"requiresAvailability":requires_availability});
+            if let Some(deadline) = deadline_at {
+                params["deadlineAt"] = json!(deadline);
+            }
+            rpc(socket, "desktop.submit", params)
+        }
+        ComputerUseCommand::Run {
+            executor,
+            owner,
+            request_key,
+            receipt,
+            deadline_at,
+            command,
+        } => crate::desktop_run::Run {
             socket,
-            "desktop.submit",
-            json!({"executorId":executor,"requestKey":request_key.unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),"owner":owner,"ttlMs":ttl_ms}),
-        ),
+            executor: &executor,
+            owner: &owner,
+            request_key: &request_key,
+            receipt: &receipt,
+            deadline_at,
+            argv: &command,
+        }
+        .execute(),
         ComputerUseCommand::Renew {
             executor,
             owner,
