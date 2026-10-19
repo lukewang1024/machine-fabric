@@ -455,7 +455,8 @@ mod tests {
         }
         let temp = tempfile::tempdir().unwrap();
         let home = temp.path().join("home");
-        let target = temp.path().join("disk-data");
+        // macOS exposes its temporary directory through /var -> /private/var.
+        let target = temp.path().canonicalize().unwrap().join("disk-data");
         let outside = temp.path().join("outside");
         fs::create_dir_all(home.join("Documents")).unwrap();
         fs::create_dir_all(home.join(".ssh")).unwrap();
