@@ -3,6 +3,7 @@ members = [
   "crates/machine-fabric-schema",
   "crates/machine-fabric-core",
   "crates/machine-fabric-protocol",
+  "crates/machine-fabric-peer",
   "crates/machine-fabric-runtime",
   "crates/machine-fabric-cli",
 ]

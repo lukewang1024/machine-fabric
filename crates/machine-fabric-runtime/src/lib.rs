@@ -16,6 +16,7 @@ mod generation;
 mod macos;
 mod path_policy;
 mod peer;
+mod peer_channel;
 mod process;
 mod rpc;
 mod telemetry;
@@ -30,6 +31,7 @@ pub use executor::{ExecutorRuntime, capability_catalog};
 pub use peer::{
     PeerAcceptConfig, PeerConnectConfig, PeerStatus, accept_peer, connect_peer, read_peer_status,
 };
+pub use peer_channel::{PeerChannelConfig, run_peer_channel};
 pub use rpc::{RpcServer, call_unix};
 pub use telemetry::{event_fields as log_event, init_logging, request_event};
 pub use transport::deploy_binary_over_ssh;

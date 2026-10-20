@@ -567,6 +567,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "machine-fabric-peer"
+version = "0.1.84"
+dependencies = [
+ "anyhow",
+ "base64",
+ "flate2",
+ "machine-fabric-protocol",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "uuid",
+]
+
+[[package]]
 name = "machine-fabric-protocol"
 version = "0.1.84"
 dependencies = [
@@ -588,6 +602,7 @@ dependencies = [
  "junction",
  "libc",
  "machine-fabric-core",
+ "machine-fabric-peer",
  "machine-fabric-protocol",
  "machine-fabric-schema",
  "serde",

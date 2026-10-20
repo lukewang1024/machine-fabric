@@ -8,10 +8,10 @@ use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{
     Arc,
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 pub struct RpcServer {
     socket: PathBuf,
@@ -474,4 +474,259 @@ mod frame_write_tests {
         assert_eq!(p.writes, 2);
         assert_eq!(p.flushes, 0);
     }
+}
+
+#[cfg(all(test, unix))]
+mod controlled_ownership_tests {
+    use super::*;
+    #[test]
+    fn both_listener_types_protect_each_others_live_endpoint() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("shared.sock");
+        let legacy = RpcServer::new(&path).bind().unwrap();
+        assert!(ControlledRpcServer::bind(&path).is_err());
+        assert!(ControlledRpcServer::bind_legacy(&path).is_err());
+        drop(legacy);
+        let owned = ControlledRpcServer::bind_legacy(&path).unwrap();
+        assert!(RpcServer::new(&path).bind().is_err());
+        assert!(ControlledRpcServer::bind_legacy(&path).is_err());
+        fs::remove_file(&path).unwrap();
+        let replacement = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        drop(owned);
+        assert!(path.exists());
+        drop(replacement);
+    }
+}
+
+/// A daemon-owned listener whose lifecycle is bounded by its caller. Unlike the
+/// legacy permanent listener it never overwrites an existing endpoint.
+pub(crate) struct ControlledRpcServer {
+    listener: Listener,
+    #[cfg(unix)]
+    _ownership: SocketOwnership,
+}
+
+impl ControlledRpcServer {
+    pub(crate) fn bind(path: &Path) -> Result<Self> {
+        Self::bind_with_overwrite(path, false)
+    }
+
+    pub(crate) fn bind_legacy(path: &Path) -> Result<Self> {
+        Self::bind_with_overwrite(path, true)
+    }
+
+    fn bind_with_overwrite(path: &Path, legacy: bool) -> Result<Self> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        #[cfg(unix)]
+        let ownership = SocketOwnership::acquire(path)?;
+        let mapped = ipc_path(path);
+        let name = mapped.as_os_str().to_fs_name::<GenericFilePath>()?;
+        let options = ListenerOptions::new()
+            .name(name)
+            .try_overwrite(legacy)
+            .reclaim_name(false)
+            .nonblocking(ListenerNonblockingMode::Accept);
+        #[cfg(windows)]
+        let options = if legacy {
+            windows_pipe_permissions(options)?
+        } else {
+            use interprocess::os::windows::{
+                local_socket::ListenerOptionsExt, security_descriptor::SecurityDescriptor,
+            };
+            use widestring::U16CString;
+            let sddl = U16CString::from_str("D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;OW)")?;
+            options.security_descriptor(SecurityDescriptor::deserialize(&sddl)?)
+        };
+        let listener = options.create_sync().context("bind daemon IPC")?;
+        #[cfg(unix)]
+        let ownership = ownership.bound()?;
+        let server = Self {
+            listener,
+            #[cfg(unix)]
+            _ownership: ownership,
+        };
+        set_owner_only_permissions(path)?;
+        Ok(server)
+    }
+
+    pub(crate) fn serve(
+        self,
+        handler: impl Fn(Request) -> Response + Send + Sync + 'static,
+        stopped: impl Fn() -> bool + Send + Sync + 'static,
+        maximum_frame: usize,
+        maximum_clients: usize,
+    ) -> Result<()> {
+        let handler = Arc::new(handler);
+        let stopped: Arc<dyn Fn() -> bool + Send + Sync> = Arc::new(stopped);
+        let active = Arc::new(AtomicUsize::new(0));
+        while !stopped() {
+            match self.listener.accept() {
+                Ok(mut stream) => {
+                    if active.load(Ordering::Acquire) >= maximum_clients {
+                        drop(stream);
+                        continue;
+                    }
+                    stream.set_nonblocking(true)?;
+                    active.fetch_add(1, Ordering::AcqRel);
+                    let active = active.clone();
+                    let handler = handler.clone();
+                    let stopped = stopped.clone();
+                    thread::spawn(move || {
+                        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+                            || -> Result<()> {
+                                let deadline = Instant::now() + Duration::from_secs(30);
+                                let bytes = read_controlled(
+                                    &mut stream,
+                                    maximum_frame,
+                                    deadline,
+                                    &*stopped,
+                                )?;
+                                let request: Request = serde_json::from_slice(&bytes)?;
+                                if stopped() {
+                                    return Ok(());
+                                }
+                                let response = handler(request);
+                                let mut bytes = serde_json::to_vec(&response)?;
+                                if bytes.len() >= maximum_frame {
+                                    bytes = serde_json::to_vec(&Response::failure(
+                                        response.request_id,
+                                        RpcError::new(
+                                            "IPC_FRAME_TOO_LARGE",
+                                            "response exceeds IPC limit",
+                                        ),
+                                    ))?;
+                                }
+                                bytes.push(b'\n');
+                                write_controlled(
+                                    &mut stream,
+                                    &bytes,
+                                    Instant::now() + Duration::from_secs(30),
+                                    &*stopped,
+                                )
+                            },
+                        ));
+                        active.fetch_sub(1, Ordering::AcqRel);
+                    });
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Ok(())
+    }
+}
+
+fn check_io(deadline: Instant, stopped: &dyn Fn() -> bool) -> Result<()> {
+    if stopped() {
+        return Err(anyhow!("IPC cancelled"));
+    }
+    if Instant::now() >= deadline {
+        return Err(anyhow!("IPC deadline elapsed"));
+    }
+    Ok(())
+}
+
+fn read_controlled(
+    stream: &mut Stream,
+    maximum: usize,
+    deadline: Instant,
+    stopped: &dyn Fn() -> bool,
+) -> Result<Vec<u8>> {
+    use std::io::Read;
+    let mut bytes = Vec::new();
+    let mut buffer = [0u8; 16 * 1024];
+    loop {
+        check_io(deadline, stopped)?;
+        match stream.read(&mut buffer) {
+            Ok(0) => return Err(anyhow!("IPC closed before a complete frame")),
+            Ok(count) => {
+                let count = buffer[..count]
+                    .iter()
+                    .position(|b| *b == b'\n')
+                    .map(|i| i + 1)
+                    .unwrap_or(count);
+                if count > maximum.saturating_sub(bytes.len()) {
+                    return Err(anyhow!("IPC frame limit exceeded"));
+                }
+                bytes.extend_from_slice(&buffer[..count]);
+                if bytes.last() == Some(&b'\n') {
+                    return Ok(bytes);
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                thread::sleep(Duration::from_millis(5))
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+}
+
+fn write_controlled(
+    stream: &mut Stream,
+    mut bytes: &[u8],
+    deadline: Instant,
+    stopped: &dyn Fn() -> bool,
+) -> Result<()> {
+    while !bytes.is_empty() {
+        check_io(deadline, stopped)?;
+        match stream.write(bytes) {
+            Ok(0) => return Err(anyhow!("IPC closed while writing")),
+            Ok(count) => bytes = &bytes[count..],
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                thread::sleep(Duration::from_millis(5))
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn call_unix_controlled(
+    socket: &Path,
+    request: &Request,
+    maximum_frame: usize,
+    timeout: Duration,
+    stopped: &dyn Fn() -> bool,
+) -> Result<Response> {
+    use interprocess::{ConnectWaitMode, local_socket::ConnectOptions};
+    let deadline = Instant::now() + timeout;
+    check_io(deadline, stopped)?;
+    let mapped = ipc_path(socket);
+    let name = mapped.as_os_str().to_fs_name::<GenericFilePath>()?;
+    let mut stream = loop {
+        check_io(deadline, stopped)?;
+        let slice =
+            Duration::from_millis(20).min(deadline.saturating_duration_since(Instant::now()));
+        match ConnectOptions::new()
+            .name(name.clone())
+            .wait_mode(ConnectWaitMode::Timeout(slice))
+            .nonblocking_stream(true)
+            .connect_sync()
+        {
+            Ok(stream) => break stream,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::TimedOut
+                        | std::io::ErrorKind::WouldBlock
+                        | std::io::ErrorKind::Interrupted
+                ) =>
+            {
+                thread::sleep(Duration::from_millis(5));
+            }
+            Err(error) => return Err(error.into()),
+        }
+    };
+    let mut bytes = serde_json::to_vec(request)?;
+    if bytes.len() >= maximum_frame {
+        return Err(anyhow!("IPC request exceeds frame limit"));
+    }
+    bytes.push(b'\n');
+    write_controlled(&mut stream, &bytes, deadline, stopped)?;
+    let bytes = read_controlled(&mut stream, maximum_frame, deadline, stopped)?;
+    Ok(serde_json::from_slice(&bytes)?)
 }

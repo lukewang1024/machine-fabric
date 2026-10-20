@@ -21,6 +21,7 @@ tungstenite.workspace = true
 uuid.workspace = true
 machine-fabric-core = { path = "../machine-fabric-core" }
 machine-fabric-protocol = { path = "../machine-fabric-protocol" }
+machine-fabric-peer = { path = "../machine-fabric-peer" }
 machine-fabric-schema = { path = "../machine-fabric-schema" }
 
 [target.'cfg(not(target_os = "android"))'.dependencies]
