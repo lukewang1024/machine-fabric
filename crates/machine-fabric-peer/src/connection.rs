@@ -42,11 +42,72 @@ impl Transport {
     /// Convenience for an already authenticated stream, primarily local tests.
     /// TCP alone supplies no authentication or encryption.
     pub fn from_tcp(stream: TcpStream) -> std::io::Result<Self> {
+        // Winsock shutdown on a duplicated socket does not reliably interrupt
+        // an already pending recv until the remote endpoint also closes. Bound
+        // each syscall, but keep ordinary idle periods inside this adapter so
+        // a timeout never discards a partially received protocol frame.
+        stream.set_read_timeout(Some(Duration::from_millis(100)))?;
+        stream.set_write_timeout(Some(Duration::from_millis(100)))?;
         let reader = stream.try_clone()?;
         let closer = stream.try_clone()?;
-        Ok(Self::new(reader, stream, move || {
-            let _ = closer.shutdown(Shutdown::Both);
-        }))
+        let closed = Arc::new(AtomicBool::new(false));
+        Ok(Self::new(
+            InterruptibleTcp {
+                stream: reader,
+                closed: closed.clone(),
+            },
+            InterruptibleTcp {
+                stream,
+                closed: closed.clone(),
+            },
+            move || {
+                closed.store(true, Ordering::Release);
+                let _ = closer.shutdown(Shutdown::Both);
+            },
+        ))
+    }
+}
+
+struct InterruptibleTcp {
+    stream: TcpStream,
+    closed: Arc<AtomicBool>,
+}
+
+impl InterruptibleTcp {
+    fn io<T>(
+        &mut self,
+        mut operation: impl FnMut(&mut TcpStream) -> std::io::Result<T>,
+    ) -> std::io::Result<T> {
+        loop {
+            if self.closed.load(Ordering::Acquire) {
+                return Err(std::io::ErrorKind::ConnectionAborted.into());
+            }
+            match operation(&mut self.stream) {
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::TimedOut
+                            | std::io::ErrorKind::WouldBlock
+                            | std::io::ErrorKind::Interrupted
+                    ) => {}
+                result => return result,
+            }
+        }
+    }
+}
+
+impl Read for InterruptibleTcp {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        self.io(|stream| stream.read(buffer))
+    }
+}
+
+impl Write for InterruptibleTcp {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        self.io(|stream| stream.write(buffer))
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.io(Write::flush)
     }
 }
 

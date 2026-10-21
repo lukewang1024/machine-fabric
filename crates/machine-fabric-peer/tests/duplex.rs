@@ -119,6 +119,30 @@ fn independent_executors_call_both_directions_concurrently_without_controller() 
 }
 
 #[test]
+fn idle_tcp_timeouts_preserve_a_partially_received_handshake() {
+    let (stream, mut remote) = streams();
+    let cfg = config("a", "b", Lease::new("lease-1", now() + 30_000).unwrap());
+    let hello = json!({"type":"hello","protocol":"machine-fabric.peer/v2","node_id":"b",
+        "roles":["tools"],"binding":cfg.binding});
+    let frame = format!("{hello}\n");
+    let peer = PeerConnection::start(
+        Transport::from_tcp(stream).unwrap(),
+        cfg,
+        Handshake::Accept,
+        echo(),
+        allow(),
+    )
+    .unwrap();
+    let split = frame.len() / 2;
+    remote.write_all(&frame.as_bytes()[..split]).unwrap();
+    thread::sleep(Duration::from_millis(350));
+    remote.write_all(&frame.as_bytes()[split..]).unwrap();
+    peer.wait_ready().unwrap();
+    peer.close();
+    assert!(peer.wait_drained(Duration::from_secs(2)));
+}
+
+#[test]
 fn wrong_node_scope_and_service_are_rejected_before_dispatch() {
     for mismatch in ["node", "scope", "service"] {
         let invoked = Arc::new(AtomicBool::new(false));
