@@ -1,0 +1,18 @@
+[package]
+name = "machine-fabric-peer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Bounded duplex RPC and leased SSH transports for executor daemons"
+
+[dependencies]
+anyhow.workspace = true
+base64.workspace = true
+flate2.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+machine-fabric-protocol = { path = "../machine-fabric-protocol" }
+
+[dev-dependencies]
+tempfile.workspace = true

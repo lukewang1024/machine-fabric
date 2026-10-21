@@ -25,6 +25,16 @@ If a Controller goes down, task control for Agents that depend on that
 Controller is unavailable; tasks are not silently adopted by another node.
 Executor admission remains node-local and does not require a central service.
 
+## Reuse in an existing executor
+
+The independent `machine-fabric-peer` crate provides scoped duplex channels
+without starting a Fabric Controller or adopting Fabric's task model. Non-Rust
+executors can supervise the private `peer channel-connect/channel-accept`
+adapter and exchange JSON over local IPC. The executor owns SSH configuration,
+platform grants and CU tool dispatch; the Coding Agent uses its authorized
+tool API. See the [executor integration guide](docs/executor-peer.md) and
+[runnable Rust example](crates/machine-fabric-peer/examples/duplex.rs).
+
 ## Agent entry points
 
 Use the compact context first, then ask for one capability contract only when

@@ -3,8 +3,8 @@ use clap::{Parser, Subcommand, ValueEnum};
 use machine_fabric_core::JsonStore;
 use machine_fabric_protocol::Request;
 use machine_fabric_runtime::{
-    Controller, ExecutorRuntime, PeerAcceptConfig, PeerConnectConfig, RpcServer, accept_peer,
-    call_unix, connect_peer, init_logging, read_peer_status,
+    Controller, ExecutorRuntime, PeerAcceptConfig, PeerChannelConfig, PeerConnectConfig, RpcServer,
+    accept_peer, call_unix, connect_peer, init_logging, read_peer_status, run_peer_channel,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -159,6 +159,16 @@ enum ExecutorCommand {
 
 #[derive(Debug, Subcommand)]
 enum PeerCommand {
+    /// Executor-owned scoped SSH channel; requires no Fabric Controller.
+    ChannelConnect {
+        #[arg(long)]
+        config: PathBuf,
+    },
+    /// Fixed SSH-stdio entrypoint for an executor-owned scoped channel.
+    ChannelAccept {
+        #[arg(long)]
+        config: PathBuf,
+    },
     Connect {
         #[arg(long)]
         id: String,
@@ -454,6 +464,12 @@ fn run_cli() -> Result<()> {
                 .serve(move |request| handler.handle(request))
         }
         Command::Peer { command } => match *command {
+            PeerCommand::ChannelConnect { config } => {
+                run_peer_channel(PeerChannelConfig::read(&config)?, true)
+            }
+            PeerCommand::ChannelAccept { config } => {
+                run_peer_channel(PeerChannelConfig::read(&config)?, false)
+            }
             PeerCommand::Connect {
                 id,
                 local_id,

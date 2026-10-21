@@ -536,7 +536,7 @@ checksum = "0ceec5bc11778974d1bcb055b18002eba7f4b3518b6a0081b3af5f21666da9ad"
 
 [[package]]
 name = "machine-fabric-cli"
-version = "0.1.84"
+version = "0.1.85"
 dependencies = [
  "anyhow",
  "clap",
@@ -553,7 +553,7 @@ dependencies = [
 
 [[package]]
 name = "machine-fabric-core"
-version = "0.1.84"
+version = "0.1.85"
 dependencies = [
  "hex",
  "machine-fabric-schema",
@@ -567,8 +567,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "machine-fabric-peer"
+version = "0.1.85"
+dependencies = [
+ "anyhow",
+ "base64",
+ "flate2",
+ "machine-fabric-protocol",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "uuid",
+]
+
+[[package]]
 name = "machine-fabric-protocol"
-version = "0.1.84"
+version = "0.1.85"
 dependencies = [
  "serde",
  "serde_json",
@@ -577,7 +591,7 @@ dependencies = [
 
 [[package]]
 name = "machine-fabric-runtime"
-version = "0.1.84"
+version = "0.1.85"
 dependencies = [
  "anyhow",
  "arboard",
@@ -588,6 +602,7 @@ dependencies = [
  "junction",
  "libc",
  "machine-fabric-core",
+ "machine-fabric-peer",
  "machine-fabric-protocol",
  "machine-fabric-schema",
  "serde",
@@ -604,7 +619,7 @@ dependencies = [
 
 [[package]]
 name = "machine-fabric-schema"
-version = "0.1.84"
+version = "0.1.85"
 dependencies = [
  "serde",
  "serde_json",
