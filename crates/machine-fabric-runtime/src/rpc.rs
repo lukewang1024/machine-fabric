@@ -636,12 +636,11 @@ fn read_controlled(
     deadline: Instant,
     stopped: &dyn Fn() -> bool,
 ) -> Result<Vec<u8>> {
-    use std::io::Read;
     let mut bytes = Vec::new();
     let mut buffer = [0u8; 16 * 1024];
     loop {
         check_io(deadline, stopped)?;
-        match stream.read(&mut buffer) {
+        match controlled_read(stream, &mut buffer) {
             Ok(0) => return Err(anyhow!("IPC closed before a complete frame")),
             Ok(count) => {
                 let count = buffer[..count]
@@ -665,6 +664,38 @@ fn read_controlled(
     }
 }
 
+fn controlled_read(stream: &mut Stream, buffer: &mut [u8]) -> std::io::Result<usize> {
+    use std::io::Read;
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::{AsHandle, AsRawHandle};
+        use windows_sys::Win32::System::Pipes::PeekNamedPipe;
+        let Stream::NamedPipe(pipe) = &*stream;
+        let mut available = 0;
+        // PIPE_NOWAIT reports ERROR_NO_DATA for an idle connected pipe. Some
+        // std/interprocess versions turn this into BrokenPipe or EOF. Peek
+        // preserves the distinction between idle and disconnected, and this
+        // connection has exactly one reader so no other read can consume it.
+        let ok = unsafe {
+            PeekNamedPipe(
+                pipe.as_handle().as_raw_handle(),
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null_mut(),
+                &mut available,
+                std::ptr::null_mut(),
+            )
+        };
+        if ok == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if available == 0 {
+            return Err(std::io::ErrorKind::WouldBlock.into());
+        }
+    }
+    stream.read(buffer)
+}
+
 fn write_controlled(
     stream: &mut Stream,
     mut bytes: &[u8],
@@ -674,6 +705,11 @@ fn write_controlled(
     while !bytes.is_empty() {
         check_io(deadline, stopped)?;
         match stream.write(bytes) {
+            // A full PIPE_NOWAIT buffer completes a byte-mode write with zero
+            // progress. It is backpressure, not evidence of a closed pipe.
+            #[cfg(windows)]
+            Ok(0) => thread::sleep(Duration::from_millis(5)),
+            #[cfg(not(windows))]
             Ok(0) => return Err(anyhow!("IPC closed while writing")),
             Ok(count) => bytes = &bytes[count..],
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
@@ -729,4 +765,52 @@ pub(crate) fn call_unix_controlled(
     write_controlled(&mut stream, &bytes, deadline, stopped)?;
     let bytes = read_controlled(&mut stream, maximum_frame, deadline, stopped)?;
     Ok(serde_json::from_slice(&bytes)?)
+}
+
+#[cfg(test)]
+mod controlled_tests {
+    use super::*;
+
+    #[test]
+    fn controlled_rpc_waits_for_idle_pipe_and_cancels_without_a_response() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("controlled.sock");
+        let server = ControlledRpcServer::bind(&path).unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let listener_stop = stop.clone();
+        let thread = thread::spawn(move || {
+            server.serve(
+                |request| {
+                    thread::sleep(Duration::from_millis(150));
+                    Response::success(request.request_id, serde_json::json!({"ready":true}))
+                },
+                move || listener_stop.load(Ordering::Acquire),
+                1024 * 1024,
+                4,
+            )
+        });
+        let response = call_unix_controlled(
+            &path,
+            &Request::new("ping", serde_json::Value::Null),
+            1024 * 1024,
+            Duration::from_secs(3),
+            &|| false,
+        )
+        .unwrap();
+        assert!(response.ok);
+        let started = Instant::now();
+        assert!(
+            call_unix_controlled(
+                &path,
+                &Request::new("ping", serde_json::Value::Null),
+                1024 * 1024,
+                Duration::from_secs(3),
+                &|| started.elapsed() > Duration::from_millis(40)
+            )
+            .is_err()
+        );
+        assert!(started.elapsed() < Duration::from_secs(1));
+        stop.store(true, Ordering::Release);
+        thread.join().unwrap().unwrap();
+    }
 }
