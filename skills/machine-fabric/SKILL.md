@@ -99,3 +99,20 @@ variables. Adopt that session instead of opening a second one behind yourself.
 The consumer must keep workspace driver/approval checks and the native exact
 window guards, use fresh observations, and save/close only its own resources.
 Never arm an away guard, unlock a machine or alter user screens to create a slot.
+
+## Explicit permission to work now
+
+When the user explicitly authorizes immediate desktop work, a node operator can
+run `scripts/authorize-desktop-now.py` locally on that Executor, with the exact
+queued job ID, owner, request key, `--confirm-user-authorized`, a reason and
+`--seconds` (at most 900). The script writes a private, boot- and token-bound
+operator receipt. It never changes or fabricates the Away Guard provider state.
+Consumers cannot opt out through a desktop RPC or environment flag.
+
+The grant covers only that fresh job. Other unattended requests retain their
+queue positions and wait for real availability; eligible requests remain serial.
+Expiry or removal of the receipt denies subsequent protected calls. Use the
+returned authorization ID with `--revoke` after completion. Never renew consent
+automatically, reuse it for another task or treat it as permission to unlock,
+clear quarantine, approve OS permissions, bypass native focus checks, or control
+user-owned windows. Inventory resources, record evidence and clean up normally.

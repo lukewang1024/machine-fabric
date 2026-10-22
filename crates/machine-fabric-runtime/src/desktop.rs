@@ -3,6 +3,8 @@ use machine_fabric_core::{atomic_replace, now_ms};
 use machine_fabric_protocol::RpcError;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+#[cfg(unix)]
+use sha2::{Digest, Sha256};
 use std::{fs, io::Write, path::PathBuf};
 
 // Missing broadcasts are bounded by this lease. An explicit false snapshot
@@ -303,6 +305,63 @@ impl DesktopQueue {
         }
         Ok(())
     }
+    // A node-local operator receipt is distinct from the unattended provider.
+    // No RPC parameter, environment flag or old token can create this grant.
+    fn user_authorization(&self, job: &Job) -> Option<Value> {
+        if !matches!(job.state.as_str(), "queued" | "active") {
+            return None;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let path = self
+                .path
+                .as_ref()?
+                .with_file_name("desktop-user-authorization.json");
+            let metadata = fs::symlink_metadata(&path).ok()?;
+            if !metadata.is_file()
+                || metadata.len() > 4096
+                || metadata.mode() & 0o777 != 0o600
+                || metadata.uid() != unsafe { libc::geteuid() }
+            {
+                return None;
+            }
+            let value: Value = serde_json::from_slice(&fs::read(path).ok()?).ok()?;
+            let now = now_ms();
+            let granted = value["grantedAtMs"].as_u64()?;
+            let expires = value["expiresAtMs"].as_u64()?;
+            if value["schemaVersion"] != 1
+                || value["source"] != "explicit-user"
+                || value["jobId"] != job.id
+                || value["owner"] != job.owner
+                || value["requestKey"] != job.request_key
+                || value["tokenSha256"] != hex::encode(Sha256::digest(job.token.as_bytes()))
+                || value["bootId"].as_str() != self.boot_id.as_deref()
+                || self.boot_id.is_none()
+                || granted > now
+                || expires <= now
+                || expires.saturating_sub(granted) > 900_000
+                || value["authorizationId"]
+                    .as_str()
+                    .and_then(|s| uuid::Uuid::parse_str(s).ok())
+                    .is_none()
+                || !value["reason"]
+                    .as_str()
+                    .is_some_and(|s| !s.is_empty() && s.len() <= 512)
+            {
+                return None;
+            }
+            Some(
+                json!({"source":"explicit-user", "authorizationId":value["authorizationId"],
+                "grantedAtMs":granted,"expiresAtMs":expires}),
+            )
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = job;
+            None
+        }
+    }
     pub(crate) fn promote(&mut self) -> Result<(), RpcError> {
         if self.recovery_inspection_active {
             return Ok(());
@@ -320,13 +379,27 @@ impl DesktopQueue {
             self.save()?;
         }
         let available = self.availability()["available"] == true;
+        // An unavailable unattended head keeps its FIFO position. Only a
+        // separately authorized job can run while that head is ineligible.
+        let candidate = self
+            .jobs
+            .iter()
+            .position(|j| j.state == "queued")
+            .filter(|&i| {
+                !(self.jobs[i].requires_availability || self.availability_required) || available
+            })
+            .or_else(|| {
+                self.jobs
+                    .iter()
+                    .position(|j| j.state == "queued" && self.user_authorization(j).is_some())
+            });
         if self.maintenance_owner.is_none()
             && !self.blocked
             && !self.in_flight
             && self.active().is_none()
-            && let Some(job) = self.jobs.iter_mut().find(|j| j.state == "queued")
-            && (!(job.requires_availability || self.availability_required) || available)
+            && let Some(index) = candidate
         {
+            let job = &mut self.jobs[index];
             let old_job = job.clone();
             self.epoch += 1;
             job.epoch = self.epoch;
@@ -345,6 +418,10 @@ impl DesktopQueue {
     }
     fn job_value(&self, job: &Job) -> Value {
         let mut value = serde_json::to_value(job).unwrap();
+        let user_authorization = self.user_authorization(job);
+        if let Some(receipt) = &user_authorization {
+            value["userAuthorization"] = receipt.clone();
+        }
         if job.requires_availability || self.availability_required {
             value["requiresAvailability"] = json!(true);
             value["inputAllowed"] = json!(
@@ -352,7 +429,7 @@ impl DesktopQueue {
                     && !self.blocked
                     && job.expires_at > now_ms()
                     && job.deadline_at.is_none_or(|at| at > now_ms())
-                    && self.availability()["available"] == true
+                    && (self.availability()["available"] == true || user_authorization.is_some())
             );
         }
         value
@@ -470,7 +547,7 @@ impl DesktopQueue {
                     .iter()
                     .filter(|job| include_terminal || !terminal(job))
                     .map(|j| {
-                        let mut value = serde_json::to_value(j).unwrap();
+                        let mut value = self.job_value(j);
                         value.as_object_mut().unwrap().remove("token");
                         value
                     })
@@ -491,6 +568,7 @@ impl DesktopQueue {
                     .ok_or_else(|| {
                         error("DESKTOP_SESSION_INVALID", "unknown session credentials")
                     })?;
+                let available = available || self.user_authorization(&self.jobs[i]).is_some();
                 let job = &mut self.jobs[i];
                 if self.blocked
                     || job.state != "active"
@@ -640,6 +718,7 @@ impl DesktopQueue {
             }
             if (job.requires_availability || self.availability_required)
                 && self.availability()["available"] != true
+                && self.user_authorization(job).is_none()
             {
                 return Err(error(
                     "DESKTOP_UNAVAILABLE",
@@ -685,6 +764,135 @@ mod tests {
     }
     fn credentials(job: &Value) -> Value {
         json!({"owner":job["owner"],"token":job["token"]})
+    }
+    #[cfg(unix)]
+    fn publish_user_authorization(q: &DesktopQueue, job: &Value) -> Value {
+        use std::os::unix::fs::PermissionsExt;
+        let now = now_ms();
+        let value = json!({"schemaVersion":1,"source":"explicit-user",
+            "authorizationId":uuid::Uuid::new_v4().to_string(),"jobId":job["id"],
+            "owner":job["owner"],"requestKey":job["requestKey"],
+            "tokenSha256":hex::encode(Sha256::digest(job["token"].as_str().unwrap().as_bytes())),
+            "bootId":q.boot_id,"grantedAtMs":now,"expiresAtMs":now+60_000,"reason":"test operator consent"});
+        let path = q
+            .path
+            .as_ref()
+            .unwrap()
+            .with_file_name("desktop-user-authorization.json");
+        fs::write(&path, value.to_string()).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        value
+    }
+    #[cfg(unix)]
+    #[test]
+    fn explicit_user_grant_is_scoped_revocable_and_preserves_waiting_jobs() {
+        let dir = tempfile::tempdir().unwrap();
+        publish_availability(dir.path(), false);
+        let mut q = DesktopQueue::open(dir.path().join("queue.json")).unwrap();
+        let waiting = submit(&mut q, "unattended");
+        let manual = submit(&mut q, "authorized-now");
+        publish_user_authorization(&q, &manual);
+        let live = q.command("desktop.get", &credentials(&manual)).unwrap();
+        assert_eq!(live["state"], "active");
+        assert_eq!(live["inputAllowed"], true);
+        assert_eq!(live["requiresAvailability"], true);
+        assert_eq!(live["userAuthorization"]["source"], "explicit-user");
+        assert_eq!(
+            q.command("desktop.get", &credentials(&waiting)).unwrap()["state"],
+            "queued"
+        );
+        assert_eq!(q.availability()["available"], false);
+        assert_eq!(
+            q.begin(
+                "computer-use.call",
+                &mut json!({"_desktop":credentials(&waiting)})
+            )
+            .unwrap_err()
+            .code,
+            "DESKTOP_BUSY"
+        );
+        q.begin(
+            "computer-use.call",
+            &mut json!({"_desktop":credentials(&manual)}),
+        )
+        .unwrap();
+        q.end(false).unwrap();
+        fs::remove_file(dir.path().join("desktop-user-authorization.json")).unwrap();
+        assert_eq!(
+            q.command("desktop.get", &credentials(&manual)).unwrap()["inputAllowed"],
+            false
+        );
+        assert_eq!(
+            q.begin(
+                "computer-use.call",
+                &mut json!({"_desktop":credentials(&manual)})
+            )
+            .unwrap_err()
+            .code,
+            "DESKTOP_UNAVAILABLE"
+        );
+        assert!(!q.in_flight);
+        q.command("desktop.finish", &credentials(&manual)).unwrap();
+        q.cleanup_done(true).unwrap();
+        publish_availability(dir.path(), true);
+        assert_eq!(
+            q.command("desktop.get", &credentials(&waiting)).unwrap()["state"],
+            "active"
+        );
+    }
+    #[cfg(unix)]
+    #[test]
+    fn user_grant_cannot_override_quarantine_maintenance_or_wrong_boot_and_token() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let dir = tempfile::tempdir().unwrap();
+        publish_availability(dir.path(), false);
+        let mut q = DesktopQueue::open(dir.path().join("queue.json")).unwrap();
+        let manual = submit(&mut q, "authorized-now");
+        let valid = publish_user_authorization(&q, &manual);
+        let path = dir.path().join("desktop-user-authorization.json");
+        for (key, value) in [
+            ("jobId", json!("another-job")),
+            ("owner", json!("another-owner")),
+            ("requestKey", json!("another-generation")),
+            ("bootId", json!("another-boot")),
+            ("tokenSha256", json!("old-token")),
+            ("source", json!("away-guard")),
+            ("expiresAtMs", json!(now_ms())),
+            ("expiresAtMs", json!(now_ms() + 900_001)),
+            ("grantedAtMs", json!(now_ms() + 1000)),
+            ("authorizationId", json!("")),
+        ] {
+            let mut invalid = valid.clone();
+            invalid[key] = value;
+            fs::write(&path, invalid.to_string()).unwrap();
+            assert!(q.user_authorization(&q.jobs[0]).is_none(), "accepted {key}");
+        }
+        fs::write(&path, valid.to_string()).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(q.user_authorization(&q.jobs[0]).is_none());
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        let target = dir.path().join("elsewhere.json");
+        fs::rename(&path, &target).unwrap();
+        symlink(&target, &path).unwrap();
+        assert!(q.user_authorization(&q.jobs[0]).is_none());
+        fs::remove_file(&path).unwrap();
+        fs::rename(target, &path).unwrap();
+        q.maintenance_owner = Some("operator".into());
+        q.promote().unwrap();
+        assert_eq!(q.jobs[0].state, "queued");
+        q.maintenance_owner = None;
+        q.blocked = true;
+        q.promote().unwrap();
+        assert_eq!(q.jobs[0].state, "queued");
+        assert_eq!(
+            q.begin(
+                "computer-use.call",
+                &mut json!({"_desktop":credentials(&manual)})
+            )
+            .unwrap_err()
+            .code,
+            "DESKTOP_RECOVERY_REQUIRED"
+        );
     }
     fn publish_availability(dir: &std::path::Path, available: bool) {
         let now = now_ms();
