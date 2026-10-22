@@ -35,6 +35,7 @@ cp -R skills/machine-fabric "$staging/skills/machine-fabric"
 cp scripts/install-from-release.sh scripts/install-from-release.ps1 scripts/install-linux-user.sh scripts/install-termux-user.sh scripts/connect-termux-peer.sh scripts/install-macos-agent.sh scripts/install-macos-app.sh scripts/install-macos-transaction.py scripts/install-windows.ps1 scripts/resolve-windows-binary.ps1 scripts/install-windows-peer.ps1 scripts/bootstrap-fabric.sh scripts/reconcile-remote-posix-registrations.sh scripts/preflight-fabric.sh scripts/plan-release-fabric.sh scripts/install-agent-skills.sh scripts/prune-state.sh "$staging/scripts/"
 cp packaging/* "$staging/packaging/"
 cp scripts/render-allow-roots.sh "$staging/scripts/"
+cp scripts/authorize-desktop-now.py "$staging/scripts/"
 cp scripts/prepare-windows-release.sh "$staging/scripts/"
 case $target in
   *-windows-msvc)

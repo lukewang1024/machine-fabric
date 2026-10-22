@@ -103,6 +103,45 @@ with (p/'events').open('a') as f:f.write('end '+name+'\\n')
                 self.assertFalse(listing['inFlight'])
                 self.assertEqual(listing['jobs'], [])
                 self.assertGreater(listing['worker']['pollingWakes'], 0)
+                # An explicit node-local consent receipt admits only its exact
+                # job while the real Away Guard provider remains unavailable.
+                available.clear()
+                await_value(lambda: not json.loads((state / 'desktop-availability.json').read_text())['available'])
+                def submit(name):
+                    return call('desktop.submit', {'executorId': 'fixture-desktop',
+                        'owner': name, 'requestKey': name, 'requiresAvailability': False})['result']
+                waiting, manual = submit('still-unattended'), submit('operator-authorized')
+                self.assertEqual(waiting['state'], 'queued')
+                self.assertEqual(manual['state'], 'queued')
+                grant_command = [sys.executable, str(root / 'scripts/authorize-desktop-now.py'),
+                    '--state-dir', str(state), '--job-id', manual['id'], '--owner', manual['owner'],
+                    '--request-key', manual['requestKey'], '--seconds', '60',
+                    '--reason', 'isolated operator-authorization regression']
+                denied = subprocess.run(grant_command, capture_output=True, text=True, timeout=10)
+                self.assertNotEqual(denied.returncode, 0)
+                self.assertFalse((state / 'desktop-user-authorization.json').exists())
+                granted = subprocess.run(grant_command + ['--confirm-user-authorized'],
+                    capture_output=True, text=True, timeout=10)
+                self.assertEqual(granted.returncode, 0, granted.stderr)
+                authorization = json.loads(granted.stdout)
+                credentials = {'executorId': 'fixture-desktop', 'owner': manual['owner'], 'token': manual['token']}
+                live = await_value(lambda: (v if (v := call('desktop.get', credentials)['result'])['state'] == 'active' else None))
+                self.assertTrue(live['inputAllowed'])
+                self.assertTrue(live['requiresAvailability'])
+                self.assertEqual(live['userAuthorization']['authorizationId'], authorization['authorizationId'])
+                call('desktop.claim', dict(credentials, consumerId='one-manual-consumer'))
+                listing = call('desktop.list', {'executorId': 'fixture-desktop', 'includeTerminal': False})['result']
+                self.assertFalse(listing['availability']['available'])
+                self.assertEqual(next(j for j in listing['jobs'] if j['id'] == waiting['id'])['state'], 'queued')
+                revoked = subprocess.run([sys.executable, str(root / 'scripts/authorize-desktop-now.py'),
+                    '--state-dir', str(state), '--revoke', authorization['authorizationId']], capture_output=True, text=True, timeout=10)
+                self.assertEqual(revoked.returncode, 0, revoked.stderr)
+                self.assertFalse(call('desktop.get', credentials)['result']['inputAllowed'])
+                call('executor.call', {'executorId': 'fixture-desktop', 'action': 'application.__availability_probe__',
+                    'params': {'_desktop': {'owner': manual['owner'], 'token': manual['token']}}}, expected_error='DESKTOP_UNAVAILABLE')
+                call('desktop.cancel', credentials)
+                call('desktop.cancel', {'executorId': 'fixture-desktop', 'owner': waiting['owner'], 'token': waiting['token']})
+                await_value(lambda: not call('desktop.list', {'executorId': 'fixture-desktop', 'includeTerminal': False})['result']['jobs'])
             finally:
                 (state / 'release-one').touch()
                 # Release the owned child even when an assertion interrupts its runner.
