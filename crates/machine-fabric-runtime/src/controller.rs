@@ -4414,6 +4414,30 @@ mod tests {
     }
 
     #[test]
+    fn native_inspection_schema_accepts_desktop_lease_without_opening_other_fields() {
+        let schema = crate::executor::recovery_inspection_test_contract().input_schema;
+        let legacy = json!({"applicationPath": "/fixture/Example.app"});
+        assert!(validate_schema(&schema, &legacy, "input").is_ok());
+        let scoped = json!({
+            "applicationPath": "/fixture/Example.app",
+            "_desktop": {"owner": "fixture-owner", "token": "fixture-token"}
+        });
+        assert!(validate_schema(&schema, &scoped, "input").is_ok());
+        for metadata in [
+            json!({"owner": "fixture-owner"}),
+            json!({"owner": 42, "token": "fixture-token"}),
+            json!({"owner": "fixture-owner", "token": "fixture-token", "bypass": true}),
+        ] {
+            let mut invalid = legacy.clone();
+            invalid["_desktop"] = metadata;
+            assert!(validate_schema(&schema, &invalid, "input").is_err());
+        }
+        let mut invalid = scoped;
+        invalid["expression"] = json!("unexpected script");
+        assert!(validate_schema(&schema, &invalid, "input").is_err());
+    }
+
+    #[test]
     fn capability_schema_validation_checks_required_types_and_bounds() {
         let schema = json!({
             "type": "object",
