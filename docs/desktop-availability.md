@@ -44,10 +44,27 @@ The provider atomically replaces it; malformed, absent, future-dated or stale
 snapshots deny admission. Minimal version 1 snapshot:
 
 ```json
-{"schemaVersion":1,"available":true,"observedAtMs":1792400000000,"expiresAtMs":1792400001500}
+{"schemaVersion":1,"provider":"away-guard","generation":"instance-id","sequence":1,"state":"armed","available":true,"observedAtMs":1792400000000,"expiresAtMs":1792400010000}
 ```
 
-Both observation age and remaining validity must be at most 1500 milliseconds.
+Observation age and the entire observation-to-expiry lifetime are bounded to
+10,000 milliseconds. Future, expired, malformed or non-provider grants fail
+closed. A fresh `available=false`, non-armed state or system lock revokes the
+next input immediately; this lease is only the missing-signal fallback.
+The queue reports both bounds in `availability.policy`. Readers still accept
+the prior 1,500ms provider lifetime, so upgrade the reader before switching
+the publisher. Keep maintenance admission closed through the transition.
+The macOS release installer accepts `--maintenance-owner OWNER` only for an
+already-acquired safe point with that exact durable owner. It preserves waiting
+FIFO entries across restart. Active/draining input, quarantine, in-flight work,
+owner mismatch and live Controller leases still refuse installation.
+
+Away Guard separately allows 10 seconds of parent heartbeat loss. Its native
+display checks still run every 300ms and use an independent 2-second progress
+watchdog. Brightness/topology failures lock immediately. Parent traffic cannot
+renew native-check health; sender monotonic timestamps and sequence numbers
+prevent buffered messages from reviving a failed monitor. These are distinct
+limits, not one timeout applied throughout the desktop stack.
 The worker reconciles queued requests every 500 ms. On macOS it also listens for
 `dev.machine-fabric.desktop-availability-changed` Darwin notifications (the Away Guard adapter also broadcasts distributed notifications for UI consumers);
 notifications only wake reconciliation. A spoofed, duplicate or delayed event

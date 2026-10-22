@@ -34,12 +34,13 @@ def digest(path):
 
 
 class Installer:
-    def __init__(self, source, home=None, data=None, state=None, bins=None):
+    def __init__(self, source, home=None, data=None, state=None, bins=None, maintenance_owner=None):
         self.home = Path(home or Path.home())
         self.data = Path(data or os.environ.get('XDG_DATA_HOME', self.home / '.local/share'))
         self.state = Path(state or os.environ.get('XDG_STATE_HOME', self.home / '.local/state')) / 'machine-fabric'
         self.bins = Path(bins or os.environ.get('XDG_BIN_HOME', self.home / '.local/bin'))
         self.source = Path(source).resolve()
+        self.maintenance_owner = maintenance_owner
         self.app = self.data / 'machine-fabric/Machine Fabric.app'
         self.agent = self.app / 'Contents/MacOS/machine-fabric-macos-agent'
         self.controller = self.data / 'machine-fabric/libexec/fabric-controller'
@@ -182,12 +183,22 @@ class Installer:
                 raise RuntimeError('executor has active/queued work')
         # Check durable queue before and after stopping, without reconcile/promote.
         queue = self.state / 'desktop-queue.json'
+        if self.maintenance_owner and not queue.exists():
+            raise RuntimeError('desktop maintenance safe point is missing')
         if queue.exists():
             value = json.loads(queue.read_bytes())
             # Historical outcome-unknown tasks are terminal. A live blocked
             # desktop still needs supported recovery; installation never clears it.
-            if value.get('blocked') or value.get('inFlight') or any(j.get('state') in ('active', 'queued', 'draining') for j in value.get('jobs', [])):
+            if value.get('blocked') or value.get('inFlight') or any(j.get('state') in ('active', 'draining') for j in value.get('jobs', [])):
                 raise RuntimeError('desktop queue is not quiescent')
+            owned_maintenance = (bool(self.maintenance_owner)
+                                 and value.get('maintenanceOwner') == self.maintenance_owner)
+            if self.maintenance_owner and not owned_maintenance:
+                raise RuntimeError('desktop maintenance owner mismatch')
+            if not owned_maintenance and any(j.get('state') == 'queued' for j in value.get('jobs', [])):
+                raise RuntimeError('desktop queue is not quiescent')
+            # With the same durable maintenance owner, queued jobs cannot be
+            # promoted before or after restart. Preserve FIFO/tokens verbatim.
         index = self.state / 'controller.json'
         if index.exists():
             value = json.loads(index.read_bytes())
@@ -555,13 +566,16 @@ class Installer:
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('source', nargs='?', default='target/release/machine-fabric-macos-agent')
+    parser.add_argument('--maintenance-owner', help='preserve queued jobs behind this already-acquired maintenance safe point')
     args = parser.parse_args()
     os.umask(0o077)
     def interrupted(signum, frame):
         raise RuntimeError('installer interrupted by signal ' + str(signum))
     signal.signal(signal.SIGTERM, interrupted)
     signal.signal(signal.SIGHUP, interrupted)
-    Installer(args.source).install()
+    if args.maintenance_owner is not None and not 1 <= len(args.maintenance_owner) <= 256:
+        parser.error('maintenance owner must be 1..256 characters')
+    Installer(args.source, maintenance_owner=args.maintenance_owner).install()
 
 
 if __name__ == '__main__': main()
