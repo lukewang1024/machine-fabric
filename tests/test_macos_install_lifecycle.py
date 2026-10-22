@@ -365,6 +365,38 @@ class LifecycleTests(unittest.TestCase):
             with self.assertRaises(BlockingIOError): self.x.install()
         self.assertFalse(self.x.calls)
 
+    def test_owned_maintenance_preserves_waiting_fifo_through_install(self):
+        queue = self.x.state / 'desktop-queue.json'
+        queue.write_text(json.dumps({'maintenanceOwner': 'watchdog-upgrade', 'inFlight': False,
+                                    'blocked': False, 'jobs': [
+            {'id': 'first', 'state': 'queued', 'token': 'fixture-one'},
+            {'id': 'second', 'state': 'queued', 'token': 'fixture-two'}]}))
+        before = queue.read_bytes()
+        self.x.maintenance_owner = 'watchdog-upgrade'
+        self.x.install()
+        self.assertEqual(queue.read_bytes(), before)
+        self.assertEqual(self.x.agent.read_text(), 'new')
+
+    def test_queued_install_requires_exact_owned_safe_point(self):
+        queue = self.x.state / 'desktop-queue.json'
+        for requested, actual, state, blocked, in_flight in [
+            (None, 'owner', 'queued', False, False),
+            ('owner', None, 'queued', False, False),
+            ('owner', 'other', 'queued', False, False),
+            ('owner', 'owner', 'active', False, False),
+            ('owner', 'owner', 'draining', False, False),
+            ('owner', 'owner', 'queued', True, False),
+            ('owner', 'owner', 'queued', False, True),
+        ]:
+            with self.subTest(requested=requested, actual=actual, state=state, blocked=blocked, in_flight=in_flight):
+                queue.write_text(json.dumps({'maintenanceOwner': actual, 'blocked': blocked,
+                                            'inFlight': in_flight, 'jobs': [{'state': state}]}))
+                before = queue.read_bytes()
+                self.x.maintenance_owner = requested
+                with self.assertRaises(RuntimeError): self.x.install()
+                self.assertEqual(queue.read_bytes(), before)
+        self.assertFalse(any('bootout' in a for a in self.x.calls))
+
     def test_identity_mismatch_rejected(self):
         original = self.x.rpc
         def wrong(endpoint, action, params=None):

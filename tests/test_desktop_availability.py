@@ -49,7 +49,7 @@ class DesktopAvailabilityTests(unittest.TestCase):
                 while not stop.is_set():
                     now = int(time.time() * 1000)
                     source = state / 'availability.tmp'
-                    source.write_text(json.dumps({'schemaVersion': 1, 'available': available.is_set(), 'observedAtMs': now, 'expiresAtMs': now + 1400}))
+                    source.write_text(json.dumps({'schemaVersion': 1, 'provider': 'away-guard', 'state': 'armed', 'generation': 'fixture', 'sequence': 1, 'available': available.is_set(), 'observedAtMs': now, 'expiresAtMs': now + 10000}))
                     source.replace(state / 'desktop-availability.json')
                     stop.wait(.1)
             try:

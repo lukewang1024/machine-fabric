@@ -53,7 +53,7 @@ case $target in
     fi
     ;;
   *-apple-darwin)
-    (cd "$root" && scripts/install-macos-app.sh bin/machine-fabric-macos-agent)
+    (cd "$root" && scripts/install-macos-app.sh bin/machine-fabric-macos-agent "$@")
     ;;
   *-linux-android)
     executor_id=${MACHINE_FABRIC_EXECUTOR_ID:-$(hostname -s)-termux}

@@ -5,6 +5,30 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{fs, io::Write, path::PathBuf};
 
+// Missing broadcasts are bounded by this lease. An explicit false snapshot
+// revokes input immediately, independently of its remaining lifetime.
+const AVAILABILITY_MAX_AGE_MS: u64 = 10_000;
+const AVAILABILITY_MAX_LIFETIME_MS: u64 = 10_000;
+
+fn snapshot_allows_input(v: &Value, now: u64) -> bool {
+    let (Some(observed), Some(expires)) = (v["observedAtMs"].as_u64(), v["expiresAtMs"].as_u64())
+    else {
+        return false;
+    };
+    v["schemaVersion"] == 1
+        && v["provider"] == "away-guard"
+        && v["state"] == "armed"
+        && v["generation"]
+            .as_str()
+            .is_some_and(|s| !s.is_empty() && s.len() <= 256)
+        && v["sequence"].as_u64().is_some_and(|n| n > 0)
+        && v["available"] == true
+        && observed <= now
+        && now - observed <= AVAILABILITY_MAX_AGE_MS
+        && expires > now
+        && expires - observed <= AVAILABILITY_MAX_LIFETIME_MS
+}
+
 #[derive(Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct DesktopQueue {
@@ -259,17 +283,11 @@ impl DesktopQueue {
             .filter(|bytes| bytes.len() <= 4096)
             .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok());
         let now = now_ms();
-        let available = snapshot.as_ref().is_some_and(|v| {
-            v["schemaVersion"] == 1
-                && v["available"] == true
-                && v["observedAtMs"]
-                    .as_u64()
-                    .is_some_and(|at| at <= now && now - at <= 1500)
-                && v["expiresAtMs"]
-                    .as_u64()
-                    .is_some_and(|at| at > now && at - now <= 1500)
-        });
-        json!({"available":available,"snapshot":snapshot})
+        let available = snapshot
+            .as_ref()
+            .is_some_and(|v| snapshot_allows_input(v, now));
+        json!({"available":available,"snapshot":snapshot,
+            "policy":{"maxAgeMs":AVAILABILITY_MAX_AGE_MS,"maxLifetimeMs":AVAILABILITY_MAX_LIFETIME_MS}})
     }
     fn refresh_availability_policy(&mut self) -> Result<(), RpcError> {
         if !self.availability_required
@@ -673,11 +691,45 @@ mod tests {
         fs::write(
             dir.join("desktop-availability.json"),
             serde_json::to_vec(&json!({
-                "schemaVersion":1,"available":available,"observedAtMs":now,"expiresAtMs":now+1400
+                "schemaVersion":1,"provider":"away-guard","state":"armed",
+                "generation":"fixture","sequence":1,"available":available,
+                "observedAtMs":now,"expiresAtMs":now+10_000
             }))
             .unwrap(),
         )
         .unwrap();
+    }
+    #[test]
+    fn ten_second_snapshot_lease_does_not_delay_revocation_or_accept_unbounded_grants() {
+        let now = 100_000;
+        let valid = json!({"schemaVersion":1,"provider":"away-guard","state":"armed",
+            "generation":"fixture","sequence":1,"available":true,
+            "observedAtMs":now,"expiresAtMs":now+10_000});
+        for age in [0, 1501, 9999] {
+            assert!(snapshot_allows_input(&valid, now + age));
+        }
+        assert!(!snapshot_allows_input(&valid, now + 10_000));
+        assert!(!snapshot_allows_input(&valid, now - 1));
+        for (key, value) in [
+            ("available", json!(false)),
+            ("provider", json!("caller")),
+            ("state", json!("locked")),
+            ("generation", json!("")),
+            ("sequence", json!(-1)),
+            ("observedAtMs", json!(now + 1)),
+            ("expiresAtMs", json!(now)),
+            ("expiresAtMs", json!(now + 10_001)),
+            ("observedAtMs", json!(now - 5000)), // Total lifetime, not just remaining TTL.
+            ("observedAtMs", json!("100000")),
+            ("expiresAtMs", Value::Null),
+        ] {
+            let mut invalid = valid.clone();
+            invalid[key] = value;
+            assert!(!snapshot_allows_input(&invalid, now), "accepted {invalid}");
+        }
+        let mut legacy = valid;
+        legacy["expiresAtMs"] = json!(now + 1500);
+        assert!(snapshot_allows_input(&legacy, now)); // Reader-first rollout.
     }
     #[test]
     fn configured_worker_enforces_gate_for_legacy_callers_and_remembers_missing_provider() {
