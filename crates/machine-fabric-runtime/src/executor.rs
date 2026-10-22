@@ -2681,7 +2681,16 @@ fn contract(name: &str, effect: Effect) -> CapabilityDescriptor {
                 "applicationPath": {"type": "string"},
                 "requestPermission": {"type": "boolean"},
                 "expectedWindowTitle": {"type": "string"},
-                "recoveryInspection": {"type": "boolean"}
+                "recoveryInspection": {"type": "boolean"},
+                "_desktop": {
+                    "type": "object",
+                    "properties": {
+                        "owner": {"type": "string"},
+                        "token": {"type": "string"}
+                    },
+                    "required": ["owner", "token"],
+                    "additionalProperties": false
+                }
             }),
             Vec::new(),
             vec!["applicationPath"],
@@ -2865,6 +2874,7 @@ fn contract(name: &str, effect: Effect) -> CapabilityDescriptor {
             "requestPermission",
             "expectedWindowTitle",
             "recoveryInspection",
+            "_desktop",
         ],
         _ => &[],
     };
