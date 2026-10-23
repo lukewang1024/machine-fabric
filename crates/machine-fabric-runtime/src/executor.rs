@@ -3802,6 +3802,8 @@ fn has_structured_computer_use_unknown(value: &Value) -> bool {
         .pointer("/details/execution/transport/outcome")
         .and_then(Value::as_str)
         == Some("unknown");
+    // The dispatch evidence requires recovery even when a new native failure
+    // has a different diagnostic error code, or no diagnostic code at all.
     let partial_hid_unknown = value
         .pointer("/details/execution/inputDispatch/outcome")
         .and_then(Value::as_str)
@@ -3821,9 +3823,7 @@ fn has_structured_computer_use_unknown(value: &Value) -> bool {
         && value
             .pointer("/details/execution/inputDispatch/retrySafe")
             .and_then(Value::as_bool)
-            == Some(false)
-        && value.pointer("/details/error/code").and_then(Value::as_str)
-            == Some("foreground_interrupted_after_partial_hid");
+            == Some(false);
 
     let semantic_unknown = value
         .pointer("/details/execution/semanticDispatch/outcome")
@@ -4655,6 +4655,81 @@ mod tests {
                 Some(tool),
                 &result
             ));
+        }
+    }
+
+    #[test]
+    fn partial_hid_quarantine_does_not_depend_on_error_code() {
+        for code in [
+            Some("foreground_interrupted_after_partial_hid"),
+            Some("modifier_interrupted_after_partial_hid"),
+            Some("input_interrupted_after_partial_hid"),
+            Some("future_native_failure"),
+            None,
+        ] {
+            let mut value = json!({"details": {"tool": "act_ui", "status": "dispatch_outcome_unknown",
+                "execution": {"inputDispatch": {"outcome": "unknown", "kind": "partial_hid",
+                    "eventsDispatched": 2, "unreleasedKeys": [13], "unreleasedMouseButtons": [],
+                    "recoveryRequired": true, "retrySafe": false}}}});
+            if let Some(code) = code {
+                value["details"]["error"] = json!({"code": code});
+            }
+            let uncertain =
+                desktop_dispatch_uncertain("computer-use.call", Some("act_ui"), &Ok(value.clone()));
+            assert!(uncertain, "partial HID evidence must quarantine: {code:?}");
+
+            let directory = tempfile::tempdir().unwrap();
+            let mut queue =
+                crate::desktop::DesktopQueue::open(directory.path().join("queue.json")).unwrap();
+            let job = queue
+                .command(
+                    "desktop.submit",
+                    &json!({
+                        "owner": "first", "requestKey": "first", "ttlMs": 10000
+                    }),
+                )
+                .unwrap();
+            queue
+                .begin(
+                    "computer-use.call",
+                    &mut json!({"_desktop": {
+                        "owner": "first", "token": job["token"]
+                    }}),
+                )
+                .unwrap();
+            queue.end(uncertain).unwrap();
+            let next = queue
+                .command(
+                    "desktop.submit",
+                    &json!({
+                        "owner": "next", "requestKey": "next", "ttlMs": 10000
+                    }),
+                )
+                .unwrap();
+            assert_eq!(next["state"], "queued", "later input must stay in the FIFO");
+
+            for (pointer, invalid) in [
+                ("/details/tool", json!("observe_ui")),
+                ("/details/status", json!("returned")),
+                ("/details/execution/inputDispatch/outcome", json!("worked")),
+                ("/details/execution/inputDispatch/kind", json!("other")),
+                (
+                    "/details/execution/inputDispatch/eventsDispatched",
+                    json!(0),
+                ),
+                (
+                    "/details/execution/inputDispatch/recoveryRequired",
+                    json!(false),
+                ),
+                ("/details/execution/inputDispatch/retrySafe", json!(true)),
+            ] {
+                let mut malformed = value.clone();
+                *malformed.pointer_mut(pointer).unwrap() = invalid;
+                assert!(
+                    !has_structured_computer_use_unknown(&malformed),
+                    "{pointer}"
+                );
+            }
         }
     }
 
