@@ -100,6 +100,13 @@ Raw `desktop.list` retains its full-history default for existing callers; pass
 maintenance ownership, safe-point status and history counts. Read `desktop.list`
 explicitly when audit history is needed; maintenance does not remove past jobs.
 
+A returned `act_ui` result with structured partial-HID evidence also quarantines
+the desktop: an unknown dispatch, positive emitted-event count, required recovery,
+and prohibited retry are authoritative regardless of the native diagnostic error
+code. Modifier failures, unconfirmed releases and future native failure types must
+not admit the next FIFO consumer merely because their helper reply returned.
+Zero-dispatch preflight refusals do not satisfy this partial-input condition.
+
 One-shot command stdout and stderr retain at most 64 KiB each. When clipped,
 the returned text starts with an explicit truncation notice; `stdoutTruncated`
 and `stderrTruncated` indicate incomplete output, and `stdoutBytes` and
