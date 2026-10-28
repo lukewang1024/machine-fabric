@@ -3812,18 +3812,9 @@ fn has_structured_computer_use_unknown(value: &Value) -> bool {
             .pointer("/details/execution/inputDispatch/kind")
             .and_then(Value::as_str)
             == Some("partial_hid")
-        && value
-            .pointer("/details/execution/inputDispatch/eventsDispatched")
-            .and_then(Value::as_u64)
-            .is_some_and(|count| count > 0)
-        && value
-            .pointer("/details/execution/inputDispatch/recoveryRequired")
-            .and_then(Value::as_bool)
-            == Some(true)
-        && value
-            .pointer("/details/execution/inputDispatch/retrySafe")
-            .and_then(Value::as_bool)
-            == Some(false);
+        && !value
+            .pointer("/details/execution/inputDispatch")
+            .is_some_and(verified_native_input_recovery);
 
     let semantic_unknown = value
         .pointer("/details/execution/semanticDispatch/outcome")
@@ -3845,6 +3836,41 @@ fn has_structured_computer_use_unknown(value: &Value) -> bool {
             == Some("semantic_dispatch_unknown");
 
     transport_unknown || partial_hid_unknown || semantic_unknown
+}
+
+// Input cleanup and application effect are separate. Only a correlated terminal
+// native result with a complete neutral-state receipt can avoid quarantine.
+fn verified_native_input_recovery(dispatch: &Value) -> bool {
+    let receipt = &dispatch["inputRecovery"];
+    let empty = |value: &Value| value.as_array().is_some_and(Vec::is_empty);
+    let codes = |value: &Value| {
+        value.as_array().is_some_and(|items| {
+            let parsed: Option<std::collections::HashSet<u64>> =
+                items.iter().map(Value::as_u64).collect();
+            parsed.is_some_and(|set| set.len() == items.len())
+        })
+    };
+    let counts_match = receipt["operationEventsDispatched"]
+        .as_u64()
+        .filter(|count| *count > 0)
+        .zip(receipt["releaseEventsDispatched"].as_u64())
+        .and_then(|(operation, releases)| operation.checked_add(releases))
+        .is_some_and(|total| dispatch["eventsDispatched"].as_u64() == Some(total));
+    dispatch["recoveryRequired"] == false
+        && dispatch["retrySafe"] == false
+        && empty(&dispatch["unreleasedKeys"])
+        && empty(&dispatch["unreleasedMouseButtons"])
+        && receipt["schemaVersion"] == 1
+        && receipt["scope"] == "native_transaction"
+        && receipt["status"] == "verified"
+        && receipt["nativeOperationStopped"] == true
+        && receipt["inputReplayed"] == false
+        && receipt["verification"] == "system_input_state"
+        && empty(&receipt["unreleasedKeys"])
+        && empty(&receipt["unreleasedMouseButtons"])
+        && codes(&receipt["verifiedKeys"])
+        && codes(&receipt["verifiedMouseButtons"])
+        && counts_match
 }
 
 fn io_error(code: &str, path: &Path, error: std::io::Error) -> RpcError {
@@ -4713,6 +4739,17 @@ mod tests {
                 ("/details/status", json!("returned")),
                 ("/details/execution/inputDispatch/outcome", json!("worked")),
                 ("/details/execution/inputDispatch/kind", json!("other")),
+            ] {
+                let mut malformed = value.clone();
+                *malformed.pointer_mut(pointer).unwrap() = invalid;
+                assert!(
+                    !has_structured_computer_use_unknown(&malformed),
+                    "{pointer}"
+                );
+            }
+            // A recognized partial-input result without a valid recovery
+            // receipt stays blocked even if its ledger is contradictory.
+            for (pointer, invalid) in [
                 (
                     "/details/execution/inputDispatch/eventsDispatched",
                     json!(0),
@@ -4725,12 +4762,61 @@ mod tests {
             ] {
                 let mut malformed = value.clone();
                 *malformed.pointer_mut(pointer).unwrap() = invalid;
-                assert!(
-                    !has_structured_computer_use_unknown(&malformed),
-                    "{pointer}"
-                );
+                assert!(has_structured_computer_use_unknown(&malformed), "{pointer}");
             }
         }
+    }
+
+    #[test]
+    fn partial_input_requires_a_complete_native_recovery_receipt() {
+        let value = json!({"details": {"tool": "act_ui", "status": "dispatch_outcome_unknown",
+            "execution": {"inputDispatch": {"outcome": "unknown", "kind": "partial_hid",
+                "eventsDispatched": 3, "unreleasedKeys": [], "unreleasedMouseButtons": [],
+                "recoveryRequired": false, "retrySafe": false,
+                "inputRecovery": {"schemaVersion": 1, "scope": "native_transaction", "status": "verified",
+                    "nativeOperationStopped": true, "inputReplayed": false, "verification": "system_input_state",
+                    "operationEventsDispatched": 2, "releaseEventsDispatched": 1,
+                    "verifiedKeys": [], "verifiedMouseButtons": [0], "unreleasedKeys": [], "unreleasedMouseButtons": []}}},
+            "error": {"code": "foreground_interrupted_after_partial_hid"}}});
+        assert!(!has_structured_computer_use_unknown(&value));
+        for pointer in [
+            "/details/execution/inputDispatch/recoveryRequired",
+            "/details/execution/inputDispatch/retrySafe",
+            "/details/execution/inputDispatch/eventsDispatched",
+            "/details/execution/inputDispatch/unreleasedKeys",
+            "/details/execution/inputDispatch/unreleasedMouseButtons",
+            "/details/execution/inputDispatch/inputRecovery",
+            "/details/execution/inputDispatch/inputRecovery/schemaVersion",
+            "/details/execution/inputDispatch/inputRecovery/scope",
+            "/details/execution/inputDispatch/inputRecovery/status",
+            "/details/execution/inputDispatch/inputRecovery/nativeOperationStopped",
+            "/details/execution/inputDispatch/inputRecovery/inputReplayed",
+            "/details/execution/inputDispatch/inputRecovery/verification",
+            "/details/execution/inputDispatch/inputRecovery/operationEventsDispatched",
+            "/details/execution/inputDispatch/inputRecovery/releaseEventsDispatched",
+            "/details/execution/inputDispatch/inputRecovery/verifiedKeys",
+            "/details/execution/inputDispatch/inputRecovery/verifiedMouseButtons",
+            "/details/execution/inputDispatch/inputRecovery/unreleasedKeys",
+            "/details/execution/inputDispatch/inputRecovery/unreleasedMouseButtons",
+        ] {
+            let mut malformed = value.clone();
+            *malformed.pointer_mut(pointer).unwrap() = Value::Null;
+            assert!(has_structured_computer_use_unknown(&malformed), "{pointer}");
+        }
+        for code in [
+            "foreground_interrupted_after_partial_hid",
+            "modifier_interrupted_after_partial_hid",
+            "native_input_interrupted_after_partial_hid",
+            "input_source_changed",
+        ] {
+            let mut blocked = value.clone();
+            blocked["details"]["error"]["code"] = json!(code);
+            blocked["details"]["execution"]["inputDispatch"]["unreleasedKeys"] = json!([59]);
+            assert!(has_structured_computer_use_unknown(&blocked), "{code}");
+        }
+        let mut lost_response = value.clone();
+        lost_response["details"]["execution"]["transport"] = json!({"outcome": "unknown"});
+        assert!(has_structured_computer_use_unknown(&lost_response));
     }
 
     #[test]
@@ -5406,6 +5492,9 @@ mod tests {
         for mode in [
             "transport",
             "partial_hid",
+            "partial_hid_modifier",
+            "partial_hid_recovered",
+            "partial_hid_bad_receipt",
             "semantic_mutation",
             "capture_read_error",
             "wait_read_error",
@@ -5505,7 +5594,7 @@ while True:
                 'execution': {'semanticDispatch': {'outcome': 'unknown', 'mechanism': 'atspi',
                     'requestId': 'semantic-fake-request-01', 'recoveryRequired': True, 'retrySafe': False}},
                 'error': {'code': 'semantic_dispatch_unknown', 'message': 'mutation may have taken effect'}}}
-    elif mode == 'partial_hid':
+    elif mode.startswith('partial_hid'):
         result = {'content': [{'type': 'text', 'text': 'partial HID input; do not retry'}],
             'details': {'tool': 'act_ui', 'status': 'dispatch_outcome_unknown',
                 'execution': {'inputDispatch': {'outcome': 'unknown', 'kind': 'partial_hid',
@@ -5513,6 +5602,17 @@ while True:
                     'recoveryRequired': True, 'retrySafe': False}},
                 'error': {'code': 'foreground_interrupted_after_partial_hid',
                     'message': 'foreground changed after partial HID dispatch'}}}
+        if mode == 'partial_hid_modifier':
+            result['details']['error']['code'] = 'modifier_interrupted_after_partial_hid'
+        elif mode in ('partial_hid_recovered', 'partial_hid_bad_receipt'):
+            dispatch = result['details']['execution']['inputDispatch']
+            dispatch.update({'recoveryRequired': False, 'unreleasedKeys': [], 'inputRecovery': {
+                'schemaVersion': 1, 'scope': 'native_transaction', 'status': 'verified',
+                'nativeOperationStopped': True, 'inputReplayed': False, 'verification': 'system_input_state',
+                'operationEventsDispatched': 2, 'releaseEventsDispatched': 1,
+                'verifiedKeys': [], 'verifiedMouseButtons': [0], 'unreleasedKeys': [], 'unreleasedMouseButtons': []}})
+            if mode == 'partial_hid_bad_receipt':
+                dispatch['inputRecovery']['nativeOperationStopped'] = False
     else:
         result = {'content': [{'type': 'text', 'text': 'native result unknown'}],
             'details': {'tool': 'act_ui', 'status': 'dispatch_outcome_unknown',
@@ -5580,6 +5680,7 @@ sock.close()
                 || mode == "effect_unverified"
                 || mode == "pure_navigation_error"
                 || mode == "launch_cleaned_error"
+                || mode == "partial_hid_recovered"
             {
                 assert_eq!(
                     first.ok,
@@ -5612,8 +5713,20 @@ sock.close()
                 }
                 let desktop = runtime.handle(Request::new("desktop.list", json!({})));
                 assert_eq!(desktop.result.unwrap()["blocked"], false, "{mode}");
+                if mode == "partial_hid_recovered" {
+                    let returned = first.result.as_ref().unwrap();
+                    assert_eq!(returned["details"]["status"], "dispatch_outcome_unknown");
+                    assert_eq!(
+                        returned["details"]["execution"]["inputDispatch"]["retrySafe"],
+                        false
+                    );
+                }
                 let mut next_input = call_params();
-                next_input["tool"] = json!("act_ui");
+                next_input["tool"] = json!(if mode == "partial_hid_recovered" {
+                    "observe_ui"
+                } else {
+                    "act_ui"
+                });
                 let second = runtime.handle(Request::new("computer-use.call", next_input));
                 assert!(second.ok, "{second:?}");
                 assert_ne!(
@@ -5626,6 +5739,13 @@ sock.close()
                     2,
                     "second request reaches actual fake host"
                 );
+                if mode == "partial_hid_recovered" {
+                    assert_eq!(
+                        calls.lines().collect::<Vec<_>>(),
+                        ["act_ui", "observe_ui"],
+                        "resync reads without replaying the interrupted action"
+                    );
+                }
                 continue;
             }
             assert!(
@@ -5650,10 +5770,14 @@ sock.close()
                         .get("inputDispatch")
                         .is_none()
                 );
-            } else if mode == "partial_hid" {
+            } else if mode.starts_with("partial_hid") {
                 assert_eq!(
                     returned["details"]["error"]["code"],
-                    "foreground_interrupted_after_partial_hid"
+                    if mode == "partial_hid_modifier" {
+                        "modifier_interrupted_after_partial_hid"
+                    } else {
+                        "foreground_interrupted_after_partial_hid"
+                    }
                 );
                 assert!(returned["details"]["execution"].get("transport").is_none());
                 assert_eq!(
@@ -5662,7 +5786,11 @@ sock.close()
                 );
                 assert_eq!(
                     returned["details"]["execution"]["inputDispatch"]["unreleasedKeys"],
-                    json!([1])
+                    if mode == "partial_hid_bad_receipt" {
+                        json!([])
+                    } else {
+                        json!([1])
+                    }
                 );
             } else {
                 assert_eq!(
