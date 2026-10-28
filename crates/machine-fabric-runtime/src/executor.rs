@@ -4739,6 +4739,17 @@ mod tests {
                 ("/details/status", json!("returned")),
                 ("/details/execution/inputDispatch/outcome", json!("worked")),
                 ("/details/execution/inputDispatch/kind", json!("other")),
+            ] {
+                let mut malformed = value.clone();
+                *malformed.pointer_mut(pointer).unwrap() = invalid;
+                assert!(
+                    !has_structured_computer_use_unknown(&malformed),
+                    "{pointer}"
+                );
+            }
+            // A recognized partial-input result without a valid recovery
+            // receipt stays blocked even if its ledger is contradictory.
+            for (pointer, invalid) in [
                 (
                     "/details/execution/inputDispatch/eventsDispatched",
                     json!(0),
@@ -4751,10 +4762,7 @@ mod tests {
             ] {
                 let mut malformed = value.clone();
                 *malformed.pointer_mut(pointer).unwrap() = invalid;
-                assert!(
-                    !has_structured_computer_use_unknown(&malformed),
-                    "{pointer}"
-                );
+                assert!(has_structured_computer_use_unknown(&malformed), "{pointer}");
             }
         }
     }
