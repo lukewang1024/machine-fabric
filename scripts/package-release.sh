@@ -29,6 +29,7 @@ case $target in
 esac
 cp README.md LICENSE "$staging/"
 cp docs/executor-peer.md "$staging/docs/"
+cp docs/windows-targeted-upgrade.md "$staging/docs/"
 mkdir -p "$staging/crates/machine-fabric-peer/examples"
 cp crates/machine-fabric-peer/examples/duplex.rs "$staging/crates/machine-fabric-peer/examples/"
 cp -R skills/machine-fabric "$staging/skills/machine-fabric"
@@ -36,6 +37,7 @@ cp scripts/install-from-release.sh scripts/install-from-release.ps1 scripts/inst
 cp packaging/* "$staging/packaging/"
 cp scripts/render-allow-roots.sh "$staging/scripts/"
 cp scripts/authorize-desktop-now.py "$staging/scripts/"
+cp scripts/windows-targeted-upgrade.ps1 "$staging/scripts/"
 cp scripts/prepare-windows-release.sh "$staging/scripts/"
 case $target in
   *-windows-msvc)

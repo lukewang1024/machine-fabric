@@ -44,6 +44,7 @@ jobs:
           ./scripts/test-resolve-windows-binary.ps1
           ./scripts/test-windows-immutable-staging.ps1
           ./scripts/test-windows-staged-release.ps1
+          ./scripts/test-windows-targeted-upgrade.ps1
       - name: Build queued desktop consumer fixture
         if: runner.os != 'Windows'
         run: cargo build --locked --bin machine-fabric
