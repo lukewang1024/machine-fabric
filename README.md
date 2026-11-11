@@ -336,6 +336,11 @@ Disconnected bridges reject new requests and do not replay pending requests.
 
 ### Windows release transport
 
+For an independently continued, single-node Windows service upgrade, see
+[Windows single-node upgrade](docs/windows-targeted-upgrade.md). It retains
+the existing policy and other peer configuration and requires a coordinated
+exclusive maintenance window for non-desktop work.
+
 Fabric bootstrap downloads the exact native Windows release archive on the
 initiator, verifies its SHA-256 from the HTTPS release source, and transfers it
 through the selected SSH connection before pausing peer connectors. Windows
