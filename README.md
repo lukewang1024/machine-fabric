@@ -299,6 +299,12 @@ The local CLI communicates with the node Controller over Unix sockets or
 Windows Named Pipes. State and logs are stored under the platform's normal
 XDG/application data locations.
 
+`filesystem.write` accepts `encoding` as `utf-8` (the default) or `base64`.
+Base64 content is decoded to bytes before the atomic write, and the returned
+digest describes those bytes. Invalid encodings and invalid base64 are rejected
+before writing. Check the destination Executor's capability contract for
+`encoding` support when interoperating with older releases.
+
 Peer frame serialization uses a bounded 64 KiB write buffer under the existing
 whole-frame lock. Each completed JSON frame retains its newline and explicit
 flush. A write failure discards remaining buffered bytes without an implicit
