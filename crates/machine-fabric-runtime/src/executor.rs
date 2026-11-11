@@ -846,6 +846,23 @@ impl ExecutorRuntime {
                     .get("content")
                     .and_then(Value::as_str)
                     .ok_or_else(|| RpcError::new("INVALID_PARAMS", "content is required"))?;
+                let payload = match params.get("encoding") {
+                    None => content.as_bytes().to_vec(),
+                    Some(Value::String(encoding)) if encoding == "utf-8" => {
+                        content.as_bytes().to_vec()
+                    }
+                    Some(Value::String(encoding)) if encoding == "base64" => {
+                        BASE64.decode(content).map_err(|_| {
+                            RpcError::new("INVALID_CONTENT", "content is not valid base64")
+                        })?
+                    }
+                    _ => {
+                        return Err(RpcError::new(
+                            "INVALID_PARAMS",
+                            "encoding must be utf-8 or base64",
+                        ));
+                    }
+                };
                 let expected_absent = match params.get("expectedAbsent") {
                     None | Some(Value::Bool(false)) => false,
                     Some(Value::Bool(true)) => true,
@@ -881,7 +898,7 @@ impl ExecutorRuntime {
                         .open(&temporary)
                         .map_err(|error| io_error("FS_WRITE_FAILED", &temporary, error))?;
                     let outcome = (|| {
-                        std::io::Write::write_all(&mut staged, content.as_bytes())
+                        std::io::Write::write_all(&mut staged, &payload)
                             .map_err(|error| io_error("FS_WRITE_FAILED", &temporary, error))?;
                         drop(staged);
                         // Linking publishes complete contents without replacing any
@@ -919,7 +936,7 @@ impl ExecutorRuntime {
                         .map_err(|error| io_error("FS_WRITE_FAILED", parent, error))?;
                 }
                 let temporary = self.atomic_temporary_path(&params, &path)?;
-                write_atomic_payload(&path, &temporary, content.as_bytes())
+                write_atomic_payload(&path, &temporary, &payload)
                     .map_err(|error| io_error("FS_WRITE_FAILED", &temporary, error))?;
                 atomic_replace(&temporary, &path)
                     .map_err(|error| io_error("FS_WRITE_FAILED", &path, error))?;
@@ -2306,11 +2323,18 @@ fn contract(name: &str, effect: Effect) -> CapabilityDescriptor {
             json!({
                 "path": {"type": "string"},
                 "content": {"type": "string"},
+                "encoding": {"type": "string", "enum": ["utf-8", "base64"], "default": "utf-8"},
                 "expectedDigest": {"type": "string"},
                 "expectedAbsent": {"type": "boolean"}
             }),
             vec!["filesystem:${path}"],
-            vec!["path", "content", "expectedDigest", "expectedAbsent"],
+            vec![
+                "path",
+                "content",
+                "encoding",
+                "expectedDigest",
+                "expectedAbsent",
+            ],
             30_000,
             RollbackStrategy::None,
             vec!["file-digest"],
@@ -2868,7 +2892,7 @@ fn contract(name: &str, effect: Effect) -> CapabilityDescriptor {
             "chromiumLocalStateSettleMs",
             "file",
         ],
-        "filesystem.write" => &["expectedDigest", "expectedAbsent"],
+        "filesystem.write" => &["encoding", "expectedDigest", "expectedAbsent"],
         "application.open-file" => &["handlerPath"],
         "ui.native-inspect" => &[
             "requestPermission",
@@ -5003,6 +5027,86 @@ mod tests {
         assert!(error.retryable);
     }
     use machine_fabric_protocol::Request;
+
+    #[test]
+    fn filesystem_write_decodes_binary_and_rejects_invalid_encoding_without_mutation() {
+        let directory = tempfile::tempdir().unwrap();
+        let runtime = ExecutorRuntime::new("local", vec![directory.path().to_path_buf()]).unwrap();
+        let bytes: Vec<u8> = (0..22_955).map(|i| (i % 256) as u8).collect();
+        let encoded = BASE64.encode(&bytes);
+        for expected_absent in [false, true] {
+            let path = directory
+                .path()
+                .join(format!("binary-{expected_absent}.docx"));
+            let result = runtime.dispatch("filesystem.write", json!({
+                "path": path, "content": encoded, "encoding": "base64", "expectedAbsent": expected_absent
+            })).unwrap();
+            assert_eq!(fs::read(&path).unwrap(), bytes);
+            assert_eq!(result["digest"], sha256_bytes(&bytes));
+            let replacement = b"PK\x03\x04\x00\xff\x80";
+            let updated = runtime
+                .dispatch(
+                    "filesystem.write",
+                    json!({
+                        "path": path, "content": BASE64.encode(replacement), "encoding": "base64",
+                        "expectedDigest": result["digest"]
+                    }),
+                )
+                .unwrap();
+            assert_eq!(fs::read(&path).unwrap(), replacement);
+            assert_eq!(updated["digest"], sha256_bytes(replacement));
+            for (encoding, content, code) in [
+                (json!("base64"), "%%%", "INVALID_CONTENT"),
+                (json!("unknown"), "abc", "INVALID_PARAMS"),
+                (json!(null), "abc", "INVALID_PARAMS"),
+            ] {
+                assert_eq!(
+                    runtime
+                        .dispatch(
+                            "filesystem.write",
+                            json!({
+                                "path": path, "content": content, "encoding": encoding,
+                                "expectedDigest": updated["digest"]
+                            })
+                        )
+                        .unwrap_err()
+                        .code,
+                    code
+                );
+                assert_eq!(fs::read(&path).unwrap(), replacement);
+            }
+            assert_eq!(runtime.dispatch("filesystem.write", json!({
+                "path": path, "content": encoded, "encoding": "base64", "expectedDigest": "sha256:wrong"
+            })).unwrap_err().code, "DIGEST_CONFLICT");
+            assert_eq!(fs::read(&path).unwrap(), replacement);
+        }
+        let text_path = directory.path().join("text.txt");
+        for encoding in [None, Some("utf-8")] {
+            let mut params = json!({"path": text_path, "content": "中文 ☃"});
+            if let Some(encoding) = encoding {
+                params["encoding"] = json!(encoding);
+            }
+            runtime.dispatch("fs.write", params).unwrap();
+            assert_eq!(fs::read(&text_path).unwrap(), "中文 ☃".as_bytes());
+        }
+        let contract = contract("filesystem.write", Effect::Mutating);
+        assert_eq!(
+            contract.input_schema["properties"]["encoding"]["enum"],
+            json!(["utf-8", "base64"])
+        );
+        assert!(
+            !contract.input_schema["required"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("encoding"))
+        );
+        assert!(
+            contract
+                .idempotency
+                .key_fields
+                .contains(&"encoding".to_owned())
+        );
+    }
 
     #[test]
     fn expected_absent_creation_never_overwrites_concurrent_winner() {

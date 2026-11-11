@@ -49,9 +49,9 @@ jobs:
           - runner: ubuntu-latest
             target: aarch64-linux-android
             android_linker: aarch64-linux-android24-clang
-          - runner: macos-14
+          - runner: macos-15
             target: aarch64-apple-darwin
-          - runner: macos-14
+          - runner: macos-15
             target: x86_64-apple-darwin
           - runner: windows-latest
             target: aarch64-pc-windows-msvc

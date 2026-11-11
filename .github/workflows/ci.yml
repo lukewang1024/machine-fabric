@@ -14,7 +14,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        runner: [ubuntu-latest, ubuntu-24.04-arm, macos-14, windows-latest]
+        runner: [ubuntu-latest, ubuntu-24.04-arm, macos-15, windows-latest]
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
@@ -79,7 +79,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - runner: macos-14
+          - runner: macos-15
             target: x86_64-apple-darwin
           - runner: windows-latest
             target: aarch64-pc-windows-msvc
